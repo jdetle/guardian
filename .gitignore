@@ -1,0 +1,23 @@
+# Rust
+/target/
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# Swift
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# Guardian runtime data (lives in ~/.guardian/, never in repo)
+state.json
+sessions.db
+*.stderr.log
+*.stdout.log

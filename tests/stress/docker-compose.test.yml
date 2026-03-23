@@ -1,0 +1,100 @@
+# Containerized test environment for the guardian daemon.
+# All testing happens inside these containers — never on the host.
+#
+# Usage:
+#   docker compose -f tests/stress/docker-compose.test.yml build
+#   docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-test
+
+services:
+  # Main test runner: builds the daemon, bundles hooks, runs the test harness
+  guardian-test:
+    build:
+      context: ../..
+      dockerfile: tests/stress/Dockerfile.test
+    command: bash /opt/guardian/tests/containerized-test.sh
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 8G
+    privileged: false
+    environment:
+      - GUARDIAN_DIR=/root/.guardian
+      - TEST_MODE=containerized
+    tmpfs:
+      - /root/.guardian:size=64M
+
+  # CPU stress sidecar — launched by the test harness via Docker-in-Docker
+  # or directly via stress-ng inside the guardian-test container
+  cpu-hog:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 0 --timeout 120s --metrics-brief
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 128M
+    profiles:
+      - stress
+
+  # Memory stress sidecar
+  mem-hog:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --vm 2 --vm-bytes 768M --timeout 120s --metrics-brief
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 2G
+    profiles:
+      - stress
+
+  # Workload containers for Docker throttle testing
+  workload-a:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 1 --timeout 300s
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    profiles:
+      - stress
+
+  workload-b:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 1 --timeout 300s
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    profiles:
+      - stress
+
+  postgres-essential:
+    image: alpine:3.20
+    command: sleep 300
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    profiles:
+      - stress

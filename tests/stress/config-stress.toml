@@ -1,0 +1,22 @@
+# Guardian config with LOW thresholds for stress testing.
+# These trigger strained/critical much earlier than defaults.
+sample_interval_secs = 1
+
+[thresholds]
+strained_cpu_percent = 30.0
+critical_cpu_percent = 50.0
+strained_memory_gb = 8.0
+critical_memory_gb = 4.0
+strained_swap_percent = 5.0
+critical_swap_percent = 15.0
+
+[docker]
+enabled = true
+auto_throttle = true
+essential_containers = ["postgres"]
+
+[fork_guard]
+enabled = true
+warn_ratio = 0.3
+kill_ratio = 0.5
+kill_enabled = false

@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "./hooks/session-start.sh",
+        "timeout": 5
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "./hooks/pre-tool-use.sh",
+        "matcher": "Shell|Task",
+        "timeout": 3,
+        "failClosed": false
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "./hooks/subagent-start.sh",
+        "timeout": 3,
+        "failClosed": false
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "./hooks/post-tool-use.sh",
+        "timeout": 5
+      }
+    ],
+    "stop": [
+      {
+        "command": "./hooks/stop.sh",
+        "timeout": 10
+      }
+    ]
+  }
+}

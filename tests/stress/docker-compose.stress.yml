@@ -1,0 +1,83 @@
+services:
+  # CPU stress: saturates all available cores
+  cpu-hog:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 0 --timeout 120s --metrics-brief
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 128M
+
+  # Memory stress: allocates 1.5GB to push available memory below thresholds
+  mem-hog:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --vm 2 --vm-bytes 768M --timeout 120s --metrics-brief
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 2G
+
+  # Simulate a "normal" workload container the daemon should throttle
+  workload-a:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 1 --timeout 300s
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  # Second workload container
+  workload-b:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 1 --timeout 300s
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  # Container with an "essential" name pattern (should NOT be throttled)
+  postgres-essential:
+    image: alpine:3.20
+    command: sleep 300
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  # Late-start container: launched AFTER critical pressure is reached
+  # Used by the adversarial test to verify new containers get throttled
+  late-joiner:
+    image: alpine:3.20
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng >/dev/null 2>&1 &&
+        stress-ng --cpu 2 --timeout 120s
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 256M
+    profiles:
+      - late

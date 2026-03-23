@@ -1,0 +1,24 @@
+# Guardian config tuned for chaos testing on M2 MacBook Air 8GB.
+# Lower thresholds than production so we can trigger without
+# actually destroying the machine.
+sample_interval_secs = 1
+
+[thresholds]
+strained_cpu_percent = 40.0
+critical_cpu_percent = 60.0
+# 8GB machine with heavy swap — available memory thresholds tuned low
+strained_memory_gb = 3.0
+critical_memory_gb = 1.5
+strained_swap_percent = 50.0
+critical_swap_percent = 80.0
+
+[docker]
+enabled = true
+auto_throttle = true
+essential_containers = ["postgres"]
+
+[fork_guard]
+enabled = true
+warn_ratio = 0.2
+kill_ratio = 0.5
+kill_enabled = true

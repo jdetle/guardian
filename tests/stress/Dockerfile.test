@@ -1,0 +1,38 @@
+# Test container for the guardian daemon.
+# The daemon binary is pre-built on macOS (it uses Mach APIs that only compile on macOS).
+# This container bundles the hooks and test harness for containerized validation.
+#
+# For hook testing and daemon integration tests, the daemon binary must be
+# built on the host first: cargo build -p guardian-daemon
+# Then cross-compiled or the macOS binary is run via emulation.
+#
+# Since guardiand uses macOS-only APIs (mach2, sysctl), containerized tests
+# focus on hook behavior, state file parsing, and script correctness —
+# the daemon itself is validated by running it on macOS with resource limits.
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    jq \
+    sqlite3 \
+    stress-ng \
+    procps \
+    curl \
+    bash \
+    coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY hooks/guardian/ /opt/guardian/hooks/
+COPY tests/stress/ /opt/guardian/tests/
+
+RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/tests/*.sh 2>/dev/null || true
+
+RUN mkdir -p /root/.guardian
+
+ENV GUARDIAN_DIR=/root/.guardian
+ENV STATE_FILE=/root/.guardian/state.json
+ENV HOOKS_DIR=/opt/guardian/hooks
+ENV TESTS_DIR=/opt/guardian/tests
+ENV TEST_MODE=containerized
+
+WORKDIR /opt/guardian

@@ -1,0 +1,67 @@
+---
+description: All daemon and stress testing must run inside Docker containers, never on bare metal
+alwaysApply: true
+version: "1.0"
+lastUpdated: "2026-03-22"
+author: "john"
+tags: [testing, docker, guardian]
+---
+
+# Containerized Testing — Never Run Tests on Bare Metal
+
+All daemon testing, stress testing, chaos testing, and hook validation MUST run inside Docker containers. No test script may execute the daemon binary, spawn stress processes, or write to `~/.guardian/` on the host OS.
+
+## The Rule
+
+Test scripts that target the guardian daemon or any system-level component must either:
+
+1. **Launch a Docker Compose test environment** (`docker compose -f docker-compose.test.yml run --rm guardian-test`)
+2. **Detect they are already inside a container** via `TEST_MODE=containerized` env var
+
+If neither condition is met, the script must refuse to run.
+
+### Guard pattern for test scripts
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ "${TEST_MODE:-}" != "containerized" ]; then
+    echo "Running tests inside Docker..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.test.yml" build guardian-test
+    docker compose -f "$SCRIPT_DIR/docker-compose.test.yml" run --rm guardian-test
+    exit $?
+fi
+
+# Only reachable inside the container
+# ... test logic here ...
+```
+
+## What Is Forbidden on the Host
+
+| Action | Why it's dangerous |
+|---|---|
+| Running `guardiand` binary directly | Leaves stale state, overwrites production config |
+| Writing to `~/.guardian/config.toml` | Toxic thresholds can brick the user's workflow |
+| Writing to `~/.guardian/state.json` | Stale state file causes hooks to misbehave |
+| Spawning `stress-ng` or busy loops | Consumes host CPU/memory, can freeze the machine |
+| `pkill` or `kill` on host processes | Can kill user applications |
+| Using `docker run` to start stress containers without resource limits | Unbounded containers can exhaust host resources |
+
+## What IS Allowed on the Host
+
+| Action | Why it's safe |
+|---|---|
+| `docker compose build` | Builds container images, no host side effects |
+| `docker compose run --rm` | Runs tests in an isolated container with tmpfs |
+| `docker compose down` | Cleans up containers |
+| `cargo build -p guardian-daemon` | Compiles the binary but does not execute it |
+| `cargo test -p guardian-daemon` | Runs Rust unit tests (no system interaction) |
+
+## Origin
+
+- **Failure**: Stress tests ran the daemon on bare metal, overwrote `~/.guardian/config.toml` with ultra-low thresholds, left stale `state.json` behind. The daemon then classified normal M2 idle as "critical" and hooks denied every Cursor tool call.
+- **Date**: 2026-03-22
+- **Root cause**: No containerization boundary between test infrastructure and the host OS
