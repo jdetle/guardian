@@ -16,15 +16,17 @@ active_sessions=$(read_state_field "cursor.active_sessions" "0")
 case "$pressure" in
     strained)
         json_output "$(jq -n \
-            --arg msg "System Guardian: moderate load (CPU: ${cpu}%, Mem free: ${mem}GB, ${active_sessions} active sessions). Consider limiting parallel subagents." \
+            --arg msg "[Guardian] Monitoring active — moderate load (CPU: ${cpu}%, Mem free: ${mem}GB, ${active_sessions} active sessions). Consider limiting parallel subagents." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     critical)
         json_output "$(jq -n \
-            --arg msg "System Guardian: high load (CPU: ${cpu}%, Mem free: ${mem}GB, ${active_sessions} active sessions). Prefer sequential work to reduce system pressure." \
+            --arg msg "[Guardian] Monitoring active — high load (CPU: ${cpu}%, Mem free: ${mem}GB, ${active_sessions} active sessions). Prefer sequential work to reduce system pressure." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     *)
-        json_output '{"permission": "allow"}'
+        json_output "$(jq -n \
+            --arg msg "[Guardian] Monitoring active — system nominal." \
+            '{permission: "allow", agent_message: $msg}')"
         ;;
 esac
