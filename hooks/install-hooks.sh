@@ -52,7 +52,7 @@ if command -v jq &>/dev/null; then
     jq --arg dir "$HOOKS_DIR" '
         .hooks |= with_entries(
             .value |= map(
-                if .command | test("guardian") then
+                if .command | test("\\./hooks/") then
                     .command = ($dir + "/" + (.command | split("/") | last))
                 else .
                 end

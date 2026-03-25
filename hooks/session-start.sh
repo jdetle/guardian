@@ -20,16 +20,23 @@ if [ -n "$conversation_id" ]; then
     db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, pressure_at_start) VALUES ('$conversation_id', '$model', '$pressure');"
 fi
 
+banner=""
+if is_daemon_active; then
+    banner="[Guardian] Agent registered and monitored (daemon active)."
+else
+    banner="[Guardian] Agent registered (daemon not detected — resource data unavailable)."
+fi
+
 context=""
 case "$pressure" in
     critical)
-        context="SYSTEM ALERT: Resources are critically low (CPU: ${cpu}%, Memory: ${mem}GB free). Minimize parallel operations, avoid spawning subagents, and defer Docker-heavy commands until pressure drops."
+        context="$banner SYSTEM ALERT: Resources are critically low (CPU: ${cpu}%, Memory: ${mem}GB free). Minimize parallel operations, avoid spawning subagents, and defer Docker-heavy commands until pressure drops."
         ;;
     strained)
-        context="SYSTEM NOTE: Resources are under moderate load (CPU: ${cpu}%, Memory: ${mem}GB free). Prefer sequential over parallel work. Avoid launching multiple subagents simultaneously."
+        context="$banner SYSTEM NOTE: Resources are under moderate load (CPU: ${cpu}%, Memory: ${mem}GB free). Prefer sequential over parallel work. Avoid launching multiple subagents simultaneously."
         ;;
     *)
-        context="System resources: nominal (CPU: ${cpu}%, Memory: ${mem}GB free)."
+        context="$banner System resources: nominal (CPU: ${cpu}%, Memory: ${mem}GB free)."
         ;;
 esac
 

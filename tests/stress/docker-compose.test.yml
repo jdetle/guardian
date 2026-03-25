@@ -4,6 +4,7 @@
 # Usage:
 #   docker compose -f tests/stress/docker-compose.test.yml build
 #   docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-test
+#   docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-e2e
 
 services:
   # Main test runner: builds the daemon, bundles hooks, runs the test harness
@@ -17,6 +18,24 @@ services:
         limits:
           cpus: "8.0"
           memory: 8G
+    privileged: false
+    environment:
+      - GUARDIAN_DIR=/root/.guardian
+      - TEST_MODE=containerized
+    tmpfs:
+      - /root/.guardian:size=64M
+
+  # E2E agent lifecycle test: simulates a full Cursor agent session
+  guardian-e2e:
+    build:
+      context: ../..
+      dockerfile: tests/stress/Dockerfile.test
+    command: bash /opt/guardian/tests/e2e-agent-lifecycle.sh
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
     privileged: false
     environment:
       - GUARDIAN_DIR=/root/.guardian

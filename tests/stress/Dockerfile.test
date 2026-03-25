@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     coreutils \
     && rm -rf /var/lib/apt/lists/*
 
-COPY hooks/guardian/ /opt/guardian/hooks/
+COPY hooks/ /opt/guardian/hooks/
 COPY tests/stress/ /opt/guardian/tests/
 
 RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/tests/*.sh 2>/dev/null || true

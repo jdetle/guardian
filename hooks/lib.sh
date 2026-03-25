@@ -11,10 +11,40 @@ STATE_FILE="$GUARDIAN_DIR/state.json"
 SESSIONS_DB="$GUARDIAN_DIR/sessions.db"
 STALE_THRESHOLD_SECS=30
 
+parse_iso_epoch() {
+    local ts="${1%%.*}"
+    if date -jf "%Y-%m-%dT%H:%M:%S" "$ts" +%s 2>/dev/null; then
+        return
+    fi
+    date -d "${ts}" +%s 2>/dev/null || echo 0
+}
+
 sanitize_sql() {
     # Escape single quotes by doubling them (SQL standard escaping).
     # This prevents SQL injection when interpolating into string literals.
     printf '%s' "$1" | sed "s/'/''/g"
+}
+
+is_daemon_active() {
+    if [ ! -f "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+        return 1
+    fi
+
+    local sampled_at
+    sampled_at=$(jq -r '.sampled_at // ""' < "$STATE_FILE" 2>/dev/null)
+    if [ -z "$sampled_at" ]; then
+        return 1
+    fi
+
+    local state_epoch now_epoch age
+    state_epoch=$(parse_iso_epoch "$sampled_at")
+    now_epoch=$(date -u +%s)
+    age=$(( now_epoch - state_epoch ))
+    if [ "$age" -gt "$STALE_THRESHOLD_SECS" ]; then
+        return 1
+    fi
+
+    return 0
 }
 
 read_state_pressure() {
@@ -36,8 +66,7 @@ read_state_pressure() {
     sampled_at=$(jq -r '.sampled_at // ""' < "$STATE_FILE" 2>/dev/null)
     if [ -n "$sampled_at" ]; then
         local state_epoch now_epoch age
-        # macOS date -jf parses the ISO 8601 prefix (strip fractional seconds and timezone)
-        state_epoch=$(date -jf "%Y-%m-%dT%H:%M:%S" "${sampled_at%%.*}" +%s 2>/dev/null || echo 0)
+        state_epoch=$(parse_iso_epoch "$sampled_at")
         now_epoch=$(date -u +%s)
         age=$(( now_epoch - state_epoch ))
         if [ "$age" -gt "$STALE_THRESHOLD_SECS" ]; then
@@ -81,13 +110,13 @@ read_full_state() {
 
 db_exec() {
     local sql="$1"
-    sqlite3 "$SESSIONS_DB" ".timeout 5000" "PRAGMA journal_mode=WAL;" "$sql" 2>/dev/null || true
+    sqlite3 "$SESSIONS_DB" ".timeout 5000" "$sql" 2>/dev/null || true
 }
 
 ensure_db() {
     if [ ! -f "$SESSIONS_DB" ]; then
         mkdir -p "$GUARDIAN_DIR"
-        sqlite3 "$SESSIONS_DB" << 'SQL'
+        sqlite3 "$SESSIONS_DB" > /dev/null 2>&1 << 'SQL'
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS sessions (
     conversation_id TEXT PRIMARY KEY,
