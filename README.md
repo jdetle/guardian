@@ -32,18 +32,56 @@ System resource monitor daemon for macOS that protects Cursor agent sessions fro
 ### Install
 
 ```bash
-# Build and install the daemon + LaunchAgent
+# 1. Build and install the daemon as a LaunchAgent
 bash scripts/install.sh
 
-# Install Cursor hooks
+# 2. Install Cursor hooks globally
 bash hooks/install-hooks.sh
 ```
+
+Both steps are required. The daemon monitors system resources and writes
+pressure state to `~/.guardian/state.json`. The hooks read that state and
+inject it into Cursor agent sessions — without global hook installation,
+agents have no visibility into system pressure.
+
+### What Global Hook Installation Does
+
+`hooks/install-hooks.sh` performs three things:
+
+1. Copies hook scripts to `~/.cursor/hooks/guardian/`
+2. Merges Guardian's hook registrations into `~/.cursor/hooks.json` (backs up the original to `hooks.json.bak`)
+3. Rewrites relative command paths to absolute paths so Cursor can find them from any workspace
+
+After installation, every new Cursor agent session will display:
+
+```
+[Guardian] Agent registered and monitored (daemon active).
+System resources: nominal (CPU: 15%, Memory: 6GB free).
+```
+
+If the daemon is not running, agents see:
+
+```
+[Guardian] Agent registered (daemon not detected — resource data unavailable).
+```
+
+This message appears in the `sessionStart` hook's `additional_context`.
+The `preToolUse` and `subagentStart` hooks also inject advisory messages
+when pressure is `strained` or `critical`, guiding agents to throttle
+their own parallelism.
 
 ### Verify
 
 ```bash
+# Check the daemon is running
 launchctl list com.guardian.guardiand
 cat ~/.guardian/state.json | jq .pressure
+
+# Check hooks are registered globally
+cat ~/.cursor/hooks.json | jq '.hooks | keys'
+
+# Check hook scripts are installed
+ls ~/.cursor/hooks/guardian/
 ```
 
 ### Configure
@@ -68,11 +106,25 @@ enabled = true
 kill_enabled = false
 ```
 
+Restart the daemon after config changes:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.guardian.guardiand.plist
+launchctl load ~/Library/LaunchAgents/com.guardian.guardiand.plist
+```
+
 ### Uninstall
 
 ```bash
+# Remove the daemon
 bash scripts/uninstall.sh
+
+# Remove global hooks
 rm -rf ~/.cursor/hooks/guardian/
+# Edit ~/.cursor/hooks.json to remove Guardian entries, or restore the backup:
+cp ~/.cursor/hooks.json.bak ~/.cursor/hooks.json
+
+# Remove all Guardian data
 rm -rf ~/.guardian/
 ```
 
@@ -82,8 +134,14 @@ rm -rf ~/.guardian/
 # Build
 cargo build
 
-# Run tests (48 unit tests covering classifier, hysteresis, etime parser, etc.)
+# Run unit tests
 cargo test
+
+# Run containerized hook tests (requires Docker)
+docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-test
+
+# Run e2e agent lifecycle test (requires Docker)
+docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-e2e
 
 # Build release
 cargo build --release
