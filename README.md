@@ -168,6 +168,65 @@ bash demos/guardian-barriers-mock/run-demo.sh
 
 Thermal state and process usage ratio can also escalate. Optional **available/total RAM** ratios in config add another signal. **Hysteresis** dampens flapping.
 
+### Querying pressure (`state.json`)
+
+The daemon writes the latest sample to **`~/.guardian/state.json`**. That file is the source of truth for “how much pressure am I under?” — the same metrics hooks inject into Cursor context.
+
+**Quick check:**
+
+```bash
+cat ~/.guardian/state.json | jq '{
+  pressure,
+  cpu_percent,
+  memory_available_gb,
+  swap_used_percent,
+  disk,
+  cursor,
+  sampled_at
+}'
+```
+
+**Fields worth reading**
+
+| Field | What it tells you |
+|--------|-------------------|
+| **`pressure`** | Overall label: `clear`, `strained`, or `critical` (see table above). |
+| **`cpu_percent`** | Host CPU load (representative sample). |
+| **`memory_available_gb`** / **`memory_total_gb`** | Free RAM vs total — tight free memory plus high swap usually means memory pressure. |
+| **`swap_used_percent`** | High values (often **well above** the rough bands in the pressure table) mean the kernel is paging — treat memory as constrained even if CPU looks fine. |
+| **`disk`** | Home volume: **`available_gb`**, **`used_percent`**, and **`level`** (`clear` / `warn` / `critical` from `[disk]` in `config.toml`). **Disk can hit `critical` while `pressure` is only `strained`** — free space still matters for builds, indexers, and swap files. |
+| **`cursor`** | Aggregate Cursor **`resident_memory_megabytes`**, **`process_count`**, and related diagnostics. |
+| **`docker`** | Running-container CPU/memory when Docker is available. |
+| **`sampled_at`** | Time of this sample (RFC3339). Shell hooks **fail-open** if the file is missing or **stale** (typically older than ~30 seconds): they assume `clear` so a stopped daemon does not block you forever. |
+
+**Plain-language read**
+
+- **`clear`** — Headroom for parallel agents, Docker, and heavier terminal work.
+- **`strained`** — Workable, but prefer **sequential** work, fewer parallel chats/subagents, and lighter Docker/indexing until numbers improve.
+- **`critical`** — Strong signal to **avoid adding load**; optional prompt gates may block until you use **`proceed_once`**, **snooze**, or the machine recovers.
+
+**Illustrative snapshot** (shape only; your machine will differ):
+
+```json
+{
+  "pressure": "strained",
+  "cpu_percent": 57.3,
+  "memory_available_gb": 1.36,
+  "swap_used_percent": 86.8,
+  "disk": {
+    "used_percent": 98.1,
+    "level": "critical",
+    "available_gb": 4.2
+  },
+  "cursor": {
+    "resident_memory_megabytes": 2181,
+    "process_count": 21
+  }
+}
+```
+
+In a case like this, the **headline** level is **strained** (between clear and critical), but **swap** is very high and **disk** is already **`critical`** — the limiting factor is often **disk space** (and memory pressure shows up in swap), not CPU percentage alone. See **`hooks/resources.md`** for cleanup ideas.
+
 ---
 
 ## Python and [Monty](https://github.com/pydantic/monty)
