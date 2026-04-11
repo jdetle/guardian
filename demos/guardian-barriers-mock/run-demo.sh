@@ -25,6 +25,7 @@ write_state() {
   "thermal_state": "nominal",
   "docker": {"running_containers": 0, "total_cpu_percent": 0.0, "total_memory_mb": 0},
   "cursor": {"active_sessions": ${sess}, "process_count": 10, "resident_memory_megabytes": 1200},
+  "disk": {"volume_path": "/tmp", "available_gb": 50.0, "total_gb": 100.0, "used_percent": 50.0, "level": "clear"},
   "process_count": 100,
   "max_proc_per_uid": 4000,
   "sampled_at": "${now}"

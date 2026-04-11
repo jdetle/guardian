@@ -57,6 +57,7 @@ fresh_state() {
   "thermal_state": "nominal",
   "docker": {"running_containers": 2, "total_cpu_percent": 10.0, "total_memory_mb": 512},
   "cursor": {"active_sessions": 1, "process_count": 4},
+  "disk": {"volume_path": "/root", "available_gb": 80.0, "total_gb": 100.0, "used_percent": 20.0, "level": "clear"},
   "process_count": 150,
   "max_proc_per_uid": 2048,
   "sampled_at": "$now"

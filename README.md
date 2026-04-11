@@ -25,9 +25,9 @@ Modern agents parallelize aggressively: shells, subagents, `docker compose`, tes
 
 | Piece | Location | Role |
 |---|---|---|
-| `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), writes `state.json` + `hook_policy.json` |
+| `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
 | Cursor hooks | `hooks/` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … |
-| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[cursorignore_policy]` |
+| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[cursorignore_policy]` |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
 | Resume helper | `scripts/guardian-resume.sh` | Snooze gates or one-shot `proceed_once` |
@@ -37,8 +37,8 @@ Modern agents parallelize aggressively: shells, subagents, `docker compose`, tes
 ## How it works
 
 1. **`guardiand`** classifies pressure as `clear`, `strained`, or `critical` (optional **memory headroom ratios** in config).
-2. State is written atomically to `~/.guardian/state.json`; **`hook_policy.json`** mirrors gate settings for shell hooks.
-3. **`beforeSubmitPrompt`** may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure + **session budget**). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
+2. State is written atomically to `~/.guardian/state.json` (including **`disk`** usage on the home volume); **`hook_policy.json`** mirrors gate settings for shell hooks.
+3. **`beforeSubmitPrompt`** may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure and/or **Cursor RSS** above cap). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
 4. **`beforeReadFile`** always **`allow`**s; it may add **advisory** text when a path matches the shipped **cursorignore checklist** and isn’t covered by `.cursorignore` or **`.guardian/cursorignore-allow`**.
 5. **`preToolUse` / `subagentStart`** remain **allow** + advisory (by default).
 6. Under load, the **daemon** enforces Docker throttling, fork guard, etc.
@@ -73,9 +73,15 @@ Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates
 
 Copy in blocked **`user_message`** repeats these hints.
 
-### Session budget (heuristic)
+### Session budget (Cursor memory)
 
-`cursor.active_sessions` counts **directories under `~/.cursor/projects`** (proxy for parallel workspace load—not a perfect Agent-tab count). When above **`[session_budget].max_active_sessions`**, **`beforeSubmitPrompt`** can block until you close or finish other sessions (or use resume overrides).
+**`[session_budget]`** uses aggregate **Cursor RSS** in megabytes (`state.json` → `cursor.resident_memory_megabytes`, summed from `Cursor*` processes via `ps`). When RSS exceeds **`max_cursor_rss_megabytes`**, **`beforeSubmitPrompt`** can block (or use resume overrides). **`warn_cursor_rss_megabytes`** drives an advisory in **`sessionStart`**. Set **`max_cursor_rss_megabytes = 0`** to disable RSS-based blocking.
+
+`cursor.active_sessions` still counts **directories under `~/.cursor/projects`** for diagnostics only (that count can stay high from stale folders).
+
+### Disk (`[disk]`)
+
+**`[disk]`** samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
 
 ### `.cursorignore` hygiene
 
@@ -83,9 +89,9 @@ Shipped patterns live in `hooks/cursorignore-checklist.json`. Per-repo exception
 
 ### Configure
 
-Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[cursorignore_policy]`).
+Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[disk]`, `[cursorignore_policy]`).
 
-**Restart `guardiand` after changing `config.toml`** (for example re-run `bash scripts/install.sh`, or `launchctl unload` / `launchctl load` on `~/Library/LaunchAgents/com.guardian.guardiand.plist`). The daemon writes **`~/.guardian/hook_policy.json` at startup** from config; until it restarts, shell hooks keep using the previous snapshot, so prompt gates and cursorignore policy flags may not match your new thresholds or `[prompt_gate]` / `[cursorignore_policy]` sections.
+**Restart `guardiand` after changing `config.toml`** (for example re-run `bash scripts/install.sh`, or `launchctl unload` / `launchctl load` on `~/Library/LaunchAgents/com.guardian.guardiand.plist`). The daemon writes **`~/.guardian/hook_policy.json` at startup** from config; until it restarts, shell hooks keep using the previous snapshot, so prompt gates and cursorignore policy flags may not match your new thresholds or `[prompt_gate]` / `[session_budget]` / `[disk]` / `[cursorignore_policy]` sections.
 
 Optional memory **ratio** thresholds (inside `[thresholds]`):
 
@@ -98,7 +104,7 @@ critical_memory_available_ratio = 0.08
 
 ```bash
 launchctl list com.guardian.guardiand
-cat ~/.guardian/state.json | jq '{pressure, cursor}'
+cat ~/.guardian/state.json | jq '{pressure, cursor, disk}'
 cat ~/.guardian/hook_policy.json
 cat ~/.cursor/hooks.json | jq '.hooks | keys'
 ```

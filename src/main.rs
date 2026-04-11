@@ -14,11 +14,12 @@ use config::{load_config, GuardianConfig};
 use hook_policy::write_hook_policy;
 use docker::stats::DockerClient;
 use sampler::cpu::{cpu_usage_percent, CpuSnapshot};
+use sampler::disk::compute_disk_state;
 use sampler::memory::MemoryInfo;
 use sampler::process::{cursor_rss_megabytes, ProcessInfo};
 use sampler::swap::SwapInfo;
 use sampler::thermal::ThermalState;
-use state::{CursorState, DockerState, GuardianState, write_state};
+use state::{CursorState, DiskState, DockerState, GuardianState, write_state};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -238,6 +239,8 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>) {
             resident_memory_megabytes: cursor_rss_mb,
         };
 
+        let disk_state = compute_disk_state(&config.disk);
+
         let now = chrono::Utc::now().to_rfc3339();
         let guardian_state = GuardianState {
             pressure,
@@ -248,6 +251,7 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>) {
             thermal_state: thermal,
             docker: docker_state,
             cursor: cursor_state,
+            disk: disk_state,
             process_count: procs.as_ref().map(|p| p.total_count).unwrap_or(0),
             max_proc_per_uid: procs.as_ref().map(|p| p.max_proc_per_uid).unwrap_or(0),
             sampled_at: now,
@@ -271,6 +275,7 @@ fn write_shutdown_state() {
         thermal_state: ThermalState::Unknown,
         docker: DockerState::default(),
         cursor: CursorState::default(),
+        disk: DiskState::default(),
         process_count: 0,
         max_proc_per_uid: 0,
         sampled_at: chrono::Utc::now().to_rfc3339(),

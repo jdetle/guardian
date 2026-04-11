@@ -19,9 +19,9 @@ cursor_sess=$(read_state_field "cursor.active_sessions" "0")
 cursor_mb=$(read_state_field "cursor.resident_memory_megabytes" "0")
 
 policy_file=$(guardian_hook_policy_file)
-warn_sess="5"
+warn_rss="4096"
 if [ -n "${policy_file:-}" ] && [ -f "$policy_file" ]; then
-    warn_sess=$(jq -r '.session_budget.warn_active_sessions // 5' "$policy_file")
+    warn_rss=$(jq -r '.session_budget.warn_cursor_rss_megabytes // 4096' "$policy_file")
 fi
 
 if [ -n "$conversation_id" ]; then
@@ -48,10 +48,25 @@ case "$pressure" in
         ;;
 esac
 
-# Heuristic parallel load (see README): count of dirs under ~/.cursor/projects
-context="${context} Cursor workspaces tracked ≈ ${cursor_sess}; Cursor RSS ≈ ${cursor_mb} MB (best-effort)."
-if [ "${cursor_sess%%.*}" -ge "${warn_sess%%.*}" ] 2>/dev/null; then
-    context="${context} NOTE: High parallel workspace count — finish or archive other Agent/Composer sessions before heavy work. See hooks/resources.md."
+# Workspace folder count is diagnostic only (stale dirs accumulate); RSS reflects actual load.
+context="${context} Cursor workspace folders under ~/.cursor/projects ≈ ${cursor_sess}; Cursor RSS ≈ ${cursor_mb} MB (best-effort)."
+cm="${cursor_mb%%.*}"
+wr="${warn_rss%%.*}"
+if [ "${wr:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt "${wr:-0}" ] 2>/dev/null; then
+    context="${context} NOTE: Cursor memory use is high (${cursor_mb} MB RSS, warn above ${warn_rss} MB) — prefer finishing or archiving heavy threads before more parallel work. See hooks/resources.md."
 fi
+
+disk_level=$(read_state_field "disk.level" "clear")
+disk_used=$(read_state_field "disk.used_percent" "0")
+disk_avail=$(read_state_field "disk.available_gb" "0")
+disk_vol=$(read_state_field "disk.volume_path" "")
+case "$disk_level" in
+    warn)
+        context="${context} NOTE: Home volume disk use is elevated (~${disk_used}% used, ~${disk_avail} GB free at ${disk_vol}). Free space: prune stale git worktrees, Docker images (docker system df / docker image prune), and large build caches — see hooks/resources.md."
+        ;;
+    critical)
+        context="${context} DISK ALERT: Home volume is very full (~${disk_used}% used, ~${disk_avail} GB free at ${disk_vol}). Free space urgently: worktrees, docker image prune, target/node_modules/DerivedData caches — see hooks/resources.md."
+        ;;
+esac
 
 json_output "$(jq -n --arg ctx "$context" '{additional_context: $ctx}')"

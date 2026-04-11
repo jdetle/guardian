@@ -17,6 +17,8 @@ pub struct GuardianConfig {
     pub session_budget: SessionBudgetConfig,
     #[serde(default)]
     pub cursorignore_policy: CursorIgnorePolicyConfig,
+    #[serde(default)]
+    pub disk: DiskConfig,
 }
 
 impl Default for GuardianConfig {
@@ -29,8 +31,38 @@ impl Default for GuardianConfig {
             prompt_gate: PromptGateConfig::default(),
             session_budget: SessionBudgetConfig::default(),
             cursorignore_policy: CursorIgnorePolicyConfig::default(),
+            disk: DiskConfig::default(),
         }
     }
+}
+
+/// Thresholds for home-volume disk advisories (`state.json` → `disk`).
+#[derive(Deserialize, Clone, Debug)]
+pub struct DiskConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_disk_warn_used_percent")]
+    pub warn_used_percent: f64,
+    #[serde(default = "default_disk_critical_used_percent")]
+    pub critical_used_percent: f64,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warn_used_percent: default_disk_warn_used_percent(),
+            critical_used_percent: default_disk_critical_used_percent(),
+        }
+    }
+}
+
+fn default_disk_warn_used_percent() -> f64 {
+    85.0
+}
+
+fn default_disk_critical_used_percent() -> f64 {
+    93.0
 }
 
 /// Policy for `beforeSubmitPrompt` (also written to `hook_policy.json` for shell hooks).
@@ -59,30 +91,40 @@ fn default_block_on() -> String {
     "critical".to_string()
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+/// Gates derived from aggregate Cursor RSS (`state.json` → `cursor.resident_memory_megabytes`),
+/// not from `~/.cursor/projects` folder count (that field remains diagnostic-only in state).
+#[derive(Deserialize, Clone, Debug)]
 pub struct SessionBudgetConfig {
-    /// Guardian counts workspace folders under `~/.cursor/projects` (heuristic proxy).
-    #[serde(default = "default_max_sessions")]
-    pub max_active_sessions: u32,
-    #[serde(default = "default_warn_sessions")]
-    pub warn_active_sessions: u32,
+    /// Block `beforeSubmitPrompt` when Cursor RSS exceeds this (MB). `0` disables RSS blocking.
+    #[serde(default = "default_max_cursor_rss_mb")]
+    pub max_cursor_rss_megabytes: u64,
+    /// Session-start advisory when Cursor RSS exceeds this (MB).
+    #[serde(default = "default_warn_cursor_rss_mb")]
+    pub warn_cursor_rss_megabytes: u64,
+    /// Legacy keys — ignored for gates; kept so older `config.toml` still deserializes.
+    #[serde(default)]
+    pub max_active_sessions: Option<u32>,
+    #[serde(default)]
+    pub warn_active_sessions: Option<u32>,
 }
 
 impl Default for SessionBudgetConfig {
     fn default() -> Self {
         Self {
-            max_active_sessions: default_max_sessions(),
-            warn_active_sessions: default_warn_sessions(),
+            max_cursor_rss_megabytes: default_max_cursor_rss_mb(),
+            warn_cursor_rss_megabytes: default_warn_cursor_rss_mb(),
+            max_active_sessions: None,
+            warn_active_sessions: None,
         }
     }
 }
 
-fn default_max_sessions() -> u32 {
-    8
+fn default_max_cursor_rss_mb() -> u64 {
+    8192
 }
 
-fn default_warn_sessions() -> u32 {
-    5
+fn default_warn_cursor_rss_mb() -> u64 {
+    4096
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]

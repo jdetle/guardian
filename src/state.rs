@@ -16,9 +16,42 @@ pub struct GuardianState {
     pub thermal_state: ThermalState,
     pub docker: DockerState,
     pub cursor: CursorState,
+    #[serde(default)]
+    pub disk: DiskState,
     pub process_count: u32,
     pub max_proc_per_uid: u32,
     pub sampled_at: String,
+}
+
+/// Disk usage on the volume containing the home directory (`statvfs`).
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskPressureLevel {
+    #[default]
+    Clear,
+    Warn,
+    Critical,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DiskState {
+    pub volume_path: String,
+    pub available_gb: f64,
+    pub total_gb: f64,
+    pub used_percent: f64,
+    pub level: DiskPressureLevel,
+}
+
+impl Default for DiskState {
+    fn default() -> Self {
+        Self {
+            volume_path: String::new(),
+            available_gb: 0.0,
+            total_gb: 0.0,
+            used_percent: 0.0,
+            level: DiskPressureLevel::Clear,
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -30,6 +63,7 @@ pub struct DockerState {
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct CursorState {
+    /// Directories under `~/.cursor/projects` (diagnostic; stale entries accumulate).
     pub active_sessions: u32,
     pub process_count: u32,
     /// Sum of RSS for processes whose short name starts with `Cursor` (best-effort via `ps`).
