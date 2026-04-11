@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CURSOR_DIR="$HOME/.cursor"
+GUARDIAN_DIR="${GUARDIAN_DIR:-$HOME/.guardian}"
 HOOKS_DIR="$CURSOR_DIR/hooks/guardian"
 
 echo "=== Guardian Hooks Installer ==="
@@ -13,11 +14,23 @@ echo "[1/3] Installing hook scripts to $HOOKS_DIR..."
 mkdir -p "$HOOKS_DIR"
 cp "$SCRIPT_DIR/lib.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/session-start.sh" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/before-submit-prompt.sh" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/before-read-file.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/pre-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/subagent-start.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/post-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/stop.sh" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/cursorignore_check.py" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/cursorignore-checklist.json" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/hook_policy.default.json" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/resources.md" "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR"/*.sh
+chmod +x "$HOOKS_DIR/cursorignore_check.py" 2>/dev/null || true
+mkdir -p "$GUARDIAN_DIR"
+if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
+    cp "$SCRIPT_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
+    echo "  Installed default ~/.guardian/hook_policy.json (edit to tune gates)"
+fi
 
 # Merge hooks.json
 echo "[2/3] Configuring hooks.json..."

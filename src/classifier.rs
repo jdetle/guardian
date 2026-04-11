@@ -22,14 +22,32 @@ impl std::fmt::Display for PressureLevel {
 pub struct ClassifierInput {
     pub cpu_percent: f64,
     pub memory_available_gb: f64,
+    pub memory_total_gb: f64,
     pub swap_used_percent: f64,
     pub thermal: ThermalState,
     pub process_usage_ratio: f64,
 }
 
+fn memory_available_ratio(input: &ClassifierInput) -> f64 {
+    if input.memory_total_gb <= 0.01 {
+        return 1.0;
+    }
+    input.memory_available_gb / input.memory_total_gb
+}
+
 pub fn classify(input: &ClassifierInput, cfg: &ThresholdConfig) -> PressureLevel {
+    let ratio = memory_available_ratio(input);
+
+    let ratio_critical = cfg
+        .critical_memory_available_ratio
+        .is_some_and(|r| ratio < r);
+    let ratio_strained = cfg
+        .strained_memory_available_ratio
+        .is_some_and(|r| ratio < r);
+
     if input.cpu_percent > cfg.critical_cpu_percent
         || input.memory_available_gb < cfg.critical_memory_gb
+        || ratio_critical
         || input.swap_used_percent > cfg.critical_swap_percent
         || input.thermal == ThermalState::Critical
         || input.thermal == ThermalState::Serious
@@ -40,6 +58,7 @@ pub fn classify(input: &ClassifierInput, cfg: &ThresholdConfig) -> PressureLevel
 
     if input.cpu_percent > cfg.strained_cpu_percent
         || input.memory_available_gb < cfg.strained_memory_gb
+        || ratio_strained
         || input.swap_used_percent > cfg.strained_swap_percent
         || input.thermal == ThermalState::Fair
         || input.process_usage_ratio > 0.6
@@ -64,6 +83,7 @@ mod tests {
         ClassifierInput {
             cpu_percent: 30.0,
             memory_available_gb: 8.0,
+            memory_total_gb: 16.0,
             swap_used_percent: 5.0,
             thermal: ThermalState::Nominal,
             process_usage_ratio: 0.2,
@@ -192,5 +212,21 @@ mod tests {
         let mut input = nominal_input();
         input.swap_used_percent = 99.0;
         assert_eq!(classify(&input, &defaults()), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn memory_available_ratio_can_escalate() {
+        let mut cfg = defaults();
+        cfg.strained_memory_available_ratio = Some(0.25);
+        cfg.critical_memory_available_ratio = Some(0.10);
+        let mut input = nominal_input();
+        input.memory_total_gb = 16.0;
+        input.memory_available_gb = 1.0; // 1/16 = 0.0625 < 0.10
+        assert_eq!(classify(&input, &cfg), PressureLevel::Critical);
+
+        let mut input2 = nominal_input();
+        input2.memory_total_gb = 16.0;
+        input2.memory_available_gb = 3.0; // 3/16 = 0.1875 < 0.25, not < 0.10
+        assert_eq!(classify(&input2, &cfg), PressureLevel::Strained);
     }
 }

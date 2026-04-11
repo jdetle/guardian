@@ -1,160 +1,149 @@
 # Guardian
 
-System resource monitor daemon for macOS that protects Cursor agent sessions from resource exhaustion.
+**Keep AI coding agents fast—and keep your Mac usable.**
 
-## Components
+Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what Cursor agents are allowed to assume*. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when pressure or parallel workspace load is too high, with **human-in-the-loop** resume paths.
 
-| Component | Path | Purpose |
+---
+
+## Why this exists
+
+Modern agents parallelize aggressively: shells, subagents, `docker compose`, test runners. That’s great for throughput until CPU pegs, memory vanishes, and swap turns your machine into sludge. **Guardian exists so agents can see the wall before they hit it**—and so protection isn’t “hope the model reads the room.”
+
+| Without Guardian | With Guardian |
+|---|---|
+| Agents guess load from vibes | Every session starts with **real** CPU, memory, swap, thermal, Docker signal |
+| No guard on user sends under load | **`beforeSubmitPrompt`** can block sends when policy says so (with **resume** options) |
+| Runaway containers amplify pain | Optional **Docker CPU throttling** on non-essential services under strain |
+| Fork storms take down the session | **Fork guard** with optional kill for pathological spawns |
+
+**Core value proposition:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional prompt gates with resume.*
+
+---
+
+## What ships in this repo
+
+| Piece | Location | Role |
 |---|---|---|
-| `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker stats every 2s |
-| Cursor hooks | `hooks/` | Shell scripts — inject system pressure advisories into agent context |
-| Guardian.app | `app/` | SwiftUI menu bar app — visualize metrics, manage Docker, view sessions |
-| Stress tests | `tests/stress/` | Containerized stress/chaos tests for the daemon |
+| `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), writes `state.json` + `hook_policy.json` |
+| Cursor hooks | `hooks/` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … |
+| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[cursorignore_policy]` |
+| Guardian.app | `app/` | SwiftUI menu bar app (optional) |
+| Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
+| Resume helper | `scripts/guardian-resume.sh` | Snooze gates or one-shot `proceed_once` |
 
-## How It Works
+---
 
-1. **`guardiand`** samples system metrics every 2 seconds and classifies pressure as `clear`, `strained`, or `critical`
-2. State is written atomically to `~/.guardian/state.json` with symlink protection
-3. **Cursor hooks** read the state file and inject advisory messages into agent sessions
-4. At `strained`/`critical` pressure, the daemon directly enforces limits:
-   - Docker CPU throttling on non-essential containers
-   - Fork guard warnings and optional process killing for runaway spawns
-5. Hooks never deny tool calls — they only inform. The daemon handles enforcement.
+## How it works
 
-## Quick Start
+1. **`guardiand`** classifies pressure as `clear`, `strained`, or `critical` (optional **memory headroom ratios** in config).
+2. State is written atomically to `~/.guardian/state.json`; **`hook_policy.json`** mirrors gate settings for shell hooks.
+3. **`beforeSubmitPrompt`** may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure + **session budget**). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
+4. **`beforeReadFile`** always **`allow`**s; it may add **advisory** text when a path matches the shipped **cursorignore checklist** and isn’t covered by `.cursorignore` or **`.guardian/cursorignore-allow`**.
+5. **`preToolUse` / `subagentStart`** remain **allow** + advisory (by default).
+6. Under load, the **daemon** enforces Docker throttling, fork guard, etc.
+
+---
+
+## Quick start
 
 ### Prerequisites
 
 - macOS 14+ (Sonoma)
-- Rust toolchain (`rustup`)
-- `jq` and `sqlite3` (pre-installed on macOS)
+- Rust (`rustup`)
+- `jq` and `sqlite3` (bundled on macOS)
+- `python3` (for `hooks/cursorignore_check.py`; macOS/Xcode CLI usually provide it)
 
 ### Install
 
 ```bash
-# 1. Build and install the daemon as a LaunchAgent
 bash scripts/install.sh
-
-# 2. Install Cursor hooks globally
 bash hooks/install-hooks.sh
 ```
 
-Both steps are required. The daemon monitors system resources and writes
-pressure state to `~/.guardian/state.json`. The hooks read that state and
-inject it into Cursor agent sessions — without global hook installation,
-agents have no visibility into system pressure.
+Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates without recompiling).
 
-### What Global Hook Installation Does
+### Prompt gates and resume
 
-`hooks/install-hooks.sh` performs three things:
+| Action | Command / file |
+|--------|------------------|
+| Allow **one** blocked send | `touch ~/.guardian/proceed_once` then submit again |
+| Snooze gates ~15 minutes | `bash scripts/guardian-resume.sh snooze 15` |
+| Clear snooze | `bash scripts/guardian-resume.sh clear-snooze` |
 
-1. Copies hook scripts to `~/.cursor/hooks/guardian/`
-2. Merges Guardian's hook registrations into `~/.cursor/hooks.json` (backs up the original to `hooks.json.bak`)
-3. Rewrites relative command paths to absolute paths so Cursor can find them from any workspace
+Copy in blocked **`user_message`** repeats these hints.
 
-After installation, every new Cursor agent session will display:
+### Session budget (heuristic)
 
+`cursor.active_sessions` counts **directories under `~/.cursor/projects`** (proxy for parallel workspace load—not a perfect Agent-tab count). When above **`[session_budget].max_active_sessions`**, **`beforeSubmitPrompt`** can block until you close or finish other sessions (or use resume overrides).
+
+### `.cursorignore` hygiene
+
+Shipped patterns live in `hooks/cursorignore-checklist.json`. Per-repo exceptions: **`.guardian/cursorignore-allow`** (one glob per line, `#` comments). See `hooks/resources.md`.
+
+### Configure
+
+Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[cursorignore_policy]`). Restart the LaunchAgent after changes.
+
+Optional memory **ratio** thresholds (inside `[thresholds]`):
+
+```toml
+strained_memory_available_ratio = 0.15
+critical_memory_available_ratio = 0.08
 ```
-[Guardian] Agent registered and monitored (daemon active).
-System resources: nominal (CPU: 15%, Memory: 6GB free).
-```
-
-If the daemon is not running, agents see:
-
-```
-[Guardian] Agent registered (daemon not detected — resource data unavailable).
-```
-
-This message appears in the `sessionStart` hook's `additional_context`.
-The `preToolUse` and `subagentStart` hooks also inject advisory messages
-when pressure is `strained` or `critical`, guiding agents to throttle
-their own parallelism.
 
 ### Verify
 
 ```bash
-# Check the daemon is running
 launchctl list com.guardian.guardiand
-cat ~/.guardian/state.json | jq .pressure
-
-# Check hooks are registered globally
+cat ~/.guardian/state.json | jq '{pressure, cursor}'
+cat ~/.guardian/hook_policy.json
 cat ~/.cursor/hooks.json | jq '.hooks | keys'
-
-# Check hook scripts are installed
-ls ~/.cursor/hooks/guardian/
-```
-
-### Configure
-
-Edit `~/.guardian/config.toml`:
-
-```toml
-sample_interval_secs = 2
-
-[thresholds]
-strained_cpu_percent = 70.0
-critical_cpu_percent = 90.0
-strained_memory_gb = 2.0
-critical_memory_gb = 1.0
-
-[docker]
-essential_containers = ["postgres"]
-auto_throttle = true
-
-[fork_guard]
-enabled = true
-kill_enabled = false
-```
-
-Restart the daemon after config changes:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.guardian.guardiand.plist
-launchctl load ~/Library/LaunchAgents/com.guardian.guardiand.plist
 ```
 
 ### Uninstall
 
 ```bash
-# Remove the daemon
 bash scripts/uninstall.sh
-
-# Remove global hooks
 rm -rf ~/.cursor/hooks/guardian/
-# Edit ~/.cursor/hooks.json to remove Guardian entries, or restore the backup:
-cp ~/.cursor/hooks.json.bak ~/.cursor/hooks.json
-
-# Remove all Guardian data
 rm -rf ~/.guardian/
 ```
+
+---
 
 ## Development
 
 ```bash
-# Build
 cargo build
-
-# Run unit tests
 cargo test
 
-# Run containerized hook tests (requires Docker)
 docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-test
-
-# Run e2e agent lifecycle test (requires Docker)
 docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-e2e
 
-# Build release
-cargo build --release
+# Mock hook I/O (no Docker)
+bash demos/guardian-barriers-mock/run-demo.sh
 ```
 
-## Pressure Levels
+---
 
-| Level | CPU | Memory Available | Swap Used |
+## Pressure levels
+
+| Level | CPU | Memory free | Swap used |
 |---|---|---|---|
 | `clear` | < 70% | > 2 GB | < 25% |
-| `strained` | 70-90% | 1-2 GB | 25-50% |
+| `strained` | 70–90% | 1–2 GB | 25–50% |
 | `critical` | > 90% | < 1 GB | > 50% |
 
-Thermal state (`Serious`/`Critical`) and process usage ratio (> 0.6 / > 0.8) also trigger escalation.
+Thermal state and process usage ratio can also escalate. Optional **available/total RAM** ratios in config add another signal. **Hysteresis** dampens flapping.
 
-Hysteresis prevents oscillation: escalation requires 2 consecutive samples, de-escalation requires 3.
+---
+
+## Python and [Monty](https://github.com/pydantic/monty)
+
+This repo includes small **Python** helpers under `hooks/` (stdlib only). We reference **[Monty](https://github.com/pydantic/monty)**—a **minimal Python interpreter in Rust** for **safe execution of LLM-generated code**—because it reduces attack surface versus unconstrained CPython in agent loops. Guardian hook scripts still run under **`python3`** on the host for Cursor; keep them small and auditable. See `.cursor/rules/monty-python.mdc`.
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

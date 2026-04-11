@@ -76,6 +76,33 @@ fn max_proc_per_uid() -> Option<u32> {
 
 /// Count processes matching a name prefix using `ps` command.
 /// More reliable than parsing raw kinfo_proc structs.
+/// Sum resident memory for macOS `ps` lines where the command starts with `Cursor` (kilobytes → megabytes).
+pub fn cursor_rss_megabytes() -> u64 {
+    let output = Command::new("ps").args(["-axo", "rss,ucomm"]).output();
+    let Ok(output) = output else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut kb_total: u64 = 0;
+    for line in text.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.splitn(2, |c: char| c.is_whitespace());
+        let rss_part = it.next().unwrap_or("");
+        let comm_part = it.next().unwrap_or("").trim_start();
+        if !comm_part.starts_with("Cursor") {
+            continue;
+        }
+        kb_total += rss_part.parse::<u64>().unwrap_or(0);
+    }
+    kb_total / 1024
+}
+
 fn count_processes_by_name(name_prefix: &str) -> u32 {
     let output = Command::new("ps")
         .args(["-u", &unsafe { libc::getuid() }.to_string(), "-o", "comm="])

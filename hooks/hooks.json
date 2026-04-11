@@ -1,6 +1,19 @@
 {
   "version": 1,
   "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "./hooks/before-submit-prompt.sh",
+        "timeout": 6
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "./hooks/before-read-file.sh",
+        "timeout": 5,
+        "failClosed": false
+      }
+    ],
     "sessionStart": [
       {
         "command": "./hooks/session-start.sh",

@@ -1,14 +1,18 @@
 ---
-description: Instructs agents to respect Guardian daemon advisories and system resource limits
+description: Instructs agents to respect Guardian daemon advisories, prompt gates, and system resource limits
 alwaysApply: true
-version: "2.0"
-lastUpdated: "2026-03-23"
+version: "3.0"
+lastUpdated: "2026-04-11"
 author: "john"
 tags: [guardian, system, agent, docker]
 ---
 # System Guardian — Respect Resource Limits
 
-A daemon (`guardiand`) monitors system resources every 2 seconds and writes pressure state to `~/.guardian/state.json`. Cursor hooks read this state and inject advisory messages into agent context. The daemon enforces resource limits directly (Docker throttling, fork guard); hooks never deny tool calls.
+A daemon (`guardiand`) monitors system resources every ~2 seconds and writes pressure state to `~/.guardian/state.json`. Cursor hooks read this state and inject advisory messages into agent context. The daemon enforces resource limits directly (Docker throttling, fork guard).
+
+**Prompt gates:** `beforeSubmitPrompt` may return `continue: false` when `~/.guardian/hook_policy.json` and live metrics indicate high pressure or too many parallel workspace roots (heuristic). Users can resume with `~/.guardian/proceed_once` or snooze — see `hooks/resources.md` and `scripts/guardian-resume.sh`. **`preToolUse` / `subagentStart` default to allow** with advisories unless you change local policy.
+
+**Read paths:** `beforeReadFile` always allows; it may warn when a path matches the shipped cursorignore checklist and is not ignored — add `.cursorignore` lines or `.guardian/cursorignore-allow` in the repo.
 
 ## Pressure Levels
 
@@ -22,7 +26,7 @@ A daemon (`guardiand`) monitors system resources every 2 seconds and writes pres
 
 ### 1. When the session start context mentions system pressure, respect it
 
-The `sessionStart` hook injects a system pressure message into the agent's context. If it says "SYSTEM ALERT" or "SYSTEM NOTE", follow the guidance:
+The `sessionStart` hook injects system pressure and parallel-session hints. If it says "SYSTEM ALERT" or "SYSTEM NOTE", follow the guidance:
 
 - **Critical**: Do not spawn subagents. Do not run parallel Shell commands. Work sequentially and minimize resource consumption.
 - **Strained**: Prefer sequential over parallel work. Limit subagent spawns to 1 at a time. Avoid `docker compose up` or other Docker-heavy commands.
@@ -39,57 +43,27 @@ When pressure is `strained` or `critical`:
 
 ### 3. Minimize parallel subagent spawning
 
-Even when pressure is `clear`, cap parallel subagents to 3. Agents should proactively limit themselves:
-
-- Launch one subagent at a time when possible
-- Use sequential tool calls for dependent operations
-- Only parallelize truly independent, lightweight tasks
+Even when pressure is `clear`, cap parallel subagents to 3. Prefer one subagent at a time when possible.
 
 ### 4. Respect advisory messages from hooks
 
-The `preToolUse` and `subagentStart` hooks always allow tool calls but may include an `agent_message` with current system load information. When you receive one of these messages:
-
-1. Factor the resource information into your next decision (e.g., prefer sequential over parallel)
-2. If multiple consecutive messages report high load, mention the resource constraint to the user
-3. The daemon handles enforcement (Docker CPU throttling, fork-bomb mitigation) — hooks only inform
+`preToolUse` and `subagentStart` allow tool calls but may include `agent_message` with load information. `beforeReadFile` may warn about large/generated paths — prefer narrowing scope with `.cursorignore`.
 
 ### 5. Monitor your own resource footprint
 
-When performing resource-intensive operations:
-
-- **Compilation**: Run `cargo build` or `swift build` one at a time, not in parallel
-- **Testing**: Batch tests in groups of 5 (per `bun-test-ci-safety.mdc`)
+- **Compilation**: Run `cargo build` or `swift build` one at a time
 - **File operations**: Prefer targeted reads over full-directory scans
-- **Git operations**: Avoid `git log --all` or other unbounded queries
 
 ## Reading System State
 
-If an agent needs to check current system pressure without waiting for a hook:
-
 ```bash
-cat ~/.guardian/state.json | jq '.pressure'
-```
-
-Or read the full state for more details:
-
-```bash
-cat ~/.guardian/state.json
+cat ~/.guardian/state.json | jq '.pressure, .cursor'
 ```
 
 ## Docker Resource Limits
 
-All Docker Compose services have `deploy.resources.limits` configured. The total ceiling is ~8.5 CPUs and ~4.8 GB across 14 services, leaving headroom for Cursor, the daemon, and macOS.
-
-When the Guardian daemon detects `critical` pressure, it may:
-- Apply CPU throttles to non-essential containers (0.5 CPU cap)
-- Apply soft throttles at `strained` (0.75 CPU cap)
-- The agent should not undo these throttles
+When the Guardian daemon detects `critical` pressure, it may throttle non-essential containers. Do not undo those throttles.
 
 ## Session ROI Tracking
 
-Every agent session is tracked in `~/.guardian/sessions.db`. The `stop` hook computes an ROI score based on:
-- Session outcome (completed/error/aborted)
-- Tool call count and efficiency
-- System resource cost during the session
-
-Agents do not need to interact with this system — it runs transparently via hooks.
+Sessions are tracked in `~/.guardian/sessions.db`; the `stop` hook records outcomes — transparent to normal agent work.
