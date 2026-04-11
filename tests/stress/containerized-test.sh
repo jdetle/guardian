@@ -97,8 +97,8 @@ test_hook_allows "subagent: clear pressure" \
     '{"pressure":"clear","cpu_percent":10,"memory_available_gb":6,"cursor":{"active_sessions":1}}' \
     "$HOOKS_DIR/subagent-start.sh"
 
-test_hook_allows "subagent: strained with many sessions" \
-    '{"pressure":"strained","cpu_percent":88,"memory_available_gb":0.8,"cursor":{"active_sessions":5}}' \
+test_hook_allows "subagent: strained with Cursor RSS / processes" \
+    '{"pressure":"strained","cpu_percent":88,"memory_available_gb":0.8,"cursor":{"resident_memory_megabytes":2400,"process_count":12}}' \
     "$HOOKS_DIR/subagent-start.sh"
 
 test_hook_allows "subagent: critical pressure" \
@@ -262,9 +262,10 @@ echo -e "\n${BOLD}${CYAN}=== Test Group 7: Prompt gate & read advisory ===${NC}"
 fresh_state() {
     local pressure="$1"
     local sess="${2:-2}"
+    local rss="${3:-100}"
     local now
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    echo "{\"pressure\":\"${pressure}\",\"cpu_percent\":90,\"memory_available_gb\":0.4,\"swap_used_percent\":70,\"sampled_at\":\"${now}\",\"cursor\":{\"active_sessions\":${sess},\"resident_memory_megabytes\":100}}"
+    echo "{\"pressure\":\"${pressure}\",\"cpu_percent\":90,\"memory_available_gb\":0.4,\"swap_used_percent\":70,\"sampled_at\":\"${now}\",\"cursor\":{\"active_sessions\":${sess},\"resident_memory_megabytes\":${rss}},\"disk\":{\"volume_path\":\"/\",\"available_gb\":50,\"total_gb\":100,\"used_percent\":50,\"level\":\"clear\"}}"
 }
 
 rm -f "$GUARDIAN_DIR/proceed_once" "$GUARDIAN_DIR/snooze_until"
@@ -296,6 +297,15 @@ if [ "$cont" = "true" ]; then
     pass "beforeSubmit: allows when clear"
 else
     fail "beforeSubmit: should allow when clear (got $result)"
+fi
+
+fresh_state clear 2 9000 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+if [ "$cont" = "false" ]; then
+    pass "beforeSubmit: blocks when Cursor RSS over session budget (clear pressure)"
+else
+    fail "beforeSubmit: expected continue false when RSS exceeds max (got $result)"
 fi
 
 fresh_state clear 2 >"$STATE_FILE"

@@ -43,7 +43,6 @@ pressure=$(read_state_pressure)
 mem=$(read_state_field "memory_available_gb" "?")
 cpu=$(read_state_field "cpu_percent" "?")
 swap=$(read_state_field "swap_used_percent" "?")
-cursor_sess=$(read_state_field "cursor.active_sessions" "0")
 cursor_mb=$(read_state_field "cursor.resident_memory_megabytes" "0")
 
 block_on=$(jq -r '.prompt_gate.block_on // "critical"' "$policy_file" 2>/dev/null || echo "never")
@@ -54,18 +53,19 @@ esac
 
 block_sess="true"
 b=$(jq -r '.prompt_gate.block_on_session_budget // true' "$policy_file" 2>/dev/null) && block_sess="$b"
-max_sess="8"
-m=$(jq -r '.session_budget.max_active_sessions // 8' "$policy_file" 2>/dev/null) && max_sess="$m"
+max_rss="8192"
+m=$(jq -r '.session_budget.max_cursor_rss_megabytes // 8192' "$policy_file" 2>/dev/null) && max_rss="$m"
 
 hints=$(guardian_resume_hint_text)
 
 blocked=0
 block_reason=""
 
+# RSS gate: fail-open when RSS is 0 (unmeasured) or max is 0 (disabled)
 if [ "$block_sess" = "true" ]; then
-    cs="${cursor_sess%%.*}"
-    mx="${max_sess%%.*}"
-    if [ "${cs:-0}" -gt "${mx:-999}" ] 2>/dev/null; then
+    cm="${cursor_mb%%.*}"
+    mx="${max_rss%%.*}"
+    if [ "${mx:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt "${mx:-0}" ] 2>/dev/null; then
         blocked=1
         block_reason="session_budget"
     fi
@@ -111,7 +111,7 @@ if [ "$blocked" -eq 1 ]; then
     msg=""
     case "$block_reason" in
         session_budget)
-            msg="[Guardian] Parallel workspace load looks high (~/.cursor/projects count ≈ ${cursor_sess}, configured max ${max_sess}). Finish or stop other Agent/Composer sessions (or close extra windows) before adding more. Cursor ~${cursor_mb} MB RSS. ${hints}"
+            msg="[Guardian] Cursor aggregate memory is high (~${cursor_mb} MB RSS, configured max ${max_rss} MB). Reduce Cursor load or close heavy work before adding more. ${hints}"
             ;;
         pressure)
             msg="[Guardian] System pressure: ${pressure} (CPU ${cpu}%, memory ${mem} GB free, swap ${swap}%). Wait for clear/strained or use override. ${hints}"

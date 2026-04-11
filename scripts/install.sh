@@ -62,9 +62,14 @@ block_on = "critical"
 block_on_session_budget = true
 
 [session_budget]
-# Heuristic: count of workspace folders under ~/.cursor/projects
-max_active_sessions = 8
-warn_active_sessions = 5
+# Aggregate Cursor RSS (MB) from guardiand — not ~/.cursor/projects folder count
+max_cursor_rss_megabytes = 8192
+warn_cursor_rss_megabytes = 4096
+
+[disk]
+enabled = true
+warn_used_percent = 85.0
+critical_used_percent = 93.0
 
 [cursorignore_policy]
 warn_once_per_path = true
