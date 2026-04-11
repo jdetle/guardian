@@ -5,8 +5,10 @@ final class GuardianClient: ObservableObject {
     @Published var state = GuardianStateData()
     @Published var history: [GuardianStateData] = []
     @Published var sessions: [SessionRecord] = []
+    @Published var queueEntries: [AgentQueueEntry] = []
 
     private let stateFileURL: URL
+    private let queueFileURL: URL
     private let dbPath: String
     private var timer: Timer?
     private var sessionTimer: Timer?
@@ -17,14 +19,17 @@ final class GuardianClient: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let guardianDir = home.appendingPathComponent(".guardian")
         self.stateFileURL = guardianDir.appendingPathComponent("state.json")
+        self.queueFileURL = guardianDir.appendingPathComponent("agent_queue.jsonl")
         self.dbPath = guardianDir.appendingPathComponent("sessions.db").path
     }
 
     func startPolling() {
         loadState()
+        loadQueue()
         loadSessions()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.loadState()
+            self?.loadQueue()
         }
         sessionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.loadSessions()
@@ -48,6 +53,26 @@ final class GuardianClient: ObservableObject {
             if self.history.count > Self.maxHistoryCount {
                 self.history.removeFirst(self.history.count - Self.maxHistoryCount)
             }
+        }
+    }
+
+    private func loadQueue() {
+        guard let text = try? String(contentsOf: queueFileURL, encoding: .utf8) else {
+            DispatchQueue.main.async { self.queueEntries = [] }
+            return
+        }
+        var parsed: [AgentQueueEntry] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            guard let data = trimmed.data(using: .utf8),
+                  let entry = try? JSONDecoder().decode(AgentQueueEntry.self, from: data) else {
+                continue
+            }
+            parsed.append(entry)
+        }
+        DispatchQueue.main.async {
+            self.queueEntries = parsed
         }
     }
 

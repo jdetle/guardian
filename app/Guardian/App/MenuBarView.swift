@@ -57,12 +57,76 @@ struct MenuBarView: View {
 
             Divider()
 
+            queueSection
+
+            Divider()
+
             Button("Quit Guardian") {
                 NSApplication.shared.terminate(nil)
             }
         }
         .padding()
-        .frame(width: 300)
+        .frame(width: 340)
+    }
+
+    @ViewBuilder
+    private var queueSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "tray.full")
+                Text("Queued jobs")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("\(client.queueEntries.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            if client.queueEntries.isEmpty {
+                Text("No entries in ~/.guardian/agent_queue.jsonl")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(client.queueEntries) { entry in
+                            Button {
+                                CursorWorkspaceOpener.open(workspacePath: entry.workspacePath)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(entry.title)
+                                        .font(.caption)
+                                        .fontWeight(.medium)
+                                        .multilineTextAlignment(.leading)
+                                        .lineLimit(2)
+                                        .foregroundStyle(.primary)
+                                    if let ws = entry.workspacePath, !ws.isEmpty {
+                                        Text(ws)
+                                            .font(.caption2)
+                                            .lineLimit(1)
+                                            .foregroundStyle(.secondary)
+                                    } else {
+                                        Text("Open Cursor (no workspace path stored)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                                .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: 200)
+            }
+
+            Text("Click a row to open that folder in Cursor.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
     }
 
     @ViewBuilder

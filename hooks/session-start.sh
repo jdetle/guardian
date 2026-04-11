@@ -69,4 +69,12 @@ case "$disk_level" in
         ;;
 esac
 
+queue_file="${GUARDIAN_DIR:-$HOME/.guardian}/agent_queue.jsonl"
+if [ -f "$queue_file" ]; then
+    qc=$(grep -c '^{' "$queue_file" 2>/dev/null || echo 0)
+    if [ "${qc:-0}" -gt 0 ] 2>/dev/null; then
+        context="${context} NOTE: ${qc} deferred agent task(s) in ~/.guardian/agent_queue.jsonl — run ~/.guardian/guardian-queue.sh list when pressure is clear (optional notifications: scripts/install-queue-watch.sh in the Guardian repo)."
+    fi
+fi
+
 json_output "$(jq -n --arg ctx "$context" '{additional_context: $ctx}')"

@@ -52,7 +52,7 @@ case "$block_on" in
 esac
 
 block_sess="true"
-b=$(jq -r '.prompt_gate.block_on_session_budget // true' "$policy_file" 2>/dev/null) && block_sess="$b"
+b=$(jq -r '.prompt_gate.block_on_session_budget // false' "$policy_file" 2>/dev/null) && block_sess="$b"
 max_rss="8192"
 m=$(jq -r '.session_budget.max_cursor_rss_megabytes // 8192' "$policy_file" 2>/dev/null) && max_rss="$m"
 
@@ -61,11 +61,17 @@ hints=$(guardian_resume_hint_text)
 blocked=0
 block_reason=""
 
-# RSS gate: fail-open when RSS is 0 (unmeasured) or max is 0 (disabled)
+# RSS gate: fail-open when RSS is 0 (unmeasured) or max is 0 (disabled).
+# Do not block on Cursor RSS alone when pressure is "clear" — if CPU/memory/swap
+# look fine, high RSS is not treated as an emergency (avoids blocking on stale
+# ~/.cursor/projects counts from old hooks or heavy-but-healthy Cursor use).
 if [ "$block_sess" = "true" ]; then
     cm="${cursor_mb%%.*}"
     mx="${max_rss%%.*}"
-    if [ "${mx:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt "${mx:-0}" ] 2>/dev/null; then
+    if [ "$pressure" != "clear" ] 2>/dev/null \
+        && [ "${mx:-0}" -gt 0 ] 2>/dev/null \
+        && [ "${cm:-0}" -gt 0 ] 2>/dev/null \
+        && [ "${cm:-0}" -gt "${mx:-0}" ] 2>/dev/null; then
         blocked=1
         block_reason="session_budget"
     fi
@@ -111,7 +117,7 @@ if [ "$blocked" -eq 1 ]; then
     msg=""
     case "$block_reason" in
         session_budget)
-            msg="[Guardian] Cursor aggregate memory is high (~${cursor_mb} MB RSS, configured max ${max_rss} MB). Reduce Cursor load or close heavy work before adding more. ${hints}"
+            msg="[Guardian] Cursor memory is high (~${cursor_mb} MB RSS, max ${max_rss} MB) while system pressure is ${pressure}. Reduce load or use override. ${hints}"
             ;;
         pressure)
             msg="[Guardian] System pressure: ${pressure} (CPU ${cpu}%, memory ${mem} GB free, swap ${swap}%). Wait for clear/strained or use override. ${hints}"
@@ -122,6 +128,16 @@ if [ "$blocked" -eq 1 ]; then
     esac
     if [ -n "$attach_notes" ]; then
         msg="${msg}"$'\n\n'"${attach_notes}"
+    fi
+    q_enqueue=$(jq -r '.queue.enqueue_on_blocked_submit // false' "$policy_file" 2>/dev/null || echo "false")
+    qid=""
+    if [ "$q_enqueue" = "true" ]; then
+        if qbin=$(guardian_queue_cli); then
+            qid=$(printf '%s' "$input" | "$qbin" enqueue-blocked-json 2>/dev/null || true)
+        fi
+    fi
+    if [ -n "$qid" ]; then
+        msg="${msg}"$'\n'"[Guardian] Saved prompt to work queue (id ${qid}). Run \`~/.guardian/guardian-queue.sh list\` or wait for a clear-pressure notification if queue-watch is installed."
     fi
     json_output "$(jq -n --arg msg "$msg" '{continue: false, user_message: $msg}')"
 fi

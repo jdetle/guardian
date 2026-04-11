@@ -28,6 +28,12 @@ cp "$SCRIPT_DIR/resources.md" "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR"/*.sh
 chmod +x "$HOOKS_DIR/cursorignore_check.py" "$HOOKS_DIR/iso_to_epoch.py" 2>/dev/null || true
 mkdir -p "$GUARDIAN_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -f "$REPO_ROOT/scripts/guardian-queue.sh" ]; then
+    cp "$REPO_ROOT/scripts/guardian-queue.sh" "$GUARDIAN_DIR/"
+    chmod +x "$GUARDIAN_DIR/guardian-queue.sh"
+    echo "  Installed ~/.guardian/guardian-queue.sh (agent work queue CLI)"
+fi
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
     cp "$SCRIPT_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
     echo "  Installed default ~/.guardian/hook_policy.json (edit to tune gates)"

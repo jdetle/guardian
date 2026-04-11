@@ -231,6 +231,17 @@ guardian_resume_hint_text() {
         "$GUARDIAN_DIR" "$GUARDIAN_DIR"
 }
 
+# Path to guardian-queue CLI (installed to ~/.guardian by hooks/install-hooks.sh).
+guardian_queue_cli() {
+    local g="${GUARDIAN_DIR:-$HOME/.guardian}/guardian-queue.sh"
+    if [ -x "$g" ]; then
+        echo "$g"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
 # Returns 0 if we should show cursorignore warning for this path (warn-once cache).
 guardian_cursorignore_should_warn() {
     local path_key="$1"
