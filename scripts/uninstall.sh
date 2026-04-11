@@ -2,9 +2,18 @@
 set -euo pipefail
 
 PLIST_NAME="com.guardian.guardiand.plist"
+QUEUE_PLIST="com.guardian.queue-watch.plist"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 
 echo "=== Guardian Daemon Uninstaller ==="
+
+if launchctl list | grep -q com.guardian.queue-watch 2>/dev/null; then
+    echo "Stopping queue-watch..."
+    launchctl unload "$LAUNCH_AGENTS/$QUEUE_PLIST" 2>/dev/null || true
+fi
+if [ -f "$LAUNCH_AGENTS/$QUEUE_PLIST" ]; then
+    rm -f "$LAUNCH_AGENTS/$QUEUE_PLIST"
+fi
 
 # Stop and unload the service
 if launchctl list | grep -q com.guardian.guardiand 2>/dev/null; then

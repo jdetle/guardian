@@ -19,6 +19,8 @@ pub struct GuardianConfig {
     pub cursorignore_policy: CursorIgnorePolicyConfig,
     #[serde(default)]
     pub disk: DiskConfig,
+    #[serde(default)]
+    pub queue: QueueConfig,
 }
 
 impl Default for GuardianConfig {
@@ -32,6 +34,23 @@ impl Default for GuardianConfig {
             session_budget: SessionBudgetConfig::default(),
             cursorignore_policy: CursorIgnorePolicyConfig::default(),
             disk: DiskConfig::default(),
+            queue: QueueConfig::default(),
+        }
+    }
+}
+
+/// Local agent work queue (`~/.guardian/agent_queue.jsonl`) — see README.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct QueueConfig {
+    /// When true, blocked `beforeSubmitPrompt` may append prompt text to the queue (if extractable).
+    #[serde(default = "default_false")]
+    pub enqueue_on_blocked_submit: bool,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            enqueue_on_blocked_submit: false,
         }
     }
 }
@@ -73,7 +92,8 @@ pub struct PromptGateConfig {
     /// `never` | `strained` | `critical` — block prompt submit when pressure is at or above this band.
     #[serde(default = "default_block_on")]
     pub block_on: String,
-    #[serde(default = "default_true")]
+    /// When true, block submits if Cursor RSS exceeds session budget — only while pressure is not `clear` (see hooks).
+    #[serde(default = "default_false")]
     pub block_on_session_budget: bool,
 }
 
@@ -82,7 +102,7 @@ impl Default for PromptGateConfig {
         Self {
             enabled: true,
             block_on: default_block_on(),
-            block_on_session_budget: true,
+            block_on_session_budget: false,
         }
     }
 }
@@ -237,6 +257,10 @@ fn default_docker_socket() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Deserialize, Clone, Debug)]

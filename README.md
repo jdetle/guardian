@@ -35,8 +35,9 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 |---|---|---|
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
 | Cursor hooks | `hooks/` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … |
-| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[cursorignore_policy]` |
-| Guardian.app | `app/` | SwiftUI menu bar app (optional) |
+| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
+| Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
+| Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
 | Resume helper | `scripts/guardian-resume.sh` | Snooze gates or one-shot `proceed_once` |
 
@@ -83,7 +84,11 @@ Copy in blocked **`user_message`** repeats these hints.
 
 ### Session budget (Cursor memory)
 
-**`[session_budget]`** uses aggregate **Cursor RSS** in megabytes (`state.json` → `cursor.resident_memory_megabytes`, summed from `Cursor*` processes via `ps`). When RSS exceeds **`max_cursor_rss_megabytes`**, **`beforeSubmitPrompt`** can block (or use resume overrides). **`warn_cursor_rss_megabytes`** drives an advisory in **`sessionStart`**. Set **`max_cursor_rss_megabytes = 0`** to disable RSS-based blocking.
+**`[session_budget]`** uses aggregate **Cursor RSS** in megabytes (`state.json` → `cursor.resident_memory_megabytes`, summed from `Cursor*` processes via `ps`). **`warn_cursor_rss_megabytes`** drives an advisory in **`sessionStart`**.
+
+**Prompt blocking** from RSS is controlled by **`[prompt_gate].block_on_session_budget`** (default **off** in new installs). When enabled, **`beforeSubmitPrompt`** only blocks for RSS when **pressure is not `clear`** *and* RSS is above **`max_cursor_rss_megabytes`**—so a healthy machine (clear CPU/memory/swap) is not blocked just because Cursor is using a few GB. Set **`max_cursor_rss_megabytes = 0`** to disable RSS-based blocking entirely.
+
+If you still see messages about **“Parallel workspace load”** and **`~/.cursor/projects` count**, your **`~/.cursor/hooks/guardian/`** scripts are outdated; run **`bash hooks/install-hooks.sh`** from this repo and restart **`guardiand`** so **`~/.guardian/hook_policy.json`** matches **`config.toml`**.
 
 `cursor.active_sessions` still counts **directories under `~/.cursor/projects`** for diagnostics only (that count can stay high from stale folders).
 
@@ -91,15 +96,26 @@ Copy in blocked **`user_message`** repeats these hints.
 
 **`[disk]`** samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
 
+### Deferred work queue (`[queue]`)
+
+Guardian cannot auto-submit prompts into Cursor (no API for that). It **can** persist a **local queue** so you remember what to run when the machine cools off:
+
+- **Storage:** `~/.guardian/agent_queue.jsonl` (append-only JSON lines; treat as **sensitive** — may contain API keys — keep file mode **0600**).
+- **CLI:** after `bash hooks/install-hooks.sh`, use **`~/.guardian/guardian-queue.sh`** (`add`, `list`, `peek`, `pop`, `count`). Example:  
+  `~/.guardian/guardian-queue.sh add "Refactor foo" "Please refactor src/foo.rs …"`
+- **Optional enqueue on block:** set **`[queue].enqueue_on_blocked_submit = true`** in **`config.toml`** and restart **`guardiand`**. When **`beforeSubmitPrompt`** blocks, the hook tries to extract prompt text from Cursor’s JSON (`prompt`, `promptText`, `text`, …) and append it to the queue. If Cursor does not send the text, nothing is stored (blocking still works).
+- **Notifications:** **`bash scripts/install-queue-watch.sh`** installs a small LaunchAgent that polls **`state.json`** and shows a **macOS notification** when pressure returns to **`clear`** and the queue is non-empty (throttled to about once per 5 minutes). **Execution is still manual** (paste into Composer).
+- **Menu bar (Swift app):** build with **`cd app && swift build -c release`** — the extra shows **Queued jobs** from the same JSONL. Rows with a **`workspace_path`** (set when enqueueing from a blocked submit that included **`workspace_roots`**) open that folder in Cursor via **`open -a Cursor <path>`**. Jobs without a path still open the Cursor app.
+
 ### `.cursorignore` hygiene
 
 Shipped patterns live in `hooks/cursorignore-checklist.json`. Per-repo exceptions: **`.guardian/cursorignore-allow`** (one glob per line, `#` comments). See `hooks/resources.md`.
 
 ### Configure
 
-Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[disk]`, `[cursorignore_policy]`).
+Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]`).
 
-**Restart `guardiand` after changing `config.toml`** (for example re-run `bash scripts/install.sh`, or `launchctl unload` / `launchctl load` on `~/Library/LaunchAgents/com.guardian.guardiand.plist`). The daemon writes **`~/.guardian/hook_policy.json` at startup** from config; until it restarts, shell hooks keep using the previous snapshot, so prompt gates and cursorignore policy flags may not match your new thresholds or `[prompt_gate]` / `[session_budget]` / `[disk]` / `[cursorignore_policy]` sections.
+**Restart `guardiand` after changing `config.toml`** (for example re-run `bash scripts/install.sh`, or `launchctl unload` / `launchctl load` on `~/Library/LaunchAgents/com.guardian.guardiand.plist`). The daemon writes **`~/.guardian/hook_policy.json` at startup** from config; until it restarts, shell hooks keep using the previous snapshot, so prompt gates and cursorignore policy flags may not match your new thresholds or `[prompt_gate]` / `[session_budget]` / `[disk]` / `[queue]` / `[cursorignore_policy]` sections.
 
 Optional memory **ratio** thresholds (inside `[thresholds]`):
 

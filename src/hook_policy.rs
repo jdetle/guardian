@@ -1,7 +1,8 @@
 //! Writes `~/.guardian/hook_policy.json` so shell hooks can mirror daemon policy without parsing TOML.
 
 use crate::config::{
-    CursorIgnorePolicyConfig, DiskConfig, GuardianConfig, PromptGateConfig, SessionBudgetConfig,
+    CursorIgnorePolicyConfig, DiskConfig, GuardianConfig, PromptGateConfig, QueueConfig,
+    SessionBudgetConfig,
 };
 use crate::config::guardian_dir;
 use serde::Serialize;
@@ -42,10 +43,24 @@ impl From<&DiskConfig> for HookDiskJson {
 }
 
 #[derive(Serialize)]
+struct HookQueueJson {
+    enqueue_on_blocked_submit: bool,
+}
+
+impl From<&QueueConfig> for HookQueueJson {
+    fn from(c: &QueueConfig) -> Self {
+        Self {
+            enqueue_on_blocked_submit: c.enqueue_on_blocked_submit,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct HookPolicyJson {
     prompt_gate: PromptGateConfig,
     session_budget: HookSessionBudgetJson,
     disk: HookDiskJson,
+    queue: HookQueueJson,
     cursorignore_policy: CursorIgnorePolicyConfig,
 }
 
@@ -57,6 +72,7 @@ pub fn write_hook_policy(cfg: &GuardianConfig) -> std::io::Result<()> {
         prompt_gate: cfg.prompt_gate.clone(),
         session_budget: (&cfg.session_budget).into(),
         disk: (&cfg.disk).into(),
+        queue: (&cfg.queue).into(),
         cursorignore_policy: cfg.cursorignore_policy.clone(),
     };
 

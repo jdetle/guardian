@@ -270,6 +270,13 @@ fresh_state() {
 
 rm -f "$GUARDIAN_DIR/proceed_once" "$GUARDIAN_DIR/snooze_until"
 
+# Default hook_policy ships block_on_session_budget false; enable for RSS gate tests below
+if [ -f "$GUARDIAN_DIR/hook_policy.json" ] && command -v jq &>/dev/null; then
+    hp_tmp=$(mktemp)
+    jq '.prompt_gate.block_on_session_budget = true' "$GUARDIAN_DIR/hook_policy.json" >"$hp_tmp" \
+        && mv "$hp_tmp" "$GUARDIAN_DIR/hook_policy.json"
+fi
+
 fresh_state critical 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
 cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
@@ -299,13 +306,23 @@ else
     fail "beforeSubmit: should allow when clear (got $result)"
 fi
 
-fresh_state clear 2 9000 >"$STATE_FILE"
+# RSS block only when pressure is not clear (see hooks/before-submit-prompt.sh)
+fresh_state strained 2 9000 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
 cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
 if [ "$cont" = "false" ]; then
-    pass "beforeSubmit: blocks when Cursor RSS over session budget (clear pressure)"
+    pass "beforeSubmit: blocks when Cursor RSS over max and pressure is strained"
 else
-    fail "beforeSubmit: expected continue false when RSS exceeds max (got $result)"
+    fail "beforeSubmit: expected continue false when RSS exceeds max under load (got $result)"
+fi
+
+fresh_state clear 2 9000 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: allows high Cursor RSS when pressure is clear"
+else
+    fail "beforeSubmit: should allow when pressure clear even if RSS is high (got $result)"
 fi
 
 fresh_state clear 2 >"$STATE_FILE"

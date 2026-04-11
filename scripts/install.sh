@@ -59,7 +59,8 @@ kill_enabled = false
 [prompt_gate]
 enabled = true
 block_on = "critical"
-block_on_session_budget = true
+# When true, block if Cursor RSS exceeds [session_budget] max while pressure is strained/critical
+block_on_session_budget = false
 
 [session_budget]
 # Aggregate Cursor RSS (MB) from guardiand — not ~/.cursor/projects folder count
@@ -70,6 +71,10 @@ warn_cursor_rss_megabytes = 4096
 enabled = true
 warn_used_percent = 85.0
 critical_used_percent = 93.0
+
+[queue]
+# When true, blocked beforeSubmitPrompt may save prompt text to ~/.guardian/agent_queue.jsonl (if Cursor sends it)
+enqueue_on_blocked_submit = false
 
 [cursorignore_policy]
 warn_once_per_path = true
