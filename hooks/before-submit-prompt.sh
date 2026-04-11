@@ -7,6 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 input=$(read_hook_input)
+if ! printf '%s' "$input" | jq empty 2>/dev/null; then
+    input="{}"
+fi
 
 if guardian_snooze_active; then
     json_output "$(jq -n '{continue: true}')"
@@ -21,7 +24,12 @@ if [ -z "${policy_file:-}" ]; then
     json_output "$(jq -n '{continue: true}')"
 fi
 
-enabled=$(jq -r '.prompt_gate.enabled // true' "$policy_file")
+if ! jq empty "$policy_file" 2>/dev/null; then
+    json_output "$(jq -n '{continue: true, user_message: "[Guardian] hook_policy.json is not valid JSON; skipping prompt gate."}')"
+fi
+
+enabled="true"
+e=$(jq -r '.prompt_gate.enabled // true' "$policy_file" 2>/dev/null) && enabled="$e"
 if [ "$enabled" != "true" ]; then
     json_output "$(jq -n '{continue: true}')"
 fi
@@ -38,9 +46,16 @@ swap=$(read_state_field "swap_used_percent" "?")
 cursor_sess=$(read_state_field "cursor.active_sessions" "0")
 cursor_mb=$(read_state_field "cursor.resident_memory_megabytes" "0")
 
-block_on=$(jq -r '.prompt_gate.block_on // "critical"' "$policy_file")
-block_sess=$(jq -r '.prompt_gate.block_on_session_budget // true' "$policy_file")
-max_sess=$(jq -r '.session_budget.max_active_sessions // 8' "$policy_file")
+block_on=$(jq -r '.prompt_gate.block_on // "critical"' "$policy_file" 2>/dev/null || echo "never")
+case "$block_on" in
+    never|strained|critical) ;;
+    *) block_on="never" ;; # unknown / typo => fail-open (do not block on pressure)
+esac
+
+block_sess="true"
+b=$(jq -r '.prompt_gate.block_on_session_budget // true' "$policy_file" 2>/dev/null) && block_sess="$b"
+max_sess="8"
+m=$(jq -r '.session_budget.max_active_sessions // 8' "$policy_file" 2>/dev/null) && max_sess="$m"
 
 hints=$(guardian_resume_hint_text)
 
@@ -48,7 +63,6 @@ blocked=0
 block_reason=""
 
 if [ "$block_sess" = "true" ]; then
-    # shell integer compare
     cs="${cursor_sess%%.*}"
     mx="${max_sess%%.*}"
     if [ "${cs:-0}" -gt "${mx:-999}" ] 2>/dev/null; then
@@ -83,14 +97,14 @@ if command -v python3 &>/dev/null && [ -f "$SCRIPT_DIR/cursorignore_check.py" ];
         while IFS= read -r root; do
             [ -n "$root" ] || continue
             args+=(--workspace-root "$root")
-        done < <(echo "$input" | jq -r '.workspace_roots[]? // empty')
+        done < <(guardian_hook_workspace_roots "$input")
         chk=$("${args[@]}" 2>/dev/null || echo '{"match":false}')
         if echo "$chk" | jq -e '.match == true' &>/dev/null; then
-            seg=$(echo "$chk" | jq -r '.segment // "path"')
-            rat=$(echo "$chk" | jq -r '.rationale // ""')
+            seg=$(echo "$chk" | jq -r '.segment // "path"' 2>/dev/null || echo "?")
+            rat=$(echo "$chk" | jq -r '.rationale // ""' 2>/dev/null || echo "")
             attach_notes="${attach_notes}[Guardian] Attachment touches '${seg}': ${rat} Add to .cursorignore or .guardian/cursorignore-allow — see hooks/resources.md"$'\n'
         fi
-    done < <(echo "$input" | jq -r '.attachments[]? | .file_path // empty')
+    done < <(guardian_hook_attachment_paths "$input")
 fi
 
 if [ "$blocked" -eq 1 ]; then

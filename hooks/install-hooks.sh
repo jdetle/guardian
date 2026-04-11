@@ -21,11 +21,12 @@ cp "$SCRIPT_DIR/subagent-start.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/post-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/stop.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/cursorignore_check.py" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/iso_to_epoch.py" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/cursorignore-checklist.json" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/hook_policy.default.json" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/resources.md" "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR"/*.sh
-chmod +x "$HOOKS_DIR/cursorignore_check.py" 2>/dev/null || true
+chmod +x "$HOOKS_DIR/cursorignore_check.py" "$HOOKS_DIR/iso_to_epoch.py" 2>/dev/null || true
 mkdir -p "$GUARDIAN_DIR"
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
     cp "$SCRIPT_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"

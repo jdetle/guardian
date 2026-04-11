@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY hooks/ /opt/guardian/hooks/
 COPY tests/stress/ /opt/guardian/tests/
 
-RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/hooks/cursorignore_check.py /opt/guardian/tests/*.sh 2>/dev/null || true
+RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/hooks/cursorignore_check.py /opt/guardian/hooks/iso_to_epoch.py /opt/guardian/tests/*.sh 2>/dev/null || true
 
 RUN mkdir -p /root/.guardian \
     && cp /opt/guardian/hooks/hook_policy.default.json /root/.guardian/hook_policy.json

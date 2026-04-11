@@ -12,12 +12,30 @@ STATE_FILE="$GUARDIAN_DIR/state.json"
 SESSIONS_DB="$GUARDIAN_DIR/sessions.db"
 STALE_THRESHOLD_SECS=30
 
+# RFC3339 / ISO-8601 with fractional seconds and offsets (chrono-compatible).
+# Uses hooks/iso_to_epoch.py when available; never truncates at the first "." (that broke +00:00).
 parse_iso_epoch() {
-    local ts="${1%%.*}"
-    if date -jf "%Y-%m-%dT%H:%M:%S" "$ts" +%s 2>/dev/null; then
-        return
+    local ts="$1"
+    if [ -z "$ts" ]; then
+        echo 0
+        return 0
     fi
-    date -d "${ts}" +%s 2>/dev/null || echo 0
+    local lib_dir
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$lib_dir/iso_to_epoch.py" ] && command -v python3 &>/dev/null; then
+        local py_epoch
+        if py_epoch=$(python3 "$lib_dir/iso_to_epoch.py" "$ts" 2>/dev/null); then
+            echo "$py_epoch"
+            return 0
+        fi
+    fi
+    # GNU date (Linux): often parses full RFC3339
+    if epoch=$(date -ud "$ts" +%s 2>/dev/null); then
+        echo "$epoch"
+        return 0
+    fi
+    # Unknown format — fail safe (epoch 0 => very "old" => hooks treat daemon as stale)
+    echo 0
 }
 
 sanitize_sql() {
@@ -174,6 +192,17 @@ guardian_hook_policy_file() {
     elif [ -n "${SCRIPT_DIR:-}" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
         echo "$SCRIPT_DIR/hook_policy.default.json"
     fi
+}
+
+# Safe JSON extractors (never fail the shell under set -e).
+guardian_hook_attachment_paths() {
+    local json="$1"
+    echo "$json" | jq -r 'try ((.attachments // []) | if type == "array" then .[] | (if type == "object" then .file_path // empty elif type == "string" then . else empty end) else empty end) catch empty' 2>/dev/null || true
+}
+
+guardian_hook_workspace_roots() {
+    local json="$1"
+    echo "$json" | jq -r 'try ((.workspace_roots // []) | if type == "array" then .[] else empty end) catch empty' 2>/dev/null || true
 }
 
 guardian_snooze_active() {

@@ -83,7 +83,9 @@ Shipped patterns live in `hooks/cursorignore-checklist.json`. Per-repo exception
 
 ### Configure
 
-Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[cursorignore_policy]`). Restart the LaunchAgent after changes.
+Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[cursorignore_policy]`).
+
+**Restart `guardiand` after changing `config.toml`** (for example re-run `bash scripts/install.sh`, or `launchctl unload` / `launchctl load` on `~/Library/LaunchAgents/com.guardian.guardiand.plist`). The daemon writes **`~/.guardian/hook_policy.json` at startup** from config; until it restarts, shell hooks keep using the previous snapshot, so prompt gates and cursorignore policy flags may not match your new thresholds or `[prompt_gate]` / `[cursorignore_policy]` sections.
 
 Optional memory **ratio** thresholds (inside `[thresholds]`):
 

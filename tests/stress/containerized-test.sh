@@ -298,6 +298,44 @@ else
     fail "beforeSubmit: should allow when clear (got $result)"
 fi
 
+fresh_state clear 2 >"$STATE_FILE"
+result=$(printf '%s' 'not valid json {{{' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+if echo "$result" | jq -e . >/dev/null 2>&1; then
+    pass "beforeSubmit: malformed stdin returns JSON (no jq/shell abort)"
+else
+    fail "beforeSubmit: malformed stdin broke output (got: ${result:0:200})"
+fi
+
+fresh_state clear 2 >"$STATE_FILE"
+result=$(echo '{"attachments":"not-an-array"}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: non-array attachments does not abort"
+else
+    fail "beforeSubmit: expected continue true with bad attachments shape (got $result)"
+fi
+
+cp "$GUARDIAN_DIR/hook_policy.json" "$GUARDIAN_DIR/hook_policy.json.bak.test"
+printf '%s' '{' >"$GUARDIAN_DIR/hook_policy.json"
+fresh_state critical 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+mv "$GUARDIAN_DIR/hook_policy.json.bak.test" "$GUARDIAN_DIR/hook_policy.json"
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
+if [ "$cont" = "true" ] && echo "$um" | grep -q 'not valid JSON'; then
+    pass "beforeSubmit: corrupt hook_policy.json fails open"
+else
+    fail "beforeSubmit: expected fail-open + message on corrupt policy (got $result)"
+fi
+
+result=$(printf '%s' 'NOT JSON' | bash "$HOOKS_DIR/before-read-file.sh" 2>/dev/null)
+perm=$(echo "$result" | jq -r '.permission // "missing"' 2>/dev/null)
+if [ "$perm" = "allow" ]; then
+    pass "beforeRead: malformed stdin allows"
+else
+    fail "beforeRead: expected allow on malformed stdin (got $result)"
+fi
+
 mkdir -p /tmp/gdemo/ws/node_modules/pkg
 touch /tmp/gdemo/ws/node_modules/pkg/file.txt
 fresh_state clear 2 >"$STATE_FILE"
