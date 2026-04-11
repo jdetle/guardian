@@ -1,23 +1,31 @@
 # Guardian
 
-**Keep AI coding agents fast—and keep your Mac usable.**
+**Keep AI coding agents useful—and keep your Mac from melting down.**
 
-Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what Cursor agents are allowed to assume*. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when pressure or parallel workspace load is too high, with **human-in-the-loop** resume paths.
+Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what Cursor agents are allowed to assume*. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
 
 ---
 
 ## Why this exists
 
-Modern agents parallelize aggressively: shells, subagents, `docker compose`, test runners. That’s great for throughput until CPU pegs, memory vanishes, and swap turns your machine into sludge. **Guardian exists so agents can see the wall before they hit it**—and so protection isn’t “hope the model reads the room.”
+### Modest laptops and Cursor
 
-| Without Guardian | With Guardian |
+Cursor on an **older MacBook, 8 GB RAM, a nearly full disk, or a thermally limited CPU** is a different product than Cursor on a desktop with headroom. The agent stack still wants to parallelize: terminals, subagents, Docker, indexers, and long chats all compete for the same small pool of RAM and disk bandwidth. When the machine is already strained, **swap spikes, the fan never stops, UI stutters, and completions time out**—not because the model is dumb, but because the host is out of air.
+
+Guardian targets that gap: **it makes “how hard are we pushing this laptop?” explicit and actionable** instead of invisible. Hooks inject real metrics into agent context; the daemon can throttle Docker and clamp fork storms; optional gates stop prompt floods when memory or policy says you’re past safe operating limits. You still get work done—you’re just less likely to **lose a session to overload** by stacking heavy operations on a machine that’s already redlining.
+
+### What it mitigates in practice
+
+| Pain point | How Guardian helps |
 |---|---|
-| Agents guess load from vibes | Every session starts with **real** CPU, memory, swap, thermal, Docker signal |
-| No guard on user sends under load | **`beforeSubmitPrompt`** can block sends when policy says so (with **resume** options) |
-| Runaway containers amplify pain | Optional **Docker CPU throttling** on non-essential services under strain |
-| Fork storms take down the session | **Fork guard** with optional kill for pathological spawns |
+| **No visibility** — agents don’t “feel” 90% CPU or 1 GB free RAM | **Session / subagent hooks** surface CPU, memory, swap, Cursor RSS, and **disk** pressure so the model (and you) see the same numbers. |
+| **Death by parallel work** — shells + Docker + subagents at once on a weak machine | **Pressure levels** and advisories steer toward sequential work; optional **prompt gates** when things are critical or Cursor memory is huge. |
+| **Docker and dev services eating the box** | Optional **Docker CPU throttling** for non-essential containers under strain. |
+| **Runaway process trees** (builds, test runners) | **Fork guard** with optional kill for pathological spawns. |
+| **Indexing and huge contexts on a full disk** | **Disk** sampling on the home volume + **cursorignore**-style warnings for paths that blow up context and disk. |
+| **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** can block (with **resume** / snooze) so you don’t add load at the worst moment. |
 
-**Core value proposition:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional prompt gates with resume.*
+**Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor stays usable on hardware that isn’t a dev workstation.*
 
 ---
 
