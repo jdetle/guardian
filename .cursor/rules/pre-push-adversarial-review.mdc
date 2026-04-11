@@ -1,0 +1,17 @@
+---
+description: Require multi-model adversarial review before git push
+alwaysApply: true
+---
+
+# Pre-push: multi-model adversarial review
+
+Before **`git push`** (or opening/updating a PR that assumes the branch is final), run a **multi-model adversarial review**:
+
+1. **At least two distinct models** — e.g. different families or providers (not two cheap passes of the same model). Use them to **independently** review the same diff or PR scope.
+2. **Adversarial stance** — each review should explicitly hunt for: correctness bugs, security issues (injection, secrets, unsafe defaults), broken edge cases, misleading docs, and **ways the change could fail in production**.
+3. **Synthesize** — reconcile disagreements; fix or document anything both flag; treat “only one model caught it” as worth addressing unless clearly a false positive.
+4. **Then push** — only after this loop; do not treat a single quick self-review as sufficient for non-trivial changes.
+
+**Scope:** Required for commits that **leave the local branch** (push, force-with-lease, PR updates from agents). Trivial doc typo fixes can be lighter, but still prefer a second pass when unsure.
+
+**Why:** Single-model review inherits one blind spot; adversarial multi-model review catches different failure modes before CI and reviewers see the branch.

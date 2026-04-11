@@ -32,6 +32,9 @@ pub struct DockerState {
 pub struct CursorState {
     pub active_sessions: u32,
     pub process_count: u32,
+    /// Sum of RSS for processes whose short name starts with `Cursor` (best-effort via `ps`).
+    #[serde(default)]
+    pub resident_memory_megabytes: u64,
 }
 
 pub fn state_file_path() -> PathBuf {

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -11,6 +11,12 @@ pub struct GuardianConfig {
     pub docker: DockerConfig,
     #[serde(default)]
     pub fork_guard: ForkGuardConfig,
+    #[serde(default)]
+    pub prompt_gate: PromptGateConfig,
+    #[serde(default)]
+    pub session_budget: SessionBudgetConfig,
+    #[serde(default)]
+    pub cursorignore_policy: CursorIgnorePolicyConfig,
 }
 
 impl Default for GuardianConfig {
@@ -20,6 +26,78 @@ impl Default for GuardianConfig {
             thresholds: ThresholdConfig::default(),
             docker: DockerConfig::default(),
             fork_guard: ForkGuardConfig::default(),
+            prompt_gate: PromptGateConfig::default(),
+            session_budget: SessionBudgetConfig::default(),
+            cursorignore_policy: CursorIgnorePolicyConfig::default(),
+        }
+    }
+}
+
+/// Policy for `beforeSubmitPrompt` (also written to `hook_policy.json` for shell hooks).
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct PromptGateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `never` | `strained` | `critical` — block prompt submit when pressure is at or above this band.
+    #[serde(default = "default_block_on")]
+    pub block_on: String,
+    #[serde(default = "default_true")]
+    pub block_on_session_budget: bool,
+}
+
+impl Default for PromptGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            block_on: default_block_on(),
+            block_on_session_budget: true,
+        }
+    }
+}
+
+fn default_block_on() -> String {
+    "critical".to_string()
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct SessionBudgetConfig {
+    /// Guardian counts workspace folders under `~/.cursor/projects` (heuristic proxy).
+    #[serde(default = "default_max_sessions")]
+    pub max_active_sessions: u32,
+    #[serde(default = "default_warn_sessions")]
+    pub warn_active_sessions: u32,
+}
+
+impl Default for SessionBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_active_sessions: default_max_sessions(),
+            warn_active_sessions: default_warn_sessions(),
+        }
+    }
+}
+
+fn default_max_sessions() -> u32 {
+    8
+}
+
+fn default_warn_sessions() -> u32 {
+    5
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct CursorIgnorePolicyConfig {
+    #[serde(default = "default_true")]
+    pub warn_once_per_path: bool,
+    #[serde(default = "default_true")]
+    pub before_read_enabled: bool,
+}
+
+impl Default for CursorIgnorePolicyConfig {
+    fn default() -> Self {
+        Self {
+            warn_once_per_path: true,
+            before_read_enabled: true,
         }
     }
 }
@@ -28,7 +106,7 @@ fn default_sample_interval_secs() -> u64 {
     2
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ThresholdConfig {
     #[serde(default = "default_strained_cpu")]
     pub strained_cpu_percent: f64,
@@ -42,6 +120,11 @@ pub struct ThresholdConfig {
     pub strained_swap_percent: f64,
     #[serde(default = "default_critical_swap")]
     pub critical_swap_percent: f64,
+    /// When set, also escalate when `available_gb / total_gb` falls below this (e.g. 0.12 = 12% free).
+    #[serde(default)]
+    pub strained_memory_available_ratio: Option<f64>,
+    #[serde(default)]
+    pub critical_memory_available_ratio: Option<f64>,
 }
 
 impl Default for ThresholdConfig {
@@ -53,6 +136,8 @@ impl Default for ThresholdConfig {
             critical_memory_gb: default_critical_memory(),
             strained_swap_percent: default_strained_swap(),
             critical_swap_percent: default_critical_swap(),
+            strained_memory_available_ratio: None,
+            critical_memory_available_ratio: None,
         }
     }
 }

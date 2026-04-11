@@ -1,0 +1,19 @@
+---
+description: Use pydantic/monty for Python execution and keep code Monty-compatible where feasible
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python — prefer [Monty](https://github.com/pydantic/monty)
+
+[Monty](https://github.com/pydantic/monty) is a **minimal, secure Python interpreter** (Rust) aimed at **running LLM-generated code** without full-container overhead. It blocks host filesystem, env, and network unless explicitly bridged.
+
+## For this repo
+
+1. **Execution** — When running or evaluating Python **from agents** (tests, demos, sandboxes), prefer the **Monty** binary if it is on `PATH`, instead of unconstrained `python3`, unless the task explicitly requires CPython (e.g. a maintainer-only script documented as such).
+
+2. **Code style** — Prefer **stdlib-only**, small surface area, and patterns that stay within Monty’s supported subset (see upstream docs). Avoid relying on C extensions or heavy third-party packages for anything that might execute under Monty.
+
+3. **Hook scripts** (`hooks/*.py`) — These may still be invoked as `python3` on the host for Cursor hooks. Keep them **stdlib-only** and **Monty-shaped** (simple I/O, no exotic deps) so they can be validated or replayed under Monty when desired.
+
+4. **References** — Track upstream: [github.com/pydantic/monty](https://github.com/pydantic/monty) (experimental; API and supported builtins evolve).

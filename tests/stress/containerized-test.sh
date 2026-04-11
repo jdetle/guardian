@@ -6,11 +6,13 @@
 # compiled for Linux. This test suite validates everything EXCEPT the
 # daemon's sampling loop:
 #
-#   1. Hooks ALWAYS return "allow" regardless of pressure level
-#   2. Hooks provide context messages on strained/critical
-#   3. State file parsing handles missing/corrupt/symlinked files
-#   4. No crash on garbage input
-#   5. Fail-open behavior: missing state = "clear", not "critical"
+#   1. preToolUse / subagentStart ALWAYS return "allow"
+#   2. beforeSubmitPrompt may return continue:false (pressure/session budget)
+#   3. beforeReadFile always returns allow (advisory only)
+#   4. Hooks provide context messages on strained/critical
+#   5. State file parsing handles missing/corrupt/symlinked files
+#   6. No crash on garbage input
+#   7. Fail-open behavior: missing state = "clear", not "critical"
 set -uo pipefail
 
 RED='\033[0;31m'
@@ -253,9 +255,101 @@ else
     fail "ensure_db did not create sessions.db"
 fi
 
-# ─── Test Group 7: Host Pollution Check ─────────────────────────────────
+# ─── Test Group 7: beforeSubmitPrompt / beforeReadFile ───────────────────
 
-echo -e "\n${BOLD}${CYAN}=== Test Group 7: No Host Pollution ===${NC}"
+echo -e "\n${BOLD}${CYAN}=== Test Group 7: Prompt gate & read advisory ===${NC}"
+
+fresh_state() {
+    local pressure="$1"
+    local sess="${2:-2}"
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "{\"pressure\":\"${pressure}\",\"cpu_percent\":90,\"memory_available_gb\":0.4,\"swap_used_percent\":70,\"sampled_at\":\"${now}\",\"cursor\":{\"active_sessions\":${sess},\"resident_memory_megabytes\":100}}"
+}
+
+rm -f "$GUARDIAN_DIR/proceed_once" "$GUARDIAN_DIR/snooze_until"
+
+fresh_state critical 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+if [ "$cont" = "false" ]; then
+    pass "beforeSubmit: blocks when critical + fresh state"
+else
+    fail "beforeSubmit: expected continue false (got $result)"
+fi
+
+touch "$GUARDIAN_DIR/proceed_once"
+fresh_state critical 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+rm -f "$GUARDIAN_DIR/proceed_once"
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: proceed_once allows submit"
+else
+    fail "beforeSubmit: proceed_once should allow (got $result)"
+fi
+
+fresh_state clear 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: allows when clear"
+else
+    fail "beforeSubmit: should allow when clear (got $result)"
+fi
+
+fresh_state clear 2 >"$STATE_FILE"
+result=$(printf '%s' 'not valid json {{{' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+if echo "$result" | jq -e . >/dev/null 2>&1; then
+    pass "beforeSubmit: malformed stdin returns JSON (no jq/shell abort)"
+else
+    fail "beforeSubmit: malformed stdin broke output (got: ${result:0:200})"
+fi
+
+fresh_state clear 2 >"$STATE_FILE"
+result=$(echo '{"attachments":"not-an-array"}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: non-array attachments does not abort"
+else
+    fail "beforeSubmit: expected continue true with bad attachments shape (got $result)"
+fi
+
+cp "$GUARDIAN_DIR/hook_policy.json" "$GUARDIAN_DIR/hook_policy.json.bak.test"
+printf '%s' '{' >"$GUARDIAN_DIR/hook_policy.json"
+fresh_state critical 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+mv "$GUARDIAN_DIR/hook_policy.json.bak.test" "$GUARDIAN_DIR/hook_policy.json"
+cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
+if [ "$cont" = "true" ] && echo "$um" | grep -q 'not valid JSON'; then
+    pass "beforeSubmit: corrupt hook_policy.json fails open"
+else
+    fail "beforeSubmit: expected fail-open + message on corrupt policy (got $result)"
+fi
+
+result=$(printf '%s' 'NOT JSON' | bash "$HOOKS_DIR/before-read-file.sh" 2>/dev/null)
+perm=$(echo "$result" | jq -r '.permission // "missing"' 2>/dev/null)
+if [ "$perm" = "allow" ]; then
+    pass "beforeRead: malformed stdin allows"
+else
+    fail "beforeRead: expected allow on malformed stdin (got $result)"
+fi
+
+mkdir -p /tmp/gdemo/ws/node_modules/pkg
+touch /tmp/gdemo/ws/node_modules/pkg/file.txt
+fresh_state clear 2 >"$STATE_FILE"
+result=$(echo '{"file_path":"/tmp/gdemo/ws/node_modules/pkg/file.txt","workspace_roots":["/tmp/gdemo/ws"]}' | bash "$HOOKS_DIR/before-read-file.sh" 2>/dev/null)
+perm=$(echo "$result" | jq -r '.permission // "missing"' 2>/dev/null)
+if [ "$perm" = "allow" ]; then
+    pass "beforeRead: allows with advisory on node_modules path"
+else
+    fail "beforeRead: expected allow (got $result)"
+fi
+
+# ─── Test Group 8: Host Pollution Check ─────────────────────────────────
+
+echo -e "\n${BOLD}${CYAN}=== Test Group 8: No Host Pollution ===${NC}"
 
 # Inside the container, /root/.guardian is a tmpfs mount.
 # Verify we haven't escaped the container by checking mount points.

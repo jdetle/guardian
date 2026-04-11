@@ -3,6 +3,7 @@
 mod classifier;
 mod config;
 mod docker;
+mod hook_policy;
 mod sampler;
 mod session_db;
 mod state;
@@ -10,10 +11,11 @@ mod validation;
 
 use classifier::{classify, ClassifierInput, PressureLevel};
 use config::{load_config, GuardianConfig};
+use hook_policy::write_hook_policy;
 use docker::stats::DockerClient;
 use sampler::cpu::{cpu_usage_percent, CpuSnapshot};
 use sampler::memory::MemoryInfo;
-use sampler::process::ProcessInfo;
+use sampler::process::{cursor_rss_megabytes, ProcessInfo};
 use sampler::swap::SwapInfo;
 use sampler::thermal::ThermalState;
 use state::{CursorState, DockerState, GuardianState, write_state};
@@ -123,6 +125,10 @@ fn main() {
         config.sample_interval_secs
     );
 
+    if let Err(e) = write_hook_policy(&config) {
+        eprintln!("[guardiand] warning: could not write hook_policy.json: {e}");
+    }
+
     if let Err(e) = session_db::ensure_db() {
         eprintln!("[guardiand] session db init warning: {e}");
     }
@@ -193,6 +199,7 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>) {
         let input = ClassifierInput {
             cpu_percent: cpu_pct,
             memory_available_gb: mem_available_gb,
+            memory_total_gb: mem_total_gb,
             swap_used_percent: swap_pct,
             thermal,
             process_usage_ratio: proc_ratio,
@@ -221,12 +228,14 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>) {
         // Process killer: identify and kill top resource abusers
         handle_process_killer(config, &procs, pressure);
 
+        let cursor_rss_mb = cursor_rss_megabytes();
         let cursor_state = CursorState {
             active_sessions: count_cursor_sessions(),
             process_count: procs
                 .as_ref()
                 .map(|p| p.cursor_process_count)
                 .unwrap_or(0),
+            resident_memory_megabytes: cursor_rss_mb,
         };
 
         let now = chrono::Utc::now().to_rfc3339();

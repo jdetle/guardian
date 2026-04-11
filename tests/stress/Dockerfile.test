@@ -20,14 +20,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     bash \
     coreutils \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY hooks/ /opt/guardian/hooks/
 COPY tests/stress/ /opt/guardian/tests/
 
-RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/tests/*.sh 2>/dev/null || true
+RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/hooks/cursorignore_check.py /opt/guardian/hooks/iso_to_epoch.py /opt/guardian/tests/*.sh 2>/dev/null || true
 
-RUN mkdir -p /root/.guardian
+RUN mkdir -p /root/.guardian \
+    && cp /opt/guardian/hooks/hook_policy.default.json /root/.guardian/hook_policy.json
 
 ENV GUARDIAN_DIR=/root/.guardian
 ENV STATE_FILE=/root/.guardian/state.json

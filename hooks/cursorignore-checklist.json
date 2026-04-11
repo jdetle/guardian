@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "segment": "node_modules",
+      "rationale": "Dependency trees are huge; indexing wastes RAM and context.",
+      "severity": "warn"
+    },
+    {
+      "segment": "target",
+      "rationale": "Rust build output is large and churns constantly.",
+      "severity": "warn"
+    },
+    {
+      "segment": "dist",
+      "rationale": "Bundled output is usually generated and not worth indexing.",
+      "severity": "warn"
+    },
+    {
+      "segment": "build",
+      "rationale": "Build directories are often large generated artifacts.",
+      "severity": "warn"
+    },
+    {
+      "segment": "__pycache__",
+      "rationale": "Python bytecode caches are noisy for the model.",
+      "severity": "info"
+    },
+    {
+      "segment": ".venv",
+      "rationale": "Virtualenvs duplicate site-packages and bloat context.",
+      "severity": "warn"
+    },
+    {
+      "segment": "coverage",
+      "rationale": "HTML coverage reports are huge and rarely edited by hand.",
+      "severity": "info"
+    },
+    {
+      "segment": ".git",
+      "rationale": "Git internals are almost never useful in agent context.",
+      "severity": "info"
+    }
+  ]
+}

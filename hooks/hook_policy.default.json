@@ -1,0 +1,15 @@
+{
+  "prompt_gate": {
+    "enabled": true,
+    "block_on": "critical",
+    "block_on_session_budget": true
+  },
+  "session_budget": {
+    "max_active_sessions": 8,
+    "warn_active_sessions": 5
+  },
+  "cursorignore_policy": {
+    "warn_once_per_path": true,
+    "before_read_enabled": true
+  }
+}
