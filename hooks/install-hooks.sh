@@ -34,6 +34,11 @@ if [ -f "$REPO_ROOT/scripts/guardian-queue.sh" ]; then
     chmod +x "$GUARDIAN_DIR/guardian-queue.sh"
     echo "  Installed ~/.guardian/guardian-queue.sh (agent work queue CLI)"
 fi
+if [ -f "$REPO_ROOT/target/release/guardian" ]; then
+    cp "$REPO_ROOT/target/release/guardian" "$GUARDIAN_DIR/guardian"
+    chmod +x "$GUARDIAN_DIR/guardian"
+    echo "  Installed ~/.guardian/guardian (snooze, once, zeno)"
+fi
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
     cp "$SCRIPT_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
     echo "  Installed default ~/.guardian/hook_policy.json (edit to tune gates)"
