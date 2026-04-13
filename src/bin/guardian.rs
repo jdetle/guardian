@@ -36,6 +36,8 @@ enum Commands {
 enum ZenoAction {
     /// Increment the zeno step counter (daemon picks this up on the next sample).
     Bump,
+    /// Decrement the zeno step by one (restore previous effective limits; min 0).
+    Rollback,
     /// Reset zeno steps to 0 (back to config.toml thresholds only).
     Reset,
     /// Show current steps and effective thresholds vs config.
@@ -123,6 +125,21 @@ fn run(cli: Cli) -> Result<(), String> {
                     "Zeno steps = {} (effective limits move halfway toward full usage each bump).",
                     z.steps
                 );
+                Ok(())
+            }
+            ZenoAction::Rollback => {
+                let mut z = zeno::load_zeno().unwrap_or_default();
+                let before = z.steps;
+                z.steps = z.steps.saturating_sub(1);
+                zeno::save_zeno(&z).map_err(|e| e.to_string())?;
+                if before == 0 {
+                    println!("Zeno rollback — already at steps=0 (config.toml limits).");
+                } else {
+                    println!(
+                        "Zeno steps {} -> {} (reverted to previous effective limits).",
+                        before, z.steps
+                    );
+                }
                 Ok(())
             }
             ZenoAction::Reset => {

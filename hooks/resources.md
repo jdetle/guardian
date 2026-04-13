@@ -15,4 +15,4 @@ Short checklist (also surfaced by hooks when load is high):
 
 - One-shot: `~/.guardian/guardian once` (or `touch ~/.guardian/proceed_once`) then submit again.
 - Snooze gates ~N minutes: `~/.guardian/guardian snooze 15`, or `bash scripts/guardian-resume.sh snooze 15`, or write an ISO timestamp into `~/.guardian/snooze_until`.
-- **Zeno** (relax effective limits — each bump moves percent-style caps halfway toward 100% used): `~/.guardian/guardian zeno bump`; `zeno status` / `zeno reset`.
+- **Zeno** (relax effective limits — each bump moves percent-style caps halfway toward 100% used): `~/.guardian/guardian zeno bump`; undo one bump with `zeno rollback`; `zeno status` / `zeno reset`.

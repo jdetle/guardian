@@ -80,7 +80,7 @@ Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates
 | Allow **one** blocked send | `~/.guardian/guardian once` (or `touch ~/.guardian/proceed_once`) then submit again |
 | Snooze gates ~15 minutes | `~/.guardian/guardian snooze 15` (or `bash scripts/guardian-resume.sh snooze 15`) |
 | Clear snooze | `~/.guardian/guardian clear-snooze` |
-| Relax limits (each bump moves percent-style caps halfway toward 100% used) | `~/.guardian/guardian zeno bump` — `zeno status` / `zeno reset` |
+| Relax limits (zeno) | `~/.guardian/guardian zeno bump` — `zeno rollback` (undo one bump) — `zeno status` / `zeno reset` |
 
 Copy in blocked **`user_message`** repeats these hints.
 
