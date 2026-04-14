@@ -14,4 +14,6 @@ Before **`git push`** (or opening/updating a PR that assumes the branch is final
 
 **Scope:** Required for commits that **leave the local branch** (push, force-with-lease, PR updates from agents). Trivial doc typo fixes can be lighter, but still prefer a second pass when unsure.
 
+**Guardian repo — installer changes:** If the PR touches install scripts, plists, or shipped Rust binaries, also follow **`pr-install-smoke-test.mdc`** (run `cargo test` / `cargo build --release` and `bash scripts/install.sh` before push, unless documented otherwise).
+
 **Why:** Single-model review inherits one blind spot; adversarial multi-model review catches different failure modes before CI and reviewers see the branch.

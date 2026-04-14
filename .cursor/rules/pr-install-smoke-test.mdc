@@ -1,0 +1,19 @@
+---
+description: Smoke-test Guardian install before pushing PRs that touch the installer or shipped binaries
+alwaysApply: true
+---
+
+# PR: install smoke test before push
+
+Before **`git push`** on a branch that will **open or update a pull request**, if the change touches **installation**, **shipped binaries**, or **hook/daemon wiring**, run a local **install smoke test** first:
+
+1. **`cargo test`** (or at minimum **`cargo build --release`**) from the repo root.
+2. **`bash scripts/install.sh`** — confirms `guardiand` and `guardian` build, `~/.guardian/guardian` is installed, LaunchAgent plist is valid, and PATH symlink logic runs without error.
+
+**When to run it:** Any diff that changes `scripts/install.sh`, `scripts/uninstall.sh`, `hooks/install-hooks.sh`, `Cargo.toml`, `src/` (daemon or CLI), or LaunchAgent / plist templates tied to install.
+
+**Exceptions:** If a full install cannot be run in the current environment (e.g. non-macOS CI only), **state that in the PR** and list what was run instead (e.g. `cargo test` only).
+
+**Ordering:** Run this **before** treating the branch as ready to push alongside the multi-model adversarial review in **`pre-push-adversarial-review.mdc`**.
+
+**Why:** Install scripts are high-impact; a broken `install.sh` bricks fresh installs until the next fix.
