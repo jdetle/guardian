@@ -36,6 +36,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
 | `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
 | Cursor hooks | `hooks/` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … |
+| Codex hooks | `hooks/codex/`, `scripts/install-codex-hooks.sh` | Same gate logic via **`UserPromptSubmit`** + **`SessionStart`** ([docs/codex.md](docs/codex.md)) |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
@@ -72,6 +73,16 @@ bash hooks/install-hooks.sh
 ```
 
 Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates without recompiling).
+
+### OpenAI Codex CLI (optional)
+
+Codex uses **`~/.codex/hooks.json`** (not Cursor’s file). Hooks are **experimental**; enable **`codex_hooks = true`** in Codex’s **`config.toml`**, then:
+
+```bash
+bash scripts/install-codex-hooks.sh
+```
+
+This installs **`UserPromptSubmit`** + **`SessionStart`** with the same policy as Cursor’s prompt gate and session hook. Details: [docs/codex.md](docs/codex.md).
 
 ### Prompt gates and resume
 

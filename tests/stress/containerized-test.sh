@@ -26,6 +26,21 @@ GUARDIAN_DIR="${GUARDIAN_DIR:-/root/.guardian}"
 STATE_FILE="$GUARDIAN_DIR/state.json"
 HOOKS_DIR="${HOOKS_DIR:-/opt/guardian/hooks}"
 
+# docker-compose tmpfs mounts an empty directory over /root/.guardian — seed files the image baked in RUN.
+mkdir -p "$GUARDIAN_DIR"
+if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$HOOKS_DIR/hook_policy.default.json" ]; then
+    cp "$HOOKS_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
+fi
+if [ ! -f "$GUARDIAN_DIR/guardian-queue.sh" ] && [ -f "/opt/guardian/scripts/guardian-queue.sh" ]; then
+    cp "/opt/guardian/scripts/guardian-queue.sh" "$GUARDIAN_DIR/guardian-queue.sh"
+    chmod +x "$GUARDIAN_DIR/guardian-queue.sh"
+fi
+
+# jq's // treats JSON false as missing; Cursor hooks use boolean "continue".
+guardian_json_continue() {
+    echo "$1" | jq -r 'if (.["continue"] | type) == "boolean" then (if .["continue"] then "true" else "false" end) else "missing" end' 2>/dev/null
+}
+
 FAILURES=()
 PASSES=()
 
@@ -279,7 +294,7 @@ fi
 
 fresh_state critical 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 if [ "$cont" = "false" ]; then
     pass "beforeSubmit: blocks when critical + fresh state"
 else
@@ -289,7 +304,7 @@ fi
 touch "$GUARDIAN_DIR/proceed_once"
 fresh_state critical 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 rm -f "$GUARDIAN_DIR/proceed_once"
 if [ "$cont" = "true" ]; then
     pass "beforeSubmit: proceed_once allows submit"
@@ -299,7 +314,7 @@ fi
 
 fresh_state clear 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 if [ "$cont" = "true" ]; then
     pass "beforeSubmit: allows when clear"
 else
@@ -309,7 +324,7 @@ fi
 # RSS block only when pressure is not clear (see hooks/before-submit-prompt.sh)
 fresh_state strained 2 9000 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 if [ "$cont" = "false" ]; then
     pass "beforeSubmit: blocks when Cursor RSS over max and pressure is strained"
 else
@@ -318,7 +333,7 @@ fi
 
 fresh_state clear 2 9000 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 if [ "$cont" = "true" ]; then
     pass "beforeSubmit: allows high Cursor RSS when pressure is clear"
 else
@@ -335,7 +350,7 @@ fi
 
 fresh_state clear 2 >"$STATE_FILE"
 result=$(echo '{"attachments":"not-an-array"}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 if [ "$cont" = "true" ]; then
     pass "beforeSubmit: non-array attachments does not abort"
 else
@@ -347,7 +362,7 @@ printf '%s' '{' >"$GUARDIAN_DIR/hook_policy.json"
 fresh_state critical 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
 mv "$GUARDIAN_DIR/hook_policy.json.bak.test" "$GUARDIAN_DIR/hook_policy.json"
-cont=$(echo "$result" | jq -r '.continue // "missing"' 2>/dev/null)
+cont=$(guardian_json_continue "$result")
 um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
 if [ "$cont" = "true" ] && echo "$um" | grep -q 'not valid JSON'; then
     pass "beforeSubmit: corrupt hook_policy.json fails open"
