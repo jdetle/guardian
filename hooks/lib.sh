@@ -228,9 +228,8 @@ guardian_consume_proceed_once() {
 
 guardian_resume_hint_text() {
     local D="${GUARDIAN_DIR:-$HOME/.guardian}"
-    # Cursor: ~/.cursor/commands/*.md become invocable slash commands in the chat composer (/name → inserts that file).
-    # install-hooks.sh copies hooks/cursor-commands/*.md there. See hooks/resources.md.
-    printf '%s' "[Guardian] Resume:"$'\n'"  Cursor (chat composer): type /guardian-snooze or /guardian-once then Enter — custom slash commands from ~/.cursor/commands (run hooks/install-hooks.sh if missing)"$'\n'"  Terminal: ${D}/guardian snooze 15  |  ${D}/guardian once"$'\n'"  macOS (click): ${D}/Guardian-Snooze-15m.command  |  ${D}/Guardian-Once.command"$'\n'"  Zeno: ${D}/guardian zeno bump  |  ${D}/guardian zeno rollback"$'\n'"  Manual: touch ${D}/proceed_once  ·  future ISO in ${D}/snooze_until"
+    # ~/.cursor/commands → /guardian-snooze etc. (install-hooks.sh). See hooks/resources.md.
+    printf '%s' "Unblock: /guardian-snooze · /guardian-once"$'\n'"${D}/guardian snooze 15 · once · zeno bump · touch ${D}/proceed_once"
 }
 
 # Advisory text while submits are still allowed — snooze in the agent UI before a hard block (beforeSubmit pass_msg).
@@ -251,7 +250,7 @@ guardian_preempt_snooze_hint() {
     fi
 
     if [ "$pressure" = "strained" ] && [ "$block_on" = "critical" ]; then
-        line1="[Guardian] Load is strained — sends still work until pressure is critical. Snooze prompt gates now in chat: type /guardian-snooze then Enter, or run ${D}/guardian snooze 15 (see hooks/resources.md)."
+        line1="Guardian: Strained load — you can still send until it hits critical. Snooze gates now: /guardian-snooze or ${D}/guardian snooze 15."
     fi
 
     if [ "$block_sess" = "true" ] && [ "$pressure" != "clear" ] 2>/dev/null \
@@ -259,7 +258,7 @@ guardian_preempt_snooze_hint() {
         && [ "${cm:-0}" -le "${mx:-0}" ] 2>/dev/null; then
         thr=$(( mx * 80 / 100 ))
         if [ "${cm:-0}" -ge "${thr:-0}" ] 2>/dev/null; then
-            line2="[Guardian] Cursor memory is near the prompt-gate cap (${cursor_mb} MB / max ${mx} MB). Snooze or trim work before a hard block: /guardian-snooze or ${D}/guardian snooze 15."
+            line2="Guardian: Cursor RAM is near your cap (${cursor_mb}/${mx} MB). Snooze before a block: /guardian-snooze."
         fi
     fi
 

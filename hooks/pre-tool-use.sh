@@ -16,12 +16,12 @@ swap=$(read_state_field "swap_used_percent" "?")
 case "$pressure" in
     strained)
         json_output "$(jq -n \
-            --arg msg "[Guardian] Monitoring active — moderate load (CPU: ${cpu}%, Mem free: ${mem}GB, Swap: ${swap}%). Consider avoiding parallel operations." \
+            --arg msg "Guardian: Moderate load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Go easy on parallelism." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     critical)
         json_output "$(jq -n \
-            --arg msg "[Guardian] Monitoring active — high load (CPU: ${cpu}%, Mem free: ${mem}GB, Swap: ${swap}%). Prefer sequential operations and avoid spawning new containers." \
+            --arg msg "Guardian: High load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Serial work; skip heavy containers." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     clear|*)

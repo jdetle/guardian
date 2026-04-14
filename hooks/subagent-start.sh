@@ -25,19 +25,21 @@ fi
 case "$pressure" in
     strained)
         json_output "$(jq -n \
-            --arg msg "[Guardian] Monitoring active — moderate load (CPU: ${cpu}%, Mem free: ${mem}GB, Cursor ~${cursor_mb} MB RSS, ~${cursor_procs} Cursor processes).${disk_frag} Consider limiting parallel subagents. See hooks/resources.md for disk hygiene." \
+            --arg msg "Guardian: Strained — CPU ${cpu}%, ${mem} GB free, Cursor ${cursor_mb} MB / ${cursor_procs} procs.${disk_frag} Fewer subagents." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     critical)
         json_output "$(jq -n \
-            --arg msg "[Guardian] Monitoring active — high load (CPU: ${cpu}%, Mem free: ${mem}GB, Cursor ~${cursor_mb} MB RSS, ~${cursor_procs} Cursor processes).${disk_frag} Prefer sequential work to reduce system pressure. See hooks/resources.md for disk hygiene." \
+            --arg msg "Guardian: Critical — CPU ${cpu}%, ${mem} GB free, Cursor ${cursor_mb} MB / ${cursor_procs} procs.${disk_frag} Serial work only." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     *)
-        msg="[Guardian] Monitoring active — system nominal."
         if [ -n "$disk_frag" ]; then
-            msg="${msg}${disk_frag} See hooks/resources.md for worktrees, Docker, caches."
+            json_output "$(jq -n \
+                --arg msg "Guardian: Load OK.${disk_frag} See hooks/resources.md." \
+                '{permission: "allow", agent_message: $msg}')"
+        else
+            json_output "$(jq -n '{permission: "allow"}')"
         fi
-        json_output "$(jq -n --arg msg "$msg" '{permission: "allow", agent_message: $msg}')"
         ;;
 esac

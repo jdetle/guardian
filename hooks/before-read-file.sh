@@ -52,7 +52,7 @@ fi
 seg=$(echo "$chk" | jq -r '.segment // "path"' 2>/dev/null || echo "path")
 rat=$(echo "$chk" | jq -r '.rationale // ""' 2>/dev/null || echo "")
 rel=$(echo "$chk" | jq -r '.relative_path // ""' 2>/dev/null || echo "")
-um="[Guardian] Reading path with segment '${seg}' (${rel}) — ${rat} Prefer adding to .cursorignore or an exception in .guardian/cursorignore-allow (see hooks/resources.md)."
-am="[Guardian] This path is usually ignored for indexing; confirm you need it in context."
+um="Guardian: ${seg} (${rel}) — ${rat} Add .cursorignore or .guardian/cursorignore-allow if you don’t need this in context."
+am="Guardian: Usually ignored path — OK to read if intentional."
 
 json_output "$(jq -n --arg um "$um" --arg am "$am" '{permission: "allow", user_message: $um, agent_message: $am}')"

@@ -1,17 +1,11 @@
-# Guardian: allow one blocked submit
+# Allow one blocked send
 
-**Invoking in Cursor:** In the chat composer, type **`/guardian-once`** and press Enter — Cursor inserts this page (commands come from `~/.cursor/commands/guardian-once.md` after `hooks/install-hooks.sh`).
-
-Run in **Terminal**:
+Type **`/guardian-once`** here, or in Terminal:
 
 ```bash
 ~/.guardian/guardian once
 ```
 
-**macOS:** double-click `~/.guardian/Guardian-Once.command` in Finder, or:
+**macOS:** open `~/.guardian/Guardian-Once.command`.
 
-```bash
-open "$HOME/.guardian/Guardian-Once.command"
-```
-
-Then submit again in Cursor.
+Then send again.

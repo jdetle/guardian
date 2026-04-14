@@ -32,38 +32,34 @@ fi
 
 banner=""
 if is_daemon_active; then
-    banner="[Guardian] Agent registered and monitored (daemon active)."
+    banner="Guardian: Session on — metrics live."
 else
-    banner="[Guardian] Agent registered (daemon not detected — resource data unavailable)."
+    banner="Guardian: Session on — no daemon (metrics stale)."
 fi
 
+G_home="${GUARDIAN_DIR:-$HOME/.guardian}"
 context=""
 case "$pressure" in
     critical)
-        context="$banner SYSTEM ALERT: Resources are critically low (CPU: ${cpu}%, Memory: ${mem}GB free). Minimize parallel operations, avoid spawning subagents, and defer Docker-heavy commands until pressure drops."
+        context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free. Ease up; sends may block. Snooze: /guardian-snooze · ${G_home}/guardian snooze 15."
         ;;
     strained)
-        context="$banner SYSTEM NOTE: Resources are under moderate load (CPU: ${cpu}%, Memory: ${mem}GB free). Prefer sequential over parallel work. Avoid launching multiple subagents simultaneously."
+        context="${banner} Load strained: CPU ${cpu}%, ${mem} GB free. Prefer serial work."
+        if [ "$block_on_hint" = "critical" ]; then
+            context="${context} Gates block at critical — snooze early: /guardian-snooze."
+        fi
         ;;
     *)
-        context="$banner System resources: nominal (CPU: ${cpu}%, Memory: ${mem}GB free)."
+        context="${banner} Load OK: CPU ${cpu}%, ${mem} GB free."
         ;;
 esac
 
-G_home="${GUARDIAN_DIR:-$HOME/.guardian}"
-if [ "$pressure" = "strained" ] && [ "$block_on_hint" = "critical" ]; then
-    context="${context} [Before a hard block] Prompt gates block at critical load — snooze in the agent UI now: type /guardian-snooze in chat, or ${G_home}/guardian snooze 15."
-fi
-if [ "$pressure" = "critical" ]; then
-    context="${context} Prompt submits may be blocked while load is critical — snooze: /guardian-snooze or ${G_home}/guardian snooze 15."
-fi
-
 # Workspace folder count is diagnostic only (stale dirs accumulate); RSS reflects actual load.
-context="${context} Cursor workspace folders under ~/.cursor/projects ≈ ${cursor_sess}; Cursor RSS ≈ ${cursor_mb} MB (best-effort)."
+context="${context} · ~/.cursor/projects ≈ ${cursor_sess} folders · Cursor RSS ≈ ${cursor_mb} MB."
 cm="${cursor_mb%%.*}"
 wr="${warn_rss%%.*}"
 if [ "${wr:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt "${wr:-0}" ] 2>/dev/null; then
-    context="${context} NOTE: Cursor memory use is high (${cursor_mb} MB RSS, warn above ${warn_rss} MB) — prefer finishing or archiving heavy threads before more parallel work. See hooks/resources.md."
+    context="${context} High Cursor RAM (${cursor_mb} MB, warn ${warn_rss} MB) — trim threads if you can."
 fi
 
 disk_level=$(read_state_field "disk.level" "clear")
@@ -72,10 +68,10 @@ disk_avail=$(read_state_field "disk.available_gb" "0")
 disk_vol=$(read_state_field "disk.volume_path" "")
 case "$disk_level" in
     warn)
-        context="${context} NOTE: Home volume disk use is elevated (~${disk_used}% used, ~${disk_avail} GB free at ${disk_vol}). Free space: prune stale git worktrees, Docker images (docker system df / docker image prune), and large build caches — see hooks/resources.md."
+        context="${context} Disk tight: ~${disk_used}% used (~${disk_avail} GB free on ${disk_vol})."
         ;;
     critical)
-        context="${context} DISK ALERT: Home volume is very full (~${disk_used}% used, ~${disk_avail} GB free at ${disk_vol}). Free space urgently: worktrees, docker image prune, target/node_modules/DerivedData caches — see hooks/resources.md."
+        context="${context} Disk critical: ~${disk_used}% used (~${disk_avail} GB free on ${disk_vol}) — free space soon."
         ;;
 esac
 
@@ -83,7 +79,7 @@ queue_file="${GUARDIAN_DIR:-$HOME/.guardian}/agent_queue.jsonl"
 if [ -f "$queue_file" ]; then
     qc=$(grep -c '^{' "$queue_file" 2>/dev/null || echo 0)
     if [ "${qc:-0}" -gt 0 ] 2>/dev/null; then
-        context="${context} NOTE: ${qc} deferred agent task(s) in ~/.guardian/agent_queue.jsonl — run ~/.guardian/guardian-queue.sh list when pressure is clear (optional notifications: scripts/install-queue-watch.sh in the Guardian repo)."
+        context="${context} Queue: ${qc} job(s) in ~/.guardian/agent_queue.jsonl (guardian-queue.sh list)."
     fi
 fi
 

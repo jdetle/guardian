@@ -11,12 +11,10 @@ Short checklist (also surfaced by hooks when load is high):
 - **Disk space** — Guardian reports home-volume usage in `state.json` and session advisories when usage crosses `[disk]` thresholds in config. Common space hogs: stale **git worktrees** (`git worktree list`, remove unused checkouts), **Docker** images/containers (`docker system df`, `docker image prune`, `docker builder prune`), **build outputs** (`target/`, `dist/`, `build/`, `node_modules`), **Xcode DerivedData**, and **`~/.cache`**.
 - **Deferred prompts** — `~/.guardian/agent_queue.jsonl` + `~/.guardian/guardian-queue.sh` (installed by `hooks/install-hooks.sh`). Use when a send is blocked or you want to run work later; Cursor does not auto-run queued text—paste manually or use optional `scripts/install-queue-watch.sh` for a clear-pressure notification.
 
-**Resume blocked prompts (human in the loop):**
+**When a send is blocked:**
 
-- **Cursor (invocable in the composer):** After `hooks/install-hooks.sh`, type **`/guardian-snooze`** or **`/guardian-once`** in the **chat input** (same place as a new message) and press Enter. Cursor resolves Markdown files in **`~/.cursor/commands/`** to slash commands; those files expand into the snooze/once steps (they do not run shell automatically — run the `bash` lines they show, or use CLI / click below).
-- **CLI:** `~/.guardian/guardian` — `snooze 15`, `once`, `zeno bump` / `zeno rollback`, etc. (`guardian --help`). If missing, run `bash scripts/install.sh` from your Guardian clone.
-- **macOS (click):** double-click `~/.guardian/Guardian-Snooze-15m.command` or `Guardian-Once.command` in Finder (installed by `install.sh` / `hooks/install-hooks.sh`). Or run `open ~/.guardian/Guardian-Snooze-15m.command` in Terminal.
-- **OpenAI Codex CLI:** install with **`bash scripts/install-codex-hooks.sh`**, enable **`codex_hooks = true`** in Codex **`config.toml`**, restart Codex — see [docs/codex.md](../docs/codex.md). Slash commands are Cursor-only; use the **`guardian`** CLI or **`.command`** files here too.
-- One-shot fallback: `touch ~/.guardian/proceed_once` then submit again.
-- Snooze fallback: write a future ISO timestamp into `~/.guardian/snooze_until`, or `bash scripts/guardian-resume.sh snooze 15` from a repo clone.
-- **Zeno** (relax effective limits — each bump moves percent-style caps halfway toward 100% used): `~/.guardian/guardian zeno bump`; undo with `zeno rollback`; `zeno status` / `zeno reset`.
+- **Chat:** `/guardian-snooze` or `/guardian-once` (after `hooks/install-hooks.sh` → `~/.cursor/commands/`).
+- **CLI:** `~/.guardian/guardian snooze 15` · `once` · `zeno bump|rollback` (`guardian --help`).
+- **macOS:** `~/.guardian/Guardian-*.command` or `open ~/.guardian/Guardian-Snooze-15m.command`.
+- **Codex:** [docs/codex.md](../docs/codex.md) — `install-codex-hooks.sh`, `codex_hooks = true`; no slash commands, use CLI / `.command`.
+- **Manual:** `touch ~/.guardian/proceed_once` · ISO in `~/.guardian/snooze_until` · `bash scripts/guardian-resume.sh snooze 15`.

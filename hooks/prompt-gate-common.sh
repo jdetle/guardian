@@ -18,7 +18,7 @@ guardian_prompt_gate_eval() {
 
     if guardian_consume_proceed_once; then
         PG_OUTCOME="pass_msg"
-        PG_MESSAGE="[Guardian] proceed_once consumed — submit allowed."
+        PG_MESSAGE="Guardian: One-shot bypass applied — send again."
         return 0
     fi
 
@@ -30,7 +30,7 @@ guardian_prompt_gate_eval() {
 
     if ! jq empty "$policy_file" 2>/dev/null; then
         PG_OUTCOME="pass_msg"
-        PG_MESSAGE="[Guardian] hook_policy.json is not valid JSON; skipping prompt gate."
+        PG_MESSAGE="Guardian: hook_policy.json not valid JSON — prompt gate off."
         return 0
     fi
 
@@ -43,7 +43,7 @@ guardian_prompt_gate_eval() {
 
     if ! is_daemon_active; then
         PG_OUTCOME="pass_msg"
-        PG_MESSAGE="[Guardian] Prompt gate skipped (daemon stale or not running)."
+        PG_MESSAGE="Guardian: No fresh metrics (guardiand quiet?) — gate off."
         return 0
     fi
 
@@ -121,7 +121,7 @@ guardian_prompt_gate_eval() {
                 local seg rat
                 seg=$(echo "$chk" | jq -r '.segment // "path"' 2>/dev/null || echo "?")
                 rat=$(echo "$chk" | jq -r '.rationale // ""' 2>/dev/null || echo "")
-                attach_notes="${attach_notes}[Guardian] Attachment touches '${seg}': ${rat} Add to .cursorignore or .guardian/cursorignore-allow — see hooks/resources.md"$'\n'
+                attach_notes="${attach_notes}Guardian: Attachment hits ${seg} (${rat}). Add .cursorignore / .guardian/cursorignore-allow if needed."$'\n'
             fi
         done < <(guardian_hook_attachment_paths "$input")
     fi
@@ -130,13 +130,13 @@ guardian_prompt_gate_eval() {
         local msg=""
         case "$block_reason" in
             session_budget)
-                msg="[Guardian] Cursor memory is high (~${cursor_mb} MB RSS, max ${max_rss} MB) while system pressure is ${pressure}. Reduce load or use override. ${hints}"
+                msg="Guardian: Blocked — Cursor RAM ${cursor_mb} MB (cap ${max_rss} MB) with ${pressure} load. Lighten work or snooze."$'\n'"${hints}"
                 ;;
             pressure)
-                msg="[Guardian] System pressure: ${pressure} (CPU ${cpu}%, memory ${mem} GB free, swap ${swap}%). Wait for clear/strained or use override. ${hints}"
+                msg="Guardian: Blocked — ${pressure} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%). Cool down or snooze."$'\n'"${hints}"
                 ;;
             *)
-                msg="[Guardian] Submit blocked by policy. ${hints}"
+                msg="Guardian: Blocked by policy."$'\n'"${hints}"
                 ;;
         esac
         if [ -n "$attach_notes" ]; then
@@ -152,7 +152,7 @@ guardian_prompt_gate_eval() {
             fi
         fi
         if [ -n "$qid" ]; then
-            msg="${msg}"$'\n'"[Guardian] Saved prompt to work queue (id ${qid}). Run \`~/.guardian/guardian-queue.sh list\` or wait for a clear-pressure notification if queue-watch is installed."
+            msg="${msg}"$'\n'"Queued as #${qid} — ~/.guardian/guardian-queue.sh list"
         fi
         PG_OUTCOME="block"
         PG_MESSAGE="$msg"
