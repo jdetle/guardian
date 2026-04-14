@@ -62,7 +62,7 @@ if [ -d "$CURSOR_CMDS_SRC" ]; then
         cp "$f" "$CURSOR_CMDS_DST/"
     done
     shopt -u nullglob
-    echo "  Installed ~/.cursor/commands/guardian-*.md — type /guardian-snooze or /guardian-once in chat"
+    echo "  Installed ~/.cursor/commands/guardian-*.md — in the chat composer, type /guardian-snooze or /guardian-once (Cursor slash commands)"
 fi
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
     cp "$SCRIPT_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
