@@ -4,7 +4,7 @@
 #
 # DESIGN: Tool hooks (preToolUse, etc.) default to allow with advisory text.
 # beforeSubmitPrompt may return continue:false when policy + load require it;
-# users can always resume via ~/.guardian/proceed_once or snooze (see resources.md).
+# users can always resume via ~/.guardian/guardian CLI, .command clickables, or snooze (see resources.md).
 # The daemon handles enforcement (Docker throttling, fork guard).
 
 GUARDIAN_DIR="$HOME/.guardian"
@@ -227,8 +227,9 @@ guardian_consume_proceed_once() {
 }
 
 guardian_resume_hint_text() {
-    printf '[Guardian] Resume: `%s/guardian once` (or `touch %s/proceed_once`); `%s/guardian snooze 15`; `%s/guardian zeno bump` / `%s/guardian zeno rollback`; or write a future ISO timestamp into %s/snooze_until.' \
-        "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR"
+    local D="${GUARDIAN_DIR:-$HOME/.guardian}"
+    # Multiline: Composer shows CLI first; macOS .command + Cursor slash commands when installed via install-hooks.sh
+    printf '%s' "[Guardian] Resume:"$'\n'"  Snooze 15m: ${D}/guardian snooze 15"$'\n'"  macOS (click): open \"${D}/Guardian-Snooze-15m.command\" or double-click that file in Finder"$'\n'"  Next send once: ${D}/guardian once  —  macOS: ${D}/Guardian-Once.command"$'\n'"  Zeno: ${D}/guardian zeno bump  |  ${D}/guardian zeno rollback"$'\n'"  Cursor: type /guardian-snooze or /guardian-once (if ~/.cursor/commands were installed)"$'\n'"  Manual: touch ${D}/proceed_once  ·  future ISO in ${D}/snooze_until"
 }
 
 # Path to guardian-queue CLI (installed to ~/.guardian by hooks/install-hooks.sh).

@@ -39,6 +39,30 @@ if [ -f "$REPO_ROOT/target/release/guardian" ]; then
     chmod +x "$GUARDIAN_DIR/guardian"
     echo "  Installed ~/.guardian/guardian (snooze, once, zeno)"
 fi
+
+MAC_DIR="$SCRIPT_DIR/mac"
+if [ -d "$MAC_DIR" ]; then
+    shopt -s nullglob
+    for f in "$MAC_DIR"/*.command; do
+        b=$(basename "$f")
+        cp "$f" "$GUARDIAN_DIR/$b"
+        chmod +x "$GUARDIAN_DIR/$b"
+    done
+    shopt -u nullglob
+    echo "  Installed ~/.guardian/Guardian-*.command (macOS: double-click snooze / once)"
+fi
+
+CURSOR_CMDS_SRC="$SCRIPT_DIR/cursor-commands"
+CURSOR_CMDS_DST="$HOME/.cursor/commands"
+if [ -d "$CURSOR_CMDS_SRC" ]; then
+    mkdir -p "$CURSOR_CMDS_DST"
+    shopt -s nullglob
+    for f in "$CURSOR_CMDS_SRC"/*.md; do
+        cp "$f" "$CURSOR_CMDS_DST/"
+    done
+    shopt -u nullglob
+    echo "  Installed ~/.cursor/commands/guardian-*.md — type /guardian-snooze or /guardian-once in chat"
+fi
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.default.json" ]; then
     cp "$SCRIPT_DIR/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
     echo "  Installed default ~/.guardian/hook_policy.json (edit to tune gates)"

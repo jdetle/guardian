@@ -10,7 +10,7 @@ tags: [guardian, system, agent, docker]
 
 A daemon (`guardiand`) monitors system resources every ~2 seconds and writes pressure state to `~/.guardian/state.json` (including home-volume **disk** usage). Cursor hooks read this state and inject advisory messages into agent context. The daemon enforces resource limits directly (Docker throttling, fork guard).
 
-**Prompt gates:** `beforeSubmitPrompt` may return `continue: false` when `~/.guardian/hook_policy.json` and live metrics indicate high pressure or Cursor aggregate RSS above the configured cap. Users can resume with `~/.guardian/proceed_once` or snooze — see `hooks/resources.md` and `scripts/guardian-resume.sh`. **`preToolUse` / `subagentStart` default to allow** with advisories unless you change local policy.
+**Prompt gates:** `beforeSubmitPrompt` may return `continue: false` when `~/.guardian/hook_policy.json` and live metrics indicate high pressure or Cursor aggregate RSS above the configured cap. Users can resume with **`~/.guardian/guardian`** (snooze / once / zeno), macOS **`~/.guardian/Guardian-*.command`** clickables, Cursor slash **`/guardian-snooze`** / **`/guardian-once`** when `~/.cursor/commands` is installed, or **`touch ~/.guardian/proceed_once`** — see `hooks/resources.md`. **`preToolUse` / `subagentStart` default to allow** with advisories unless you change local policy.
 
 **Read paths:** `beforeReadFile` always allows; it may warn when a path matches the shipped cursorignore checklist and is not ignored — add `.cursorignore` lines or `.guardian/cursorignore-allow` in the repo.
 

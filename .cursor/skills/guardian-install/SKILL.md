@@ -41,6 +41,7 @@ This script:
 1. Copies hook scripts to `~/.cursor/hooks/guardian/`
 2. Creates or merges `~/.cursor/hooks.json` with Guardian registrations
 3. Resolves paths to absolute references
+4. Copies **`~/.guardian/Guardian-*.command`** (macOS double-click snooze/once) and **`~/.cursor/commands/guardian-*.md`** (slash **`/guardian-snooze`** / **`/guardian-once`** in chat) when those folders exist in the repo
 
 Verify hooks are registered:
 

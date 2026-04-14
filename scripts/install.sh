@@ -48,6 +48,18 @@ else
     echo "  PATH:    could not create symlink — run: sudo ln -sf $GUARDIAN_DIR/guardian /usr/local/bin/guardian"
 fi
 
+# macOS double-click helpers (same as `guardian snooze 15` / `guardian once`)
+if [ -d "$REPO_ROOT/hooks/mac" ]; then
+    shopt -s nullglob
+    for f in "$REPO_ROOT/hooks/mac"/*.command; do
+        b=$(basename "$f")
+        cp "$f" "$GUARDIAN_DIR/"
+        chmod +x "$GUARDIAN_DIR/$b"
+    done
+    shopt -u nullglob
+    echo "  Click:   ~/.guardian/Guardian-*.command (Finder) for snooze / once"
+fi
+
 # Write default config if none exists
 if [ ! -f "$GUARDIAN_DIR/config.toml" ]; then
     echo "[3/5] Writing default config..."

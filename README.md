@@ -40,7 +40,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
-| Resume + zeno | `~/.guardian/guardian`, `scripts/guardian-resume.sh` | Snooze gates, one-shot `proceed_once`, or **zeno** bumps (halfway toward 100% on percent caps) |
+| Resume + zeno | `~/.guardian/guardian`, `Guardian-*.command`, `/guardian-snooze` | CLI, macOS double-click helpers, Cursor slash commands (see `hooks/resources.md`) |
 
 ---
 
