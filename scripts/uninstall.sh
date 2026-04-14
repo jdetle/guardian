@@ -29,6 +29,14 @@ if [ -f "$LAUNCH_AGENTS/$PLIST_NAME" ]; then
     rm "$LAUNCH_AGENTS/$PLIST_NAME"
 fi
 
+# Remove PATH symlinks created by install.sh (best-effort).
+GUARDIAN_CLI="$HOME/.guardian/guardian"
+for candidate in /usr/local/bin/guardian "$HOME/.local/bin/guardian"; do
+    if [ -L "$candidate" ] && [ "$(readlink "$candidate")" = "$GUARDIAN_CLI" ]; then
+        rm -f "$candidate" && echo "Removed PATH symlink $candidate"
+    fi
+done
+
 echo ""
 echo "Guardian daemon uninstalled."
 echo "Data preserved at ~/.guardian/ (remove manually if desired)."

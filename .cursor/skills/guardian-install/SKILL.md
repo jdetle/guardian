@@ -20,8 +20,9 @@ bash scripts/install.sh
 This script:
 1. Builds `guardiand` and the `guardian` CLI in release mode (CLI copied to `~/.guardian/guardian`)
 2. Creates `~/.guardian/` with a default `config.toml`
-3. Installs a LaunchAgent plist to `~/Library/LaunchAgents/`
-4. Starts the daemon immediately
+3. Symlinks `guardian` onto your PATH when possible (`/usr/local/bin/guardian`, or `~/.local/bin/guardian` if `/usr/local/bin` is not writable—add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` if needed)
+4. Installs a LaunchAgent plist to `~/Library/LaunchAgents/`
+5. Starts the daemon immediately
 
 Verify it's running:
 

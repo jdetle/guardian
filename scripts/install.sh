@@ -33,6 +33,21 @@ cp "$GUARDIAN_CLI_BIN" "$GUARDIAN_DIR/guardian"
 chmod +x "$GUARDIAN_DIR/guardian"
 echo "  Installed ~/.guardian/guardian (snooze, once, clear-snooze, zeno)"
 
+# Symlink onto PATH so `guardian` works outside full paths (prefer /usr/local/bin, else ~/.local/bin).
+if ln -sf "$GUARDIAN_DIR/guardian" /usr/local/bin/guardian 2>/dev/null; then
+    echo "  PATH:    /usr/local/bin/guardian -> ~/.guardian/guardian"
+elif mkdir -p "$HOME/.local/bin" && ln -sf "$GUARDIAN_DIR/guardian" "$HOME/.local/bin/guardian"; then
+    echo "  PATH:    ~/.local/bin/guardian -> ~/.guardian/guardian"
+    case ":${PATH:-}:" in
+        *":$HOME/.local/bin:"*) ;;
+        *)
+            echo "           Add to shell profile if \`guardian\` is not found: export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+    esac
+else
+    echo "  PATH:    could not create symlink — run: sudo ln -sf $GUARDIAN_DIR/guardian /usr/local/bin/guardian"
+fi
+
 # Write default config if none exists
 if [ ! -f "$GUARDIAN_DIR/config.toml" ]; then
     echo "[3/5] Writing default config..."
