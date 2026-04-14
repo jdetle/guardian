@@ -49,6 +49,16 @@ Verify hooks are registered:
 cat ~/.cursor/hooks.json | jq '.hooks | keys'
 ```
 
+### 2b. OpenAI Codex CLI hooks (optional)
+
+Use the same machine-wide **`~/.guardian/`** policy with [Codex hooks](https://developers.openai.com/codex/hooks/) (enable **`[features] codex_hooks = true`** in Codex `config.toml`), then:
+
+```bash
+bash scripts/install-codex-hooks.sh
+```
+
+See [docs/codex.md](../../../docs/codex.md) for behavior and differences vs Cursor.
+
 ### 3. Build the SwiftUI App (Optional)
 
 Requires Xcode (not just CommandLineTools):
