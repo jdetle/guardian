@@ -1,5 +1,6 @@
 #!/bin/bash
 # Snooze Guardian prompt gates or allow the next submit once (human-in-the-loop).
+# Prefer ~/.guardian/guardian when installed (see scripts/install.sh).
 # Usage:
 #   bash scripts/guardian-resume.sh snooze [minutes]   # default 15
 #   bash scripts/guardian-resume.sh proceed-once
@@ -8,6 +9,22 @@ set -euo pipefail
 
 GUARDIAN_DIR="${GUARDIAN_DIR:-$HOME/.guardian}"
 mkdir -p "$GUARDIAN_DIR"
+
+G_CLI="$GUARDIAN_DIR/guardian"
+if [ -x "$G_CLI" ]; then
+    cmd="${1:-}"
+    case "$cmd" in
+        snooze)
+            exec "$G_CLI" snooze "${2:-15}"
+            ;;
+        proceed-once)
+            exec "$G_CLI" once
+            ;;
+        clear-snooze)
+            exec "$G_CLI" clear-snooze
+            ;;
+    esac
+fi
 
 cmd="${1:-}"
 case "$cmd" in

@@ -227,8 +227,8 @@ guardian_consume_proceed_once() {
 }
 
 guardian_resume_hint_text() {
-    printf '[Guardian] Resume: one-shot `touch %s/proceed_once` then submit again; or `bash scripts/guardian-resume.sh snooze 15` from the Guardian repo to snooze gates; or write a future ISO timestamp into %s/snooze_until.' \
-        "$GUARDIAN_DIR" "$GUARDIAN_DIR"
+    printf '[Guardian] Resume: `%s/guardian once` (or `touch %s/proceed_once`); `%s/guardian snooze 15`; `%s/guardian zeno bump` / `%s/guardian zeno rollback`; or write a future ISO timestamp into %s/snooze_until.' \
+        "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR" "$GUARDIAN_DIR"
 }
 
 # Path to guardian-queue CLI (installed to ~/.guardian by hooks/install-hooks.sh).

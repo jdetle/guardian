@@ -5,9 +5,17 @@ edition = "2021"
 description = "System resource monitor daemon for Cursor agent throttling"
 license = "MIT"
 
+[lib]
+name = "guardian_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "guardiand"
 path = "src/main.rs"
+
+[[bin]]
+name = "guardian"
+path = "src/bin/guardian.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -17,3 +25,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 libc = "0.2"
 mach2 = "0.4"
 dirs = "6"
+clap = { version = "4", features = ["derive"] }

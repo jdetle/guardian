@@ -11,19 +11,27 @@ GUARDIAN_DIR="$HOME/.guardian"
 echo "=== Guardian Daemon Installer ==="
 
 # Build the daemon in release mode
-echo "[1/5] Building guardiand..."
+echo "[1/5] Building guardiand and guardian CLI..."
 cd "$REPO_ROOT"
 cargo build --release
 GUARDIAND_BIN="$REPO_ROOT/target/release/guardiand"
+GUARDIAN_CLI_BIN="$REPO_ROOT/target/release/guardian"
 
 if [ ! -f "$GUARDIAND_BIN" ]; then
     echo "ERROR: guardiand binary not found at $GUARDIAND_BIN"
+    exit 1
+fi
+if [ ! -f "$GUARDIAN_CLI_BIN" ]; then
+    echo "ERROR: guardian CLI not found at $GUARDIAN_CLI_BIN"
     exit 1
 fi
 
 # Create guardian directory
 echo "[2/5] Creating ~/.guardian/..."
 mkdir -p "$GUARDIAN_DIR"
+cp "$GUARDIAN_CLI_BIN" "$GUARDIAN_DIR/guardian"
+chmod +x "$GUARDIAN_DIR/guardian"
+echo "  Installed ~/.guardian/guardian (snooze, once, clear-snooze, zeno)"
 
 # Write default config if none exists
 if [ ! -f "$GUARDIAN_DIR/config.toml" ]; then
@@ -110,6 +118,7 @@ if launchctl list | grep -q com.guardian.guardiand; then
     echo "  Config:  $GUARDIAN_DIR/config.toml"
     echo "  State:   $GUARDIAN_DIR/state.json"
     echo "  Logs:    $GUARDIAN_DIR/guardiand.stderr.log"
+    echo "  CLI:     $GUARDIAN_DIR/guardian --help"
     echo ""
     echo "To check status:  launchctl list com.guardian.guardiand"
     echo "To view state:    cat ~/.guardian/state.json"

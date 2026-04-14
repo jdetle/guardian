@@ -34,12 +34,13 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | Piece | Location | Role |
 |---|---|---|
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
+| `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
 | Cursor hooks | `hooks/` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
-| Resume helper | `scripts/guardian-resume.sh` | Snooze gates or one-shot `proceed_once` |
+| Resume + zeno | `~/.guardian/guardian`, `scripts/guardian-resume.sh` | Snooze gates, one-shot `proceed_once`, or **zeno** bumps (halfway toward 100% on percent caps) |
 
 ---
 
@@ -76,9 +77,10 @@ Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates
 
 | Action | Command / file |
 |--------|------------------|
-| Allow **one** blocked send | `touch ~/.guardian/proceed_once` then submit again |
-| Snooze gates ~15 minutes | `bash scripts/guardian-resume.sh snooze 15` |
-| Clear snooze | `bash scripts/guardian-resume.sh clear-snooze` |
+| Allow **one** blocked send | `~/.guardian/guardian once` (or `touch ~/.guardian/proceed_once`) then submit again |
+| Snooze gates ~15 minutes | `~/.guardian/guardian snooze 15` (or `bash scripts/guardian-resume.sh snooze 15`) |
+| Clear snooze | `~/.guardian/guardian clear-snooze` |
+| Relax limits (zeno) | `~/.guardian/guardian zeno bump` — `zeno rollback` (undo one bump) — `zeno status` / `zeno reset` |
 
 Copy in blocked **`user_message`** repeats these hints.
 
