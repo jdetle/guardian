@@ -205,6 +205,40 @@ guardian_hook_workspace_roots() {
     echo "$json" | jq -r 'try ((.workspace_roots // []) | if type == "array" then .[] else empty end) catch empty' 2>/dev/null || true
 }
 
+# Cursor beforeSubmitPrompt / Codex UserPromptSubmit — merge fields that may carry the user message.
+guardian_hook_prompt_text_bundle() {
+    local json="$1"
+    printf '%s' "$json" | jq -r 'try (
+        [ (.prompt // ""), (.promptText // ""), (.text // ""), (.message // ""), (.input // ""), (.content // "") ]
+        | map(tostring) | join("\n")
+    ) catch ""' 2>/dev/null || echo ""
+}
+
+# Never block Guardian “meta” prompts: slash helpers + guardian-install / guardian-upgrade skills.
+# Returns 0 when the prompt gate should skip blocking (PG_OUTCOME stays pass).
+guardian_hook_is_guardian_meta_prompt() {
+    local raw="$1"
+    [ -n "$raw" ] || return 1
+    local t
+    t=$(printf '%s' "$raw" | head -c 250000)
+
+    local first
+    first=$(printf '%s' "$t" | sed '/./!d' | head -1 | sed 's/^[[:space:]]*//')
+    case "$first" in
+        /guardian-snooze*) return 0 ;;
+        /guardian-once*) return 0 ;;
+    esac
+
+    if printf '%s' "$t" | grep -qF 'skills/guardian-install'; then return 0; fi
+    if printf '%s' "$t" | grep -qF 'skills/guardian-upgrade'; then return 0; fi
+    if printf '%s' "$t" | grep -qF 'guardian-install/SKILL.md'; then return 0; fi
+    if printf '%s' "$t" | grep -qF 'guardian-upgrade/SKILL.md'; then return 0; fi
+    if printf '%s' "$t" | grep -qF '.cursor/skills/guardian-install'; then return 0; fi
+    if printf '%s' "$t" | grep -qF '.cursor/skills/guardian-upgrade'; then return 0; fi
+
+    return 1
+}
+
 guardian_snooze_active() {
     local f="$GUARDIAN_DIR/snooze_until"
     [ -f "$f" ] || return 1

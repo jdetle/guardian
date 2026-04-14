@@ -301,6 +301,24 @@ else
     fail "beforeSubmit: expected continue false (got $result)"
 fi
 
+fresh_state critical 2 >"$STATE_FILE"
+result=$(printf '%s' '{"prompt":"/guardian-snooze"}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(guardian_json_continue "$result")
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: never blocks /guardian-snooze (meta)"
+else
+    fail "beforeSubmit: /guardian-snooze must not be blocked when critical (got $result)"
+fi
+
+fresh_state critical 2 >"$STATE_FILE"
+result=$(jq -n --arg p 'Follow .cursor/skills/guardian-upgrade' '{prompt:$p}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(guardian_json_continue "$result")
+if [ "$cont" = "true" ]; then
+    pass "beforeSubmit: never blocks guardian skill paths (meta)"
+else
+    fail "beforeSubmit: guardian skill prompt must not be blocked when critical (got $result)"
+fi
+
 touch "$GUARDIAN_DIR/proceed_once"
 fresh_state critical 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)

@@ -1,6 +1,8 @@
 #!/bin/bash
 # Shared prompt-gate evaluation for Cursor (beforeSubmitPrompt) and Codex (UserPromptSubmit).
 # Source after lib.sh. Call: guardian_prompt_gate_eval "$input_json"
+# Guardian slash commands (/guardian-snooze, /guardian-once) and guardian-install / guardian-upgrade
+# skill paths never block — users must always reach snooze/install flows under load.
 # Sets:
 #   PG_OUTCOME=pass|pass_msg|block
 #   PG_MESSAGE=""           # primary user-facing string (block reason or advisory)
@@ -13,6 +15,12 @@ guardian_prompt_gate_eval() {
     PG_ATTACH_ONLY=false
 
     if guardian_snooze_active; then
+        return 0
+    fi
+
+    local prompt_bundle
+    prompt_bundle=$(guardian_hook_prompt_text_bundle "$input")
+    if guardian_hook_is_guardian_meta_prompt "$prompt_bundle"; then
         return 0
     fi
 

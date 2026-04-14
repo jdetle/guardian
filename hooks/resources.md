@@ -13,6 +13,8 @@ Short checklist (also surfaced by hooks when load is high):
 
 **When a send is blocked:**
 
+- **Never blocked by the gate:** `/guardian-snooze`, `/guardian-once`, and prompts that reference **guardian-install** / **guardian-upgrade** (e.g. `.cursor/skills/guardian-install`, `skills/guardian-upgrade`, `…/SKILL.md`) — install and snooze always get through.
+
 - **Chat:** `/guardian-snooze` or `/guardian-once` (after `hooks/install-hooks.sh` → `~/.cursor/commands/`).
 - **CLI:** `~/.guardian/guardian snooze 15` · `once` · `zeno bump|rollback` (`guardian --help`).
 - **macOS:** `~/.guardian/Guardian-*.command` or `open ~/.guardian/Guardian-Snooze-15m.command`.
