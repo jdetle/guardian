@@ -27,7 +27,7 @@ COPY hooks/ /opt/guardian/hooks/
 COPY scripts/guardian-queue.sh /opt/guardian/scripts/guardian-queue.sh
 COPY tests/stress/ /opt/guardian/tests/
 
-RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/hooks/cursorignore_check.py /opt/guardian/hooks/iso_to_epoch.py /opt/guardian/tests/*.sh /opt/guardian/scripts/guardian-queue.sh 2>/dev/null || true
+RUN chmod +x /opt/guardian/hooks/*.sh /opt/guardian/hooks/codex/*.sh /opt/guardian/hooks/cursorignore_check.py /opt/guardian/hooks/iso_to_epoch.py /opt/guardian/tests/*.sh /opt/guardian/scripts/guardian-queue.sh 2>/dev/null || true
 
 RUN mkdir -p /root/.guardian \
     && cp /opt/guardian/hooks/hook_policy.default.json /root/.guardian/hook_policy.json \

@@ -4,7 +4,7 @@
 #
 # DESIGN: Tool hooks (preToolUse, etc.) default to allow with advisory text.
 # beforeSubmitPrompt may return continue:false when policy + load require it;
-# users can always resume via ~/.guardian/guardian CLI, .command clickables, or snooze (see resources.md).
+# users can always resume via ~/.guardian/guardian CLI, .command clickables, or snooze (see resources.md). Codex uses hooks/codex/.
 # The daemon handles enforcement (Docker throttling, fork guard).
 
 GUARDIAN_DIR="$HOME/.guardian"

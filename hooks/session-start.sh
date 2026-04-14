@@ -77,4 +77,16 @@ if [ -f "$queue_file" ]; then
     fi
 fi
 
-json_output "$(jq -n --arg ctx "$context" '{additional_context: $ctx}')"
+# Cursor expects additional_context; Codex expects hookSpecificOutput (see hooks/codex/session-start.sh).
+if [ "${GUARDIAN_HOOK_FORMAT:-cursor}" = "codex" ]; then
+    json_output "$(jq -n \
+        --arg ctx "$context" \
+        '{
+            hookSpecificOutput: {
+                hookEventName: "SessionStart",
+                additionalContext: $ctx
+            }
+        }')"
+else
+    json_output "$(jq -n --arg ctx "$context" '{additional_context: $ctx}')"
+fi

@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/user-prompt-submit.sh",
+            "timeout": 6
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/session-start.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

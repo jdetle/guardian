@@ -24,9 +24,7 @@ case "$pressure" in
             --arg msg "[Guardian] Monitoring active — high load (CPU: ${cpu}%, Mem free: ${mem}GB, Swap: ${swap}%). Prefer sequential operations and avoid spawning new containers." \
             '{permission: "allow", agent_message: $msg}')"
         ;;
-    *)
-        json_output "$(jq -n \
-            --arg msg "[Guardian] Monitoring active — system nominal." \
-            '{permission: "allow", agent_message: $msg}')"
+    clear|*)
+        json_output "$(jq -n '{permission: "allow"}')"
         ;;
 esac
