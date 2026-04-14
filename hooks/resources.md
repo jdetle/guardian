@@ -13,9 +13,9 @@ Short checklist (also surfaced by hooks when load is high):
 
 **Resume blocked prompts (human in the loop):**
 
-- **CLI (preferred):** `~/.guardian/guardian` — `snooze 15`, `once`, `zeno bump` / `zeno rollback`, etc. (`guardian --help`). If missing, run `bash scripts/install.sh` from your Guardian clone.
+- **Cursor (invocable in the composer):** After `hooks/install-hooks.sh`, type **`/guardian-snooze`** or **`/guardian-once`** in the **chat input** (same place as a new message) and press Enter. Cursor resolves Markdown files in **`~/.cursor/commands/`** to slash commands; those files expand into the snooze/once steps (they do not run shell automatically — run the `bash` lines they show, or use CLI / click below).
+- **CLI:** `~/.guardian/guardian` — `snooze 15`, `once`, `zeno bump` / `zeno rollback`, etc. (`guardian --help`). If missing, run `bash scripts/install.sh` from your Guardian clone.
 - **macOS (click):** double-click `~/.guardian/Guardian-Snooze-15m.command` or `Guardian-Once.command` in Finder (installed by `install.sh` / `hooks/install-hooks.sh`). Or run `open ~/.guardian/Guardian-Snooze-15m.command` in Terminal.
-- **Cursor (slash commands):** after `hooks/install-hooks.sh`, use **`/guardian-snooze`** or **`/guardian-once`** in chat — these paste the steps above (they do not run shell by themselves).
 - One-shot fallback: `touch ~/.guardian/proceed_once` then submit again.
 - Snooze fallback: write a future ISO timestamp into `~/.guardian/snooze_until`, or `bash scripts/guardian-resume.sh snooze 15` from a repo clone.
 - **Zeno** (relax effective limits — each bump moves percent-style caps halfway toward 100% used): `~/.guardian/guardian zeno bump`; undo with `zeno rollback`; `zeno status` / `zeno reset`.

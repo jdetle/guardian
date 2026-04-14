@@ -1,8 +1,10 @@
 # Guardian
 
-**Keep AI coding agents useful—and keep your Mac from melting down.**
+**Agent resource monitor for AI coding agents** — **Cursor** and **OpenAI Codex** are supported today.
 
-Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what Cursor agents are allowed to assume*. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
+**Keep agents useful—and keep your Mac from melting down.**
+
+Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and Cursor process usage, writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
 
 ---
 
@@ -25,7 +27,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | **Indexing and huge contexts on a full disk** | **Disk** sampling on the home volume + **cursorignore**-style warnings for paths that blow up context and disk. |
 | **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** can block (with **resume** / snooze) so you don’t add load at the worst moment. |
 
-**Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor stays usable on hardware that isn’t a dev workstation.*
+**Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor and Codex stay usable on hardware that isn’t a dev workstation.*
 
 ---
 
@@ -35,7 +37,8 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 |---|---|---|
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
 | `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
-| Cursor hooks | `hooks/` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … |
+| Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … (`~/.cursor/hooks.json`) |
+| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI — `UserPromptSubmit`, `SessionStart` (`~/.codex/hooks.json`; enable `[features] codex_hooks` in Codex config). |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |

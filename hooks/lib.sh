@@ -228,8 +228,9 @@ guardian_consume_proceed_once() {
 
 guardian_resume_hint_text() {
     local D="${GUARDIAN_DIR:-$HOME/.guardian}"
-    # Multiline: Composer shows CLI first; macOS .command + Cursor slash commands when installed via install-hooks.sh
-    printf '%s' "[Guardian] Resume:"$'\n'"  Snooze 15m: ${D}/guardian snooze 15"$'\n'"  macOS (click): open \"${D}/Guardian-Snooze-15m.command\" or double-click that file in Finder"$'\n'"  Next send once: ${D}/guardian once  —  macOS: ${D}/Guardian-Once.command"$'\n'"  Zeno: ${D}/guardian zeno bump  |  ${D}/guardian zeno rollback"$'\n'"  Cursor: type /guardian-snooze or /guardian-once (if ~/.cursor/commands were installed)"$'\n'"  Manual: touch ${D}/proceed_once  ·  future ISO in ${D}/snooze_until"
+    # Cursor: ~/.cursor/commands/*.md become invocable slash commands in the chat composer (/name → inserts that file).
+    # install-hooks.sh copies hooks/cursor-commands/*.md there. See hooks/resources.md.
+    printf '%s' "[Guardian] Resume:"$'\n'"  Cursor (chat composer): type /guardian-snooze or /guardian-once then Enter — custom slash commands from ~/.cursor/commands (run hooks/install-hooks.sh if missing)"$'\n'"  Terminal: ${D}/guardian snooze 15  |  ${D}/guardian once"$'\n'"  macOS (click): ${D}/Guardian-Snooze-15m.command  |  ${D}/Guardian-Once.command"$'\n'"  Zeno: ${D}/guardian zeno bump  |  ${D}/guardian zeno rollback"$'\n'"  Manual: touch ${D}/proceed_once  ·  future ISO in ${D}/snooze_until"
 }
 
 # Path to guardian-queue CLI (installed to ~/.guardian by hooks/install-hooks.sh).
