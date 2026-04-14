@@ -159,10 +159,22 @@ guardian_prompt_gate_eval() {
         return 0
     fi
 
+    local preempt
+    preempt=$(guardian_preempt_snooze_hint "$pressure" "$block_on" "$block_sess" "$cursor_mb" "$max_rss")
+
     if [ -n "$attach_notes" ]; then
         PG_OUTCOME="pass_msg"
         PG_MESSAGE="$attach_notes"
+        if [ -n "$preempt" ]; then
+            PG_MESSAGE="${attach_notes}"$'\n'"${preempt}"
+        fi
         PG_ATTACH_ONLY=true
+        return 0
+    fi
+
+    if [ -n "$preempt" ]; then
+        PG_OUTCOME="pass_msg"
+        PG_MESSAGE="$preempt"
         return 0
     fi
 

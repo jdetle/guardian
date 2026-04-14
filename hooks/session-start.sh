@@ -20,8 +20,10 @@ cursor_mb=$(read_state_field "cursor.resident_memory_megabytes" "0")
 
 policy_file=$(guardian_hook_policy_file)
 warn_rss="4096"
+block_on_hint="critical"
 if [ -n "${policy_file:-}" ] && [ -f "$policy_file" ]; then
     warn_rss=$(jq -r '.session_budget.warn_cursor_rss_megabytes // 4096' "$policy_file")
+    block_on_hint=$(jq -r '.prompt_gate.block_on // "critical"' "$policy_file" 2>/dev/null || echo "critical")
 fi
 
 if [ -n "$conversation_id" ]; then
@@ -47,6 +49,14 @@ case "$pressure" in
         context="$banner System resources: nominal (CPU: ${cpu}%, Memory: ${mem}GB free)."
         ;;
 esac
+
+G_home="${GUARDIAN_DIR:-$HOME/.guardian}"
+if [ "$pressure" = "strained" ] && [ "$block_on_hint" = "critical" ]; then
+    context="${context} [Before a hard block] Prompt gates block at critical load — snooze in the agent UI now: type /guardian-snooze in chat, or ${G_home}/guardian snooze 15."
+fi
+if [ "$pressure" = "critical" ]; then
+    context="${context} Prompt submits may be blocked while load is critical — snooze: /guardian-snooze or ${G_home}/guardian snooze 15."
+fi
 
 # Workspace folder count is diagnostic only (stale dirs accumulate); RSS reflects actual load.
 context="${context} Cursor workspace folders under ~/.cursor/projects ≈ ${cursor_sess}; Cursor RSS ≈ ${cursor_mb} MB (best-effort)."

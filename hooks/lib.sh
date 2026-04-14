@@ -233,6 +233,45 @@ guardian_resume_hint_text() {
     printf '%s' "[Guardian] Resume:"$'\n'"  Cursor (chat composer): type /guardian-snooze or /guardian-once then Enter — custom slash commands from ~/.cursor/commands (run hooks/install-hooks.sh if missing)"$'\n'"  Terminal: ${D}/guardian snooze 15  |  ${D}/guardian once"$'\n'"  macOS (click): ${D}/Guardian-Snooze-15m.command  |  ${D}/Guardian-Once.command"$'\n'"  Zeno: ${D}/guardian zeno bump  |  ${D}/guardian zeno rollback"$'\n'"  Manual: touch ${D}/proceed_once  ·  future ISO in ${D}/snooze_until"
 }
 
+# Advisory text while submits are still allowed — snooze in the agent UI before a hard block (beforeSubmit pass_msg).
+# Args: pressure block_on block_on_session_budget cursor_mb max_cursor_rss_megabytes
+guardian_preempt_snooze_hint() {
+    local pressure="${1:-clear}"
+    local block_on="${2:-critical}"
+    local block_sess="${3:-false}"
+    local cursor_mb="${4:-0}"
+    local max_rss="${5:-8192}"
+    local D="${GUARDIAN_DIR:-$HOME/.guardian}"
+    local cm mx thr line1="" line2=""
+
+    cm="${cursor_mb%%.*}"
+    mx="${max_rss%%.*}"
+    if [ "${mx:-0}" -le 0 ] 2>/dev/null; then
+        mx=8192
+    fi
+
+    if [ "$pressure" = "strained" ] && [ "$block_on" = "critical" ]; then
+        line1="[Guardian] Load is strained — sends still work until pressure is critical. Snooze prompt gates now in chat: type /guardian-snooze then Enter, or run ${D}/guardian snooze 15 (see hooks/resources.md)."
+    fi
+
+    if [ "$block_sess" = "true" ] && [ "$pressure" != "clear" ] 2>/dev/null \
+        && [ "${mx:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt 0 ] 2>/dev/null \
+        && [ "${cm:-0}" -le "${mx:-0}" ] 2>/dev/null; then
+        thr=$(( mx * 80 / 100 ))
+        if [ "${cm:-0}" -ge "${thr:-0}" ] 2>/dev/null; then
+            line2="[Guardian] Cursor memory is near the prompt-gate cap (${cursor_mb} MB / max ${mx} MB). Snooze or trim work before a hard block: /guardian-snooze or ${D}/guardian snooze 15."
+        fi
+    fi
+
+    if [ -n "$line1" ] && [ -n "$line2" ]; then
+        printf '%s\n%s' "$line1" "$line2"
+    elif [ -n "$line1" ]; then
+        printf '%s' "$line1"
+    elif [ -n "$line2" ]; then
+        printf '%s' "$line2"
+    fi
+}
+
 # Path to guardian-queue CLI (installed to ~/.guardian by hooks/install-hooks.sh).
 guardian_queue_cli() {
     local g="${GUARDIAN_DIR:-$HOME/.guardian}/guardian-queue.sh"

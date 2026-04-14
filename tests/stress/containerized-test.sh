@@ -321,6 +321,16 @@ else
     fail "beforeSubmit: should allow when clear (got $result)"
 fi
 
+fresh_state strained 2 100 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(guardian_json_continue "$result")
+um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
+if [ "$cont" = "true" ] && echo "$um" | grep -q '/guardian-snooze'; then
+    pass "beforeSubmit: preempt snooze hint in agent UI while strained (before critical block)"
+else
+    fail "beforeSubmit: expected continue true + preempt snooze hint when strained (got $result)"
+fi
+
 # RSS block only when pressure is not clear (see hooks/before-submit-prompt.sh)
 fresh_state strained 2 9000 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
