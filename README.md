@@ -1,6 +1,6 @@
 # Guardian
 
-**Agent resource monitor for AI coding agents** — **Cursor** and **OpenAI Codex** are supported today.
+**Agent resource monitor for AI coding agents** — **Cursor**, **OpenAI Codex**, and **Claude Code** are supported today.
 
 **Keep agents useful—and keep your Mac from melting down.**
 
@@ -27,7 +27,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | **Indexing and huge contexts on a full disk** | **Disk** sampling on the home volume + **cursorignore**-style warnings for paths that blow up context and disk. |
 | **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** can block (with **resume** / snooze) so you don’t add load at the worst moment. |
 
-**Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor and Codex stay usable on hardware that isn’t a dev workstation.*
+**Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor, Codex, and Claude Code stay usable on hardware that isn’t a dev workstation.*
 
 ---
 
@@ -39,6 +39,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
 | Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … (`~/.cursor/hooks.json`) |
 | Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI — `UserPromptSubmit`, `SessionStart` (`~/.codex/hooks.json`; enable `[features] codex_hooks` in Codex config). See [docs/codex.md](docs/codex.md). |
+| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | Anthropic Claude Code — `UserPromptSubmit`, `SessionStart`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
@@ -85,6 +86,16 @@ bash scripts/install-codex-hooks.sh
 ```
 
 This installs **`UserPromptSubmit`** + **`SessionStart`** with the same policy as Cursor’s prompt gate and session hook. Details: [docs/codex.md](docs/codex.md).
+
+### Claude Code (optional)
+
+Claude Code reads hooks from **`~/.claude/settings.json`**. After `bash scripts/install.sh` (or at least `cargo build --release` if you want the CLI copied to `~/.guardian/`):
+
+```bash
+bash scripts/install-claude-hooks.sh
+```
+
+This merges **`UserPromptSubmit`**, **`SessionStart`**, and **`PreToolUse`** into the `hooks` object. Restart Claude Code after installing. Details: [docs/claude-code.md](docs/claude-code.md).
 
 ### Prompt gates and resume
 
@@ -249,6 +260,10 @@ In a case like this, the **headline** level is **strained** (between clear and c
 This repo includes small **Python** helpers under `hooks/` (stdlib only). We reference **[Monty](https://github.com/pydantic/monty)**—a **minimal Python interpreter in Rust** for **safe execution of LLM-generated code**—because it reduces attack surface versus unconstrained CPython in agent loops. Guardian hook scripts still run under **`python3`** on the host for Cursor; keep them small and auditable. See `.cursor/rules/monty-python.mdc`.
 
 ---
+
+## Contributing
+
+Pull requests to `main` (not direct pushes); bump **`Cargo.toml`** SemVer per [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

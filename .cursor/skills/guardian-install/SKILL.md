@@ -59,6 +59,16 @@ bash scripts/install-codex-hooks.sh
 
 See [docs/codex.md](../../../docs/codex.md) for behavior and differences vs Cursor.
 
+### 2c. Claude Code hooks (optional)
+
+Use the same machine-wide **`~/.guardian/`** policy with [Claude Code hooks](https://code.claude.com/docs/en/hooks), then:
+
+```bash
+bash scripts/install-claude-hooks.sh
+```
+
+See [docs/claude-code.md](../../../docs/claude-code.md) for behavior (UserPromptSubmit, SessionStart, PreToolUse) and differences vs Cursor.
+
 ### 3. Build the SwiftUI App (Optional)
 
 Requires Xcode (not just CommandLineTools):
