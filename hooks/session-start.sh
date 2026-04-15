@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/lib.sh"
 input=$(read_hook_input)
 ensure_db
 
-conversation_id=$(sanitize_sql "$(echo "$input" | jq -r '.conversation_id // ""')")
+conversation_id=$(sanitize_sql "$(echo "$input" | jq -r '.conversation_id // .session_id // ""')")
 model=$(sanitize_sql "$(echo "$input" | jq -r '.model // "unknown"')")
 
 pressure=$(read_state_pressure)
