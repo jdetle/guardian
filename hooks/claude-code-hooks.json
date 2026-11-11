@@ -1,35 +1,36 @@
 {
   "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/codex/user-prompt-submit.sh",
-            "timeout": 6
-          }
-        ]
-      }
-    ],
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
         "hooks": [
           {
             "type": "command",
-            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/codex/session-start.sh",
+            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/claude/session-start.sh",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/claude/user-prompt-submit.sh",
+            "timeout": 6
           }
         ]
       }
     ],
     "PreToolUse": [
       {
+        "matcher": "Bash|Agent|Task",
         "hooks": [
           {
             "type": "command",
             "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/claude/pre-tool-use.sh",
-            "timeout": 3
+            "timeout": 5
           }
         ]
       }

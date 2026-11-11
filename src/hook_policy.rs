@@ -2,7 +2,7 @@
 
 use crate::config::{
     CursorIgnorePolicyConfig, DiskConfig, GuardianConfig, PromptGateConfig, QueueConfig,
-    SessionBudgetConfig,
+    SessionBudgetConfig, ToolGateConfig,
 };
 use crate::config::guardian_dir;
 use serde::Serialize;
@@ -58,6 +58,7 @@ impl From<&QueueConfig> for HookQueueJson {
 #[derive(Serialize)]
 struct HookPolicyJson {
     prompt_gate: PromptGateConfig,
+    tool_gate: ToolGateConfig,
     session_budget: HookSessionBudgetJson,
     disk: HookDiskJson,
     queue: HookQueueJson,
@@ -70,6 +71,7 @@ pub fn write_hook_policy(cfg: &GuardianConfig) -> std::io::Result<()> {
 
     let export = HookPolicyJson {
         prompt_gate: cfg.prompt_gate.clone(),
+        tool_gate: cfg.tool_gate.clone(),
         session_budget: (&cfg.session_budget).into(),
         disk: (&cfg.disk).into(),
         queue: (&cfg.queue).into(),

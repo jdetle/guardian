@@ -38,9 +38,9 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, per-agent RSS for Cursor / Claude / Codex (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
 | `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
 | Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … (`~/.cursor/hooks.json`) |
-| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI — `UserPromptSubmit`, `SessionStart` (`~/.codex/hooks.json`; enable `[features] codex_hooks` in Codex config). See [docs/codex.md](docs/codex.md). |
-| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | Anthropic Claude Code — `UserPromptSubmit`, `SessionStart`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
-| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
+| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI + app — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (`~/.codex/hooks.json`; hooks must be **trusted** in Codex once). See [docs/codex.md](docs/codex.md). |
+| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
+| Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[tool_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
@@ -54,7 +54,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 2. State is written atomically to `~/.guardian/state.json` (including **`disk`** usage on the home volume); **`hook_policy.json`** mirrors gate settings for shell hooks.
 3. **`beforeSubmitPrompt`** may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure and/or **Cursor RSS** above cap). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
 4. **`beforeReadFile`** always **`allow`**s; it may add **advisory** text when a path matches the shipped **cursorignore checklist** and isn’t covered by `.cursorignore` or **`.guardian/cursorignore-allow`**.
-5. **`preToolUse` / `subagentStart`** remain **allow** + advisory (by default).
+5. **`preToolUse` / `subagentStart`** remain **allow** + advisory (by default). Opt in to **`[tool_gate] deny_subagents_on = "critical"`** to deny *new subagent spawns* under pressure — the one thing a prompt gate cannot stop mid-turn.
 6. Under load, the **daemon** enforces Docker throttling, fork guard, etc.
 
 ---
@@ -71,33 +71,44 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 ### Install
 
 ```bash
-bash scripts/install.sh
-bash hooks/install-hooks.sh
+bash scripts/install.sh              # daemon + CLI (required)
+bash hooks/install-hooks.sh          # Cursor
+bash scripts/install-claude-hooks.sh # Claude Code
+bash scripts/install-codex-hooks.sh  # OpenAI Codex
 ```
+
+Run the hook installers for the agents you use; all three read the same **`~/.guardian/`** state and policy.
 
 `install.sh` copies **`guardiand`** to **`~/.guardian/guardiand`** and points the LaunchAgent there, so `cargo clean` or a disk-space sweep of `target/` no longer kills the daemon. It exits non-zero unless the new daemon is actually writing fresh `state.json`.
 
 Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates without recompiling).
 
-### OpenAI Codex CLI (optional)
-
-Codex uses **`~/.codex/hooks.json`** (not Cursor’s file). Hooks are **experimental**; enable **`codex_hooks = true`** in Codex’s **`config.toml`**, then:
-
-```bash
-bash scripts/install-codex-hooks.sh
-```
-
-This installs **`UserPromptSubmit`** + **`SessionStart`** with the same policy as Cursor’s prompt gate and session hook. Details: [docs/codex.md](docs/codex.md).
-
-### Claude Code (optional)
-
-Claude Code reads hooks from **`~/.claude/settings.json`**. After `bash scripts/install.sh` (or at least `cargo build --release` if you want the CLI copied to `~/.guardian/`):
+### Claude Code
 
 ```bash
 bash scripts/install-claude-hooks.sh
 ```
 
-This merges **`UserPromptSubmit`**, **`SessionStart`**, and **`PreToolUse`** into the `hooks` object. Restart Claude Code after installing. Details: [docs/claude-code.md](docs/claude-code.md).
+Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), and **`PreToolUse`** (`Bash|Agent|Task` advisory) into **`~/.claude/settings.json`**. Idempotent; other hooks and settings are preserved, and entries from earlier Guardian versions are replaced. Start a new session afterwards. Details: [docs/claude-code.md](docs/claude-code.md).
+
+### OpenAI Codex
+
+```bash
+bash scripts/install-codex-hooks.sh
+```
+
+Merges the same three events into **`~/.codex/hooks.json`**. Hooks are on by default in current Codex, but **Codex skips new or changed hooks until you trust them** — run **`/hooks`** in the CLI or open **Settings > Hooks** in the app. Details: [docs/codex.md](docs/codex.md).
+
+### Tool gate (`[tool_gate]`)
+
+Tool hooks are advisory by default. To hard-stop subagent fan-out when the machine is already in trouble:
+
+```toml
+[tool_gate]
+deny_subagents_on = "critical"   # "never" (default) | "strained" | "critical"
+```
+
+Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_agent`). Shell commands are never denied; a snooze lifts the deny. Restart `guardiand` after editing.
 
 ### Prompt gates and resume
 
@@ -159,15 +170,19 @@ launchctl list com.guardian.guardiand
 cat ~/.guardian/state.json | jq '{pressure, agents, disk, sampled_at}'   # sampled_at must be seconds old
 cat ~/.guardian/hook_policy.json
 cat ~/.cursor/hooks.json | jq '.hooks | keys'
+cat ~/.claude/settings.json | jq '.hooks | keys'
+cat ~/.codex/hooks.json | jq '.hooks | keys'
 ```
 
 ### Uninstall
 
 ```bash
 bash scripts/uninstall.sh
-rm -rf ~/.cursor/hooks/guardian/
+rm -rf ~/.cursor/hooks/guardian/ ~/.claude/hooks/guardian/ ~/.codex/hooks/guardian/
 rm -rf ~/.guardian/
 ```
+
+Also delete the Guardian entries (commands containing `/hooks/guardian/`) from `~/.cursor/hooks.json`, `~/.claude/settings.json`, and `~/.codex/hooks.json` — otherwise each agent keeps trying to run scripts that no longer exist.
 
 ---
 
@@ -228,7 +243,7 @@ cat ~/.guardian/state.json | jq '{
 | **`agents`** | Resident memory per coding agent, in MB: **`cursor_mb`**, **`claude_mb`** (desktop app + Claude Code CLI), **`codex_mb`**, and **`total_mb`**. Matched on executable path via `ps`; agents launched through a generic runtime (e.g. an npm install running as `node`) are not attributed. |
 | **`cursor`** | Aggregate Cursor **`resident_memory_megabytes`** (processes running from `Cursor.app`), **`process_count`**, and related diagnostics. |
 | **`docker`** | Running-container CPU/memory when Docker is available. |
-| **`sampled_at`** | Time of this sample (RFC3339). Shell hooks **fail-open** if the file is missing or **stale** (typically older than ~30 seconds): they assume `clear` so a stopped daemon does not block you forever. |
+| **`sampled_at`** | Time of this sample (RFC3339). Shell hooks **fail-open** if the file is missing, **stale** (older than ~30 seconds), future-dated, or has no `sampled_at` at all: they assume `clear` so a stopped daemon does not block you forever. |
 
 **Plain-language read**
 

@@ -1,46 +1,101 @@
 # Guardian + Claude Code
 
-Guardian can drive the same **prompt gate**, **session context**, and **pre-tool advisories** via Claude Code’s hooks ([Hooks reference](https://code.claude.com/docs/en/hooks)).
+Guardian drives the same **prompt gate**, **session context**, and **tool advisory** in Claude Code
+through its [hooks](https://code.claude.com/docs/en/hooks). The hooks live in the user-level
+`~/.claude/settings.json`, so they apply to the CLI, the desktop app's Code tab, and the IDE
+extensions alike.
 
 ## Requirements
 
-- `jq` for the installer merge step.
-- Claude Code reads hook definitions from **`~/.claude/settings.json`** (or project `.claude/settings.json`). The installer only updates the user-level file unless you merge manually.
+- `guardiand` installed and running (`bash scripts/install.sh`) — without fresh metrics every hook
+  fails open and the gate is off.
+- `jq` (the installer refuses to touch `settings.json` without it).
 
 ## Install
-
-From your Guardian git clone (after `cargo build --release` if you want the latest `guardian` binary copied to `~/.guardian/`):
 
 ```bash
 bash scripts/install-claude-hooks.sh
 ```
 
-This installs scripts under **`~/.claude/hooks/guardian/`** and merges the **`hooks`** object into **`~/.claude/settings.json`** (backup: `settings.json.bak` when merging), registering:
+This copies scripts to **`~/.claude/hooks/guardian/`** and merges three entries into
+**`~/.claude/settings.json`** (backup: `settings.json.guardian.bak`). Re-running is safe: existing
+Guardian entries are replaced, never duplicated, and other hooks and settings are left alone.
+`CLAUDE_CONFIG_DIR` is honored.
 
-- **`UserPromptSubmit`** — same policy as Cursor’s `beforeSubmitPrompt` / Codex’s `UserPromptSubmit` (pressure, RSS, snooze, `proceed_once`, queue enqueue). Implemented by the shared Codex adapter script.
-- **`SessionStart`** — same context as Cursor’s `sessionStart`, in Claude’s `hookSpecificOutput` shape (matchers: `startup`, `resume`, `clear`, `compact`).
-- **`PreToolUse`** — always allow; under strain or critical load, injects **`additionalContext`** with system pressure (Claude’s `hookSpecificOutput` shape).
+Sessions snapshot their hooks at startup — **start a new session** (or open `/hooks`) after installing.
 
-Restart Claude Code after changing `settings.json` or hook scripts.
+## What each hook does
 
-## Differences vs Cursor and Codex
+| Event | Script | Behavior |
+|---|---|---|
+| `SessionStart` | `claude/session-start.sh` | Adds one line of context: pressure, free RAM, per-agent RAM (Claude / Codex / Cursor), disk. Says so loudly when the daemon is not running. |
+| `UserPromptSubmit` | `claude/user-prompt-submit.sh` | The prompt gate. Returns `decision: "block"` when `[prompt_gate]` says so (default: `critical` pressure). At `strained` it adds a short advisory instead. |
+| `PreToolUse` (`Bash\|Agent\|Task`) | `claude/pre-tool-use.sh` | Silent when load is clear. At `strained` / `critical` adds an advisory as `additionalContext`, at most once per 2 minutes per session. Optionally **denies subagent spawns** (see below). |
 
-| | Cursor | Codex | Claude Code |
-|---|--------|--------|--------------|
-| Config | `~/.cursor/hooks.json` | `~/.codex/hooks.json` | `~/.claude/settings.json` → `hooks` |
-| Prompt event | `beforeSubmitPrompt` | `UserPromptSubmit` | `UserPromptSubmit` |
-| Block shape | `continue: false`, `user_message` | `decision: "block"`, `reason` | `decision: "block"`, `reason` |
-| Tool advisories | `preToolUse` (`permission`, `agent_message`) | (not installed by Guardian) | `PreToolUse` → `hookSpecificOutput.permissionDecision` + `additionalContext` |
-| Slash commands | `~/.cursor/commands/guardian-*.md` | — | — |
+The `PreToolUse` hook **never returns `permissionDecision: "allow"`** — that would skip Claude Code's
+own permission prompt. It either says nothing, adds context, or (opt-in) denies a subagent.
 
-Resume paths (`guardian snooze`, `once`, zeno) are identical; see [hooks/resources.md](../hooks/resources.md).
+## Stopping subagent fan-out under pressure (opt-in)
 
-Session metrics in `session-start` still describe **Cursor** process memory and `~/.cursor/projects` from `state.json` (daemon-sourced). That remains accurate if you use Cursor alongside Claude Code on the same machine.
+The prompt gate only sees *new prompts*. A long agentic turn can keep spawning subagents — each one
+a separate process — after pressure has already gone critical. To stop that, set in
+`~/.guardian/config.toml` and restart `guardiand`:
+
+```toml
+[tool_gate]
+deny_subagents_on = "critical"   # "never" (default) | "strained" | "critical"
+```
+
+The `Agent` / `Task` tool call is then denied with a reason telling the agent to do the work
+serially in the current session. `Bash` is never denied. A snooze lifts the deny. The same setting
+applies to Cursor (`Task`) and Codex (`spawn_agent`).
+
+## When a prompt is blocked
+
+Claude Code shows the block reason and your original prompt. From any terminal:
+
+```bash
+~/.guardian/guardian snooze 15   # gates off for 15 minutes
+~/.guardian/guardian once        # let exactly one prompt through
+```
+
+Then send again. macOS double-click helpers (`~/.guardian/Guardian-*.command`) work too. Cursor's
+`/guardian-snooze` slash commands are not installed for Claude Code.
+
+## Differences vs Cursor
+
+| | Cursor | Claude Code |
+|---|--------|-------------|
+| Config | `~/.cursor/hooks.json` | `~/.claude/settings.json` (`hooks` key) |
+| Prompt event | `beforeSubmitPrompt` | `UserPromptSubmit` |
+| Block shape | `continue: false`, `user_message` | `decision: "block"`, `reason` |
+| Tool advisory | `agent_message` on every call | `additionalContext`, rate limited |
+| Session id | `conversation_id` | `session_id` (stored in the same `sessions.db` column) |
+| Not ported | — | `beforeReadFile` (`.cursorignore` advisory), `postToolUse` / `stop` ROI tracking |
+
+## Verify
+
+```bash
+jq '.hooks | keys' ~/.claude/settings.json
+echo '{"source":"startup"}' | ~/.claude/hooks/guardian/claude/session-start.sh | jq -r '.hookSpecificOutput.additionalContext'
+```
+
+Hook behavior under simulated pressure is covered by the containerized suite
+(`docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-test`, group 7b).
+
+## Uninstall
+
+Remove the three entries whose command contains `/hooks/guardian/` from `~/.claude/settings.json`
+(or restore `settings.json.guardian.bak`), then `rm -rf ~/.claude/hooks/guardian/`.
 
 ## Caveats
 
-- **Managed / enterprise settings** may restrict hooks (`allowManagedHooksOnly`, etc.); see [Hook configuration](https://code.claude.com/en/settings#hook-configuration).
-- **Blocking in subagent or multi-tool flows** may not always match expectations; if you rely on hard blocking, check recent issues in the upstream Claude Code repo.
+- **Managed / enterprise settings** may restrict hooks (`allowManagedHooksOnly`, etc.); see
+  [Hook configuration](https://code.claude.com/en/settings#hook-configuration).
+- **Upgrading from Guardian 0.3.1:** that version's `PreToolUse` hook ran on every tool and answered
+  `permissionDecision: "allow"`, which auto-approved tool calls. Re-run
+  `bash scripts/install-claude-hooks.sh` — it replaces the old entries (including duplicates left by
+  repeated installs) with the advisory-only hook.
 
 ## Smoke test
 

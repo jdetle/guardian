@@ -21,6 +21,8 @@ pub struct GuardianConfig {
     pub disk: DiskConfig,
     #[serde(default)]
     pub queue: QueueConfig,
+    #[serde(default)]
+    pub tool_gate: ToolGateConfig,
 }
 
 impl Default for GuardianConfig {
@@ -35,8 +37,29 @@ impl Default for GuardianConfig {
             cursorignore_policy: CursorIgnorePolicyConfig::default(),
             disk: DiskConfig::default(),
             queue: QueueConfig::default(),
+            tool_gate: ToolGateConfig::default(),
         }
     }
+}
+
+/// Tool-call gate (preToolUse / PreToolUse hooks). Advisory-only unless configured otherwise.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ToolGateConfig {
+    /// Deny new subagent spawns at this pressure: `"never"` (default), `"strained"`, or `"critical"`.
+    #[serde(default = "default_deny_subagents_on")]
+    pub deny_subagents_on: String,
+}
+
+impl Default for ToolGateConfig {
+    fn default() -> Self {
+        Self {
+            deny_subagents_on: default_deny_subagents_on(),
+        }
+    }
+}
+
+fn default_deny_subagents_on() -> String {
+    "never".to_string()
 }
 
 /// Local agent work queue (`~/.guardian/agent_queue.jsonl`) — see README.

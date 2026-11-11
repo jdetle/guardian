@@ -111,6 +111,12 @@ block_on = "critical"
 # When true, block if Cursor RSS exceeds [session_budget] max while pressure is strained/critical
 block_on_session_budget = false
 
+# Tool-call gate (Cursor preToolUse, Claude Code / Codex PreToolUse). Advisory by default.
+[tool_gate]
+# Deny NEW subagent spawns at this pressure: "never" | "strained" | "critical".
+# Subagent fan-out is the main way one agent turn multiplies memory use.
+deny_subagents_on = "never"
+
 [session_budget]
 # Aggregate Cursor RSS (MB) from guardiand — not ~/.cursor/projects folder count
 max_cursor_rss_megabytes = 8192

@@ -20,6 +20,30 @@ parse_iso_epoch() {
         echo 0
         return 0
     fi
+    # Fast path, no python spawn: UTC timestamps as written by guardiand (…+00:00) and the
+    # guardian CLI (…Z). Hooks run on every tool call, so this matters under memory pressure.
+    # Pure integer arithmetic (days-from-civil) rather than jq's strptime/mktime, which has
+    # been off by an hour under DST in some jq 1.6 builds — that would silently turn gates off.
+    case "$ts" in
+        *Z|*+00:00)
+            local jq_epoch
+            if jq_epoch=$(jq -rn --arg t "$ts" '
+                $t
+                | capture("^(?<y>[0-9]{4})-(?<m>[0-9]{2})-(?<d>[0-9]{2})T(?<H>[0-9]{2}):(?<M>[0-9]{2}):(?<S>[0-9]{2})(?:\\.[0-9]+)?(?:Z|\\+00:00)$")
+                | map_values(tonumber)
+                | (if .m <= 2 then .y - 1 else .y end) as $y
+                | ($y / 400 | floor) as $era
+                | ($y - $era * 400) as $yoe
+                | (((153 * (.m + (if .m > 2 then -3 else 9 end)) + 2) / 5 | floor) + .d - 1) as $doy
+                | ($yoe * 365 + ($yoe / 4 | floor) - ($yoe / 100 | floor) + $doy) as $doe
+                | ($era * 146097 + $doe - 719468) * 86400 + .H * 3600 + .M * 60 + .S
+                ' 2>/dev/null) \
+                && [ -n "$jq_epoch" ]; then
+                echo "$jq_epoch"
+                return 0
+            fi
+            ;;
+    esac
     local lib_dir
     lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -f "$lib_dir/iso_to_epoch.py" ] && command -v python3 &>/dev/null; then
@@ -49,17 +73,25 @@ is_daemon_active() {
         return 1
     fi
 
+    # No timestamp means we cannot tell how old the sample is: treat it as not live.
     local sampled_at
-    sampled_at=$(jq -r '.sampled_at // ""' < "$STATE_FILE" 2>/dev/null)
+    sampled_at=$(jq -r 'try (.sampled_at // "" | tostring) catch ""' < "$STATE_FILE" 2>/dev/null) || sampled_at=""
     if [ -z "$sampled_at" ]; then
         return 1
     fi
 
     local state_epoch now_epoch age
     state_epoch=$(parse_iso_epoch "$sampled_at")
+    case "$state_epoch" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
     now_epoch=$(date -u +%s)
     age=$(( now_epoch - state_epoch ))
     if [ "$age" -gt "$STALE_THRESHOLD_SECS" ]; then
+        return 1
+    fi
+    # A sample from the future (clock change, hand-edited file) is not a live sample either.
+    if [ "$age" -lt "-$STALE_THRESHOLD_SECS" ]; then
         return 1
     fi
 
@@ -79,19 +111,12 @@ read_state_pressure() {
         return
     fi
 
-    # Staleness check: if state.json is older than STALE_THRESHOLD_SECS,
-    # the daemon may have crashed. Fail-open to "clear".
-    local sampled_at
-    sampled_at=$(jq -r '.sampled_at // ""' < "$STATE_FILE" 2>/dev/null)
-    if [ -n "$sampled_at" ]; then
-        local state_epoch now_epoch age
-        state_epoch=$(parse_iso_epoch "$sampled_at")
-        now_epoch=$(date -u +%s)
-        age=$(( now_epoch - state_epoch ))
-        if [ "$age" -gt "$STALE_THRESHOLD_SECS" ]; then
-            echo "clear"
-            return
-        fi
+    # Staleness check: only a fresh, timestamped sample is trusted. A state.json that is old,
+    # future-dated, or has no sampled_at at all means the daemon is not reporting — fail open.
+    # Same rule as is_daemon_active, so "gates are off" messages and gate behavior agree.
+    if ! is_daemon_active; then
+        echo "clear"
+        return
     fi
 
     local pressure
@@ -262,8 +287,16 @@ guardian_consume_proceed_once() {
 
 guardian_resume_hint_text() {
     local D="${GUARDIAN_DIR:-$HOME/.guardian}"
-    # ~/.cursor/commands → /guardian-snooze etc. (install-hooks.sh). See hooks/resources.md.
-    printf '%s' "Unblock: /guardian-snooze · /guardian-once"$'\n'"${D}/guardian snooze 15 · once · zeno bump · touch ${D}/proceed_once"
+    case "${GUARDIAN_HOOK_FORMAT:-cursor}" in
+        claude|codex)
+            # No Guardian slash commands outside Cursor — point at the CLI.
+            printf '%s' "Unblock from a terminal: ${D}/guardian snooze 15 (or: ${D}/guardian once), then send again."$'\n'"Also: ${D}/guardian zeno bump · touch ${D}/proceed_once"
+            ;;
+        *)
+            # ~/.cursor/commands → /guardian-snooze etc. (install-hooks.sh). See hooks/resources.md.
+            printf '%s' "Unblock: /guardian-snooze · /guardian-once"$'\n'"${D}/guardian snooze 15 · once · zeno bump · touch ${D}/proceed_once"
+            ;;
+    esac
 }
 
 # Advisory text while submits are still allowed — snooze in the agent UI before a hard block (beforeSubmit pass_msg).
@@ -284,7 +317,14 @@ guardian_preempt_snooze_hint() {
     fi
 
     if [ "$pressure" = "strained" ] && [ "$block_on" = "critical" ]; then
-        line1="Guardian: Strained load — you can still send until it hits critical. Snooze gates now: /guardian-snooze or ${D}/guardian snooze 15."
+        case "${GUARDIAN_HOOK_FORMAT:-cursor}" in
+            claude|codex)
+                line1="Guardian: Strained load — prompts still go through until it hits critical. Prefer serial work; avoid subagents and heavy containers. (User can snooze gates: ${D}/guardian snooze 15.)"
+                ;;
+            *)
+                line1="Guardian: Strained load — you can still send until it hits critical. Snooze gates now: /guardian-snooze or ${D}/guardian snooze 15."
+                ;;
+        esac
     fi
 
     if [ "$block_sess" = "true" ] && [ "$pressure" != "clear" ] 2>/dev/null \

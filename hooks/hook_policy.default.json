@@ -4,6 +4,9 @@
     "block_on": "critical",
     "block_on_session_budget": false
   },
+  "tool_gate": {
+    "deny_subagents_on": "never"
+  },
   "session_budget": {
     "max_cursor_rss_megabytes": 8192,
     "warn_cursor_rss_megabytes": 4096

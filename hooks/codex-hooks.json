@@ -1,5 +1,17 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/session-start.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -11,14 +23,14 @@
         ]
       }
     ],
-    "SessionStart": [
+    "PreToolUse": [
       {
-        "matcher": "startup|resume",
+        "matcher": "Bash|Agent|spawn_agent",
         "hooks": [
           {
             "type": "command",
-            "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/session-start.sh",
-            "timeout": 10
+            "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/pre-tool-use.sh",
+            "timeout": 5
           }
         ]
       }
