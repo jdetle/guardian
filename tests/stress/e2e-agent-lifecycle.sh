@@ -78,19 +78,19 @@ result=$(echo "{\"conversation_id\":\"$CONV_ID\",\"model\":\"$MODEL\"}" \
 
 ctx=$(echo "$result" | jq -r '.additional_context // ""' 2>/dev/null)
 
-if echo "$ctx" | grep -q '\[Guardian\]'; then
+if echo "$ctx" | grep -q 'Guardian:'; then
     pass "registration banner present in additional_context"
 else
     fail "registration banner missing (got: $ctx)"
 fi
 
-if echo "$ctx" | grep -q 'daemon active'; then
+if echo "$ctx" | grep -q 'metrics live'; then
     pass "daemon-active status detected"
 else
     fail "daemon-active status missing (got: $ctx)"
 fi
 
-if echo "$ctx" | grep -q 'Agent registered'; then
+if echo "$ctx" | grep -q 'Session on'; then
     pass "registration confirmation text present"
 else
     fail "registration confirmation missing (got: $ctx)"
@@ -108,13 +108,13 @@ result=$(echo "{\"conversation_id\":\"$CONV_ID_INACTIVE\",\"model\":\"$MODEL\"}"
 
 ctx=$(echo "$result" | jq -r '.additional_context // ""' 2>/dev/null)
 
-if echo "$ctx" | grep -q '\[Guardian\]'; then
+if echo "$ctx" | grep -q 'Guardian:'; then
     pass "registration banner present without daemon"
 else
     fail "registration banner missing without daemon (got: $ctx)"
 fi
 
-if echo "$ctx" | grep -q 'daemon not detected'; then
+if echo "$ctx" | grep -q 'no daemon'; then
     pass "daemon-inactive status detected"
 else
     fail "daemon-inactive status missing (got: $ctx)"

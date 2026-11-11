@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Supersede stale runs on a PR, but let every push to main finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    # guardiand uses Mach / sysctl APIs, so it only builds on macOS.
+    name: Rust (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Unit tests
+        run: cargo test --locked
+      - name: Hook scripts under macOS bash 3.2
+        # Users run the hooks with /bin/bash 3.2; the container suite below uses bash 5.
+        # HOME points at a scratch directory so nothing reads or writes a real ~/.guardian.
+        run: |
+          set -euo pipefail
+          /bin/bash --version | head -1
+          while IFS= read -r f; do
+            /bin/bash -n "$f"
+          done < <(git ls-files '*.sh' '*.command')
+          export HOME="$RUNNER_TEMP/guardian-home"
+          mkdir -p "$HOME"
+          /bin/bash tests/codex-hook-smoke.sh
+          /bin/bash tests/claude-hook-smoke.sh
+          /bin/bash demos/guardian-barriers-mock/run-demo.sh
+
+  hooks:
+    # Hook scripts are validated in a container, never on a developer machine
+    # (see .cursor/rules/containerized-testing.mdc).
+    name: Hooks (container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          while IFS= read -r f; do
+            bash -n "$f"
+          done < <(git ls-files '*.sh' '*.command')
+      - name: Hook suite
+        run: docker compose -f tests/stress/docker-compose.test.yml run --rm --build guardian-test
+      - name: Agent lifecycle e2e
+        run: docker compose -f tests/stress/docker-compose.test.yml run --rm --build guardian-e2e

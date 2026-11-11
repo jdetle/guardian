@@ -18,6 +18,7 @@ The crate version in **`Cargo.toml`** tracks releases of **`guardiand`** and the
 ## Reviews and checks
 
 - Before push: multi-model adversarial review (see `.cursor/rules/pre-push-adversarial-review.mdc`).
+- CI (`.github/workflows/ci.yml`) must be green: Rust build + unit tests on macOS, containerized hook suite + e2e on Linux. After bumping the version, run a `cargo` command so the committed `Cargo.lock` follows (CI uses `--locked`).
 - If the change touches install scripts, plists, or shipped Rust binaries: run the install smoke test (see `.cursor/rules/pr-install-smoke-test.mdc`).
 
 ## License

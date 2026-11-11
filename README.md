@@ -182,6 +182,8 @@ docker compose -f tests/stress/docker-compose.test.yml run --rm guardian-e2e
 bash demos/guardian-barriers-mock/run-demo.sh
 ```
 
+Every pull request runs the same checks in GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `cargo build --release` + `cargo test` on macOS (plus a syntax check and smoke run of the hook scripts under macOS's bash 3.2), and the containerized hook suite + agent-lifecycle e2e on Linux. `Cargo.lock` is committed and CI builds with `--locked`; run any `cargo` command after bumping the version so the lockfile follows.
+
 ---
 
 ## Pressure levels
