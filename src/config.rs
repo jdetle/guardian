@@ -210,6 +210,11 @@ pub struct ThresholdConfig {
     pub strained_memory_available_ratio: Option<f64>,
     #[serde(default)]
     pub critical_memory_available_ratio: Option<f64>,
+    /// When true (default), swap % and CPU % can only reach `critical` if a second signal
+    /// agrees (kernel memory pressure for swap, thermal pressure for CPU); alone they count as
+    /// `strained`. Set false to let each threshold reach `critical` on its own.
+    #[serde(default = "default_true")]
+    pub corroborate_critical: bool,
 }
 
 impl Default for ThresholdConfig {
@@ -223,6 +228,7 @@ impl Default for ThresholdConfig {
             critical_swap_percent: default_critical_swap(),
             strained_memory_available_ratio: None,
             critical_memory_available_ratio: None,
+            corroborate_critical: true,
         }
     }
 }

@@ -122,3 +122,83 @@ fn total_physical_memory() -> Option<u64> {
         None
     }
 }
+
+/// The kernel's own memory-pressure verdict — the same signal behind Activity Monitor's
+/// memory-pressure graph. Unlike "free pages" or "swap used %", it accounts for compression,
+/// purgeable memory and how hard the VM system is actually working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryPressureLevel {
+    Normal,
+    Warn,
+    Critical,
+    /// The sysctl is unavailable or returned a value we do not know.
+    Unknown,
+}
+
+impl MemoryPressureLevel {
+    /// `kern.memorystatus_vm_pressure_level`: 1 = normal, 2 = warn, 4 = critical.
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            1 => Self::Normal,
+            2 => Self::Warn,
+            4 => Self::Critical,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn sample() -> Self {
+        let mut value: u32 = 0;
+        let mut len = mem::size_of::<u32>();
+        let name = b"kern.memorystatus_vm_pressure_level\0";
+        let ret = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr() as *const libc::c_char,
+                &mut value as *mut u32 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret != 0 || len != mem::size_of::<u32>() {
+            return Self::Unknown;
+        }
+        Self::from_raw(value)
+    }
+}
+
+impl std::fmt::Display for MemoryPressureLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Normal => write!(f, "normal"),
+            Self::Warn => write!(f, "warn"),
+            Self::Critical => write!(f, "critical"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pressure_level_tests {
+    use super::*;
+
+    #[test]
+    fn maps_kernel_values() {
+        assert_eq!(MemoryPressureLevel::from_raw(1), MemoryPressureLevel::Normal);
+        assert_eq!(MemoryPressureLevel::from_raw(2), MemoryPressureLevel::Warn);
+        assert_eq!(MemoryPressureLevel::from_raw(4), MemoryPressureLevel::Critical);
+    }
+
+    #[test]
+    fn unexpected_values_are_unknown_not_normal() {
+        for v in [0u32, 3, 5, 8, u32::MAX] {
+            assert_eq!(MemoryPressureLevel::from_raw(v), MemoryPressureLevel::Unknown);
+        }
+    }
+
+    #[test]
+    fn sampling_never_panics_and_is_known_on_macos() {
+        // The sysctl exists on every supported macOS; a real machine reports a known level.
+        assert_ne!(MemoryPressureLevel::sample(), MemoryPressureLevel::Unknown);
+    }
+}

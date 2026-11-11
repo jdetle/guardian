@@ -141,7 +141,7 @@ guardian_prompt_gate_eval() {
                 msg="Guardian: Blocked — Cursor RAM ${cursor_mb} MB (cap ${max_rss} MB) with ${pressure} load. Lighten work or snooze."$'\n'"${hints}"
                 ;;
             pressure)
-                msg="Guardian: Blocked — ${pressure} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%). Cool down or snooze."$'\n'"${hints}"
+                msg="Guardian: Blocked — ${pressure} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%).$(read_state_reasons_suffix) Cool down or snooze."$'\n'"${hints}"
                 ;;
             *)
                 msg="Guardian: Blocked by policy."$'\n'"${hints}"

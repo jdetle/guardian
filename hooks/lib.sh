@@ -144,6 +144,28 @@ read_state_field() {
     echo "${value:-$default}"
 }
 
+# Why the daemon classified the current sample above clear, e.g. "swap 93% used; thermal
+# pressure heavy" (guardiand >= 0.6.0 writes pressure_reasons). Prints " Why: ….", or nothing
+# when the daemon gave no reasons, so callers can append it unconditionally.
+read_state_reasons_suffix() {
+    if [ ! -f "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+        return 0
+    fi
+    local reasons
+    reasons=$(jq -r 'try (
+        (.pressure_reasons // [])
+        | if type == "array" then (
+              map(select(type == "string")) | .[0:4] | join("; ")
+              # state.json is user-writable and this text lands in agent context:
+              # keep it one plain line.
+              | gsub("[[:cntrl:]]"; " ") | .[0:200] | sub("[. ]+$"; "")
+          ) else "" end
+    ) catch ""' < "$STATE_FILE" 2>/dev/null) || reasons=""
+    if [ -n "$reasons" ]; then
+        printf ' Why: %s.' "$reasons"
+    fi
+}
+
 read_full_state() {
     if [ ! -f "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
         echo "{}"

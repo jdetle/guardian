@@ -90,6 +90,10 @@ strained_memory_gb = 2.0
 critical_memory_gb = 1.0
 strained_swap_percent = 25.0
 critical_swap_percent = 50.0
+# Swap % and CPU % reach critical only when a second signal agrees (kernel memory pressure
+# for swap, thermal pressure for CPU); alone they count as strained. Set false to let each
+# threshold reach critical by itself.
+corroborate_critical = true
 
 [docker]
 enabled = true

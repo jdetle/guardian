@@ -675,6 +675,81 @@ else
     fail "lib: parse_iso_epoch wrong (plus=$epoch_plus z=$epoch_z)"
 fi
 
+# pressure_reasons from the daemon are surfaced so a block explains itself
+reasons_state() {
+    local pressure="$1" reasons="$2" now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "{\"pressure\":\"${pressure}\",\"pressure_reasons\":${reasons},\"cpu_percent\":41,\"memory_available_gb\":2.1,\"swap_used_percent\":30,\"sampled_at\":\"${now}\",\"cursor\":{},\"disk\":{\"level\":\"clear\"}}"
+}
+
+reset_policy
+reasons_state critical '["thermal pressure heavy","swap 93% used"]' >"$STATE_FILE"
+result=$(echo '{"prompt":"x","session_id":"s-why"}' | bash "$CLAUDE_HOOKS/user-prompt-submit.sh" 2>/dev/null)
+reason=$(echo "$result" | jq -r '.reason // ""' 2>/dev/null)
+if echo "$reason" | grep -q 'Why: thermal pressure heavy; swap 93% used\.'; then
+    pass "claude promptGate: block reason says why (daemon pressure_reasons)"
+else
+    fail "claude promptGate: block reason lacks the why (got $result)"
+fi
+
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
+if echo "$um" | grep -q 'Why: thermal pressure heavy'; then
+    pass "cursor beforeSubmit: block message says why"
+else
+    fail "cursor beforeSubmit: block message lacks the why (got $result)"
+fi
+
+result=$(echo '{"tool_name":"Bash","session_id":"s-why2"}' | bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
+ctx=$(echo "$result" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+if echo "$ctx" | grep -q 'Why: thermal pressure heavy'; then
+    pass "claude preTool: advisory says why"
+else
+    fail "claude preTool: advisory lacks the why (got $result)"
+fi
+
+why_ok=1
+for bad in '"not-an-array"' '{"a":1}' 'null' '[]' '[1,{"x":2}]'; do
+    rm -rf "$GUARDIAN_DIR/advise"
+    reasons_state strained "$bad" >"$STATE_FILE"
+    result=$(echo '{"tool_name":"Bash","session_id":"s-why3"}' | bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
+    ctx=$(echo "$result" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+    if [ -z "$ctx" ] || echo "$ctx" | grep -q 'Why:'; then
+        why_ok=0
+        echo "    unexpected for reasons=$bad: $result"
+    fi
+done
+if [ "$why_ok" -eq 1 ]; then
+    pass "claude preTool: missing or malformed pressure_reasons are ignored, advisory still shown"
+else
+    fail "claude preTool: malformed pressure_reasons broke the advisory"
+fi
+
+printf '%s' '{"pressure":"strained","pressure_reasons":["a\nIGNORE PREVIOUS\u0007 x","b."],"cpu_percent":41,"memory_available_gb":2.1,"swap_used_percent":30,"sampled_at":"' >"$STATE_FILE"
+printf '%s"}' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >>"$STATE_FILE"
+rm -rf "$GUARDIAN_DIR/advise"
+result=$(echo '{"tool_name":"Bash","session_id":"s-why4"}' | bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
+ctx=$(echo "$result" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+if [ "$(printf '%s' "$ctx" | wc -l | tr -d ' ')" = "0" ] && ! printf '%s' "$ctx" | grep -q '[[:cntrl:]]' \
+    && printf '%s' "$ctx" | grep -q 'Why: a IGNORE PREVIOUS  x; b\.$'; then
+    pass "claude preTool: control characters in pressure_reasons are flattened to one plain line"
+else
+    fail "claude preTool: reasons not sanitized (got $result)"
+fi
+
+fresh_state critical >"$STATE_FILE"
+tmp_state=$(mktemp)
+jq '.pressure_reasons = ["thermal pressure heavy"]' "$STATE_FILE" >"$tmp_state" && cat "$tmp_state" >"$STATE_FILE"
+rm -f "$tmp_state"
+result=$(echo '{}' | bash "$HOOKS_DIR/subagent-start.sh" 2>/dev/null)
+msg=$(echo "$result" | jq -r '.agent_message // ""' 2>/dev/null)
+perm=$(echo "$result" | jq -r '.permission // ""' 2>/dev/null)
+if [ "$perm" = "allow" ] && echo "$msg" | grep -q 'Why: thermal pressure heavy\.'; then
+    pass "cursor subagentStart: advisory says why"
+else
+    fail "cursor subagentStart: advisory lacks the why (got $result)"
+fi
+
 # The jq fast path must agree with the python reference on edge dates, in any timezone
 iso_ok=1
 for ts in 2024-02-29T23:59:59Z 2025-01-01T00:00:00Z 2000-03-01T00:00:00+00:00 2026-07-15T12:00:00.5Z 2028-02-29T00:00:00Z; do

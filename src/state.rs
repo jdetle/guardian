@@ -1,5 +1,6 @@
 use crate::classifier::PressureLevel;
 use crate::config::guardian_dir;
+use crate::sampler::memory::MemoryPressureLevel;
 use crate::sampler::thermal::ThermalState;
 use serde::Serialize;
 use std::fs;
@@ -9,10 +10,14 @@ use std::path::PathBuf;
 #[derive(Serialize, Clone, Debug)]
 pub struct GuardianState {
     pub pressure: PressureLevel,
+    /// Plain-language causes of the current sample's level (empty when clear).
+    pub pressure_reasons: Vec<String>,
     pub cpu_percent: f64,
     pub memory_available_gb: f64,
     pub memory_total_gb: f64,
     pub swap_used_percent: f64,
+    /// The kernel's memory-pressure verdict: normal | warn | critical | unknown.
+    pub memory_pressure_level: MemoryPressureLevel,
     pub thermal_state: ThermalState,
     pub docker: DockerState,
     pub cursor: CursorState,
