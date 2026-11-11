@@ -1,17 +1,12 @@
 #!/bin/bash
-# Minimal smoke test: Claude Code adapters emit valid JSON shapes.
+# Minimal smoke test: Claude Code adapters emit valid JSON shapes against whatever state is live.
 # Run from repo root: bash tests/claude-hook-smoke.sh
+# Behavior under simulated pressure is covered by the containerized suite (group 7b).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UPS="$ROOT/hooks/codex/user-prompt-submit.sh"
+UPS="$ROOT/hooks/claude/user-prompt-submit.sh"
 PTU="$ROOT/hooks/claude/pre-tool-use.sh"
-
-for f in "$UPS" "$PTU"; do
-    if [ ! -x "$f" ] && [ -f "$f" ]; then
-        chmod +x "$f"
-    fi
-done
 
 out=$(printf '%s' '{"prompt":"smoke","cwd":"/tmp","session_id":"test"}' | bash "$UPS")
 echo "$out" | jq empty >/dev/null
@@ -28,17 +23,22 @@ case "$kind" in
         ;;
 esac
 
-pt_in='{"session_id":"s","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"true"}}'
+# PreToolUse: silent when load is clear, otherwise context (or an opt-in subagent deny).
+# It must NEVER answer "allow" — that would skip Claude Code's own permission prompt.
+pt_in='{"session_id":"smoke-test","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"true"}}'
 pt_out=$(printf '%s' "$pt_in" | bash "$PTU")
-echo "$pt_out" | jq empty >/dev/null
 
-hen=$(echo "$pt_out" | jq -r '.hookSpecificOutput.hookEventName // empty')
-pd=$(echo "$pt_out" | jq -r '.hookSpecificOutput.permissionDecision // empty')
-
-if [ "$hen" != "PreToolUse" ] || [ "$pd" != "allow" ]; then
-    echo "claude-hook-smoke: PreToolUse unexpected JSON: $pt_out" >&2
-    exit 1
+if [ -z "$pt_out" ]; then
+    echo "claude-hook-smoke: PreToolUse ok (silent — no decision, no context)"
+else
+    echo "$pt_out" | jq empty >/dev/null
+    hen=$(echo "$pt_out" | jq -r '.hookSpecificOutput.hookEventName // empty')
+    pd=$(echo "$pt_out" | jq -r '.hookSpecificOutput.permissionDecision // "none"')
+    if [ "$hen" != "PreToolUse" ] || [ "$pd" = "allow" ]; then
+        echo "claude-hook-smoke: PreToolUse unexpected JSON: $pt_out" >&2
+        exit 1
+    fi
+    echo "claude-hook-smoke: PreToolUse ok (hookEventName=$hen permissionDecision=$pd)"
 fi
 
-echo "claude-hook-smoke: PreToolUse ok (hookEventName=$hen permissionDecision=$pd)"
 echo "claude-hook-smoke: ok"

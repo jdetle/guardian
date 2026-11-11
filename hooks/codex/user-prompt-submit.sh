@@ -1,7 +1,9 @@
 #!/bin/bash
-# Codex UserPromptSubmit — same policy as Cursor beforeSubmitPrompt; emits Codex hook JSON.
-# stdin: Codex JSON (prompt, session_id, cwd, …)
+# Codex / Claude Code UserPromptSubmit — same policy as Cursor beforeSubmitPrompt; emits the
+# shared Codex / Claude Code hook JSON. (hooks/claude/user-prompt-submit.sh reuses this.)
+# stdin: hook JSON (prompt, session_id, cwd, …)
 set -euo pipefail
+export GUARDIAN_HOOK_FORMAT="${GUARDIAN_HOOK_FORMAT:-codex}"
 
 # Installed to ~/.codex/hooks/guardian/codex/ — shared assets live in parent directory.
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
