@@ -16,6 +16,8 @@ pub struct GuardianState {
     pub thermal_state: ThermalState,
     pub docker: DockerState,
     pub cursor: CursorState,
+    /// Resident memory per coding-agent app (Cursor / Claude / Codex).
+    pub agents: AgentsState,
     #[serde(default)]
     pub disk: DiskState,
     pub process_count: u32,
@@ -66,9 +68,18 @@ pub struct CursorState {
     /// Directories under `~/.cursor/projects` (diagnostic; stale entries accumulate).
     pub active_sessions: u32,
     pub process_count: u32,
-    /// Sum of RSS for processes whose short name starts with `Cursor` (best-effort via `ps`).
+    /// Sum of RSS for processes running from `Cursor.app` (best-effort via `ps`).
     #[serde(default)]
     pub resident_memory_megabytes: u64,
+}
+
+/// Resident memory (MB) of each coding-agent app, summed over its processes (best-effort via `ps`).
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct AgentsState {
+    pub cursor_mb: u64,
+    pub claude_mb: u64,
+    pub codex_mb: u64,
+    pub total_mb: u64,
 }
 
 pub fn state_file_path() -> PathBuf {

@@ -14,24 +14,38 @@ echo "=== Guardian Daemon Installer ==="
 echo "[1/5] Building guardiand and guardian CLI..."
 cd "$REPO_ROOT"
 cargo build --release
-GUARDIAND_BIN="$REPO_ROOT/target/release/guardiand"
-GUARDIAN_CLI_BIN="$REPO_ROOT/target/release/guardian"
+GUARDIAND_BUILT="$REPO_ROOT/target/release/guardiand"
+GUARDIAN_CLI_BUILT="$REPO_ROOT/target/release/guardian"
 
-if [ ! -f "$GUARDIAND_BIN" ]; then
-    echo "ERROR: guardiand binary not found at $GUARDIAND_BIN"
+if [ ! -f "$GUARDIAND_BUILT" ]; then
+    echo "ERROR: guardiand binary not found at $GUARDIAND_BUILT"
     exit 1
 fi
-if [ ! -f "$GUARDIAN_CLI_BIN" ]; then
-    echo "ERROR: guardian CLI not found at $GUARDIAN_CLI_BIN"
+if [ ! -f "$GUARDIAN_CLI_BUILT" ]; then
+    echo "ERROR: guardian CLI not found at $GUARDIAN_CLI_BUILT"
     exit 1
 fi
+
+# Copy to a temp name then rename: never rewrite a binary in place (a running or
+# previously-executed Mach-O that is overwritten can be killed on next launch).
+install_binary() {
+    local src="$1" dst="$2"
+    cp "$src" "$dst.new"
+    chmod +x "$dst.new"
+    mv -f "$dst.new" "$dst"
+}
 
 # Create guardian directory
 echo "[2/5] Creating ~/.guardian/..."
 mkdir -p "$GUARDIAN_DIR"
-cp "$GUARDIAN_CLI_BIN" "$GUARDIAN_DIR/guardian"
-chmod +x "$GUARDIAN_DIR/guardian"
+install_binary "$GUARDIAN_CLI_BUILT" "$GUARDIAN_DIR/guardian"
 echo "  Installed ~/.guardian/guardian (snooze, once, clear-snooze, zeno)"
+
+# The LaunchAgent runs this copy, NOT target/release/guardiand: cleaning build artifacts
+# (cargo clean, disk-space sweeps) used to delete the daemon out from under launchd.
+GUARDIAND_BIN="$GUARDIAN_DIR/guardiand"
+install_binary "$GUARDIAND_BUILT" "$GUARDIAND_BIN"
+echo "  Installed ~/.guardian/guardiand (daemon; survives cargo clean)"
 
 # Symlink onto PATH so `guardian` works outside full paths (prefer /usr/local/bin, else ~/.local/bin).
 if ln -sf "$GUARDIAN_DIR/guardian" /usr/local/bin/guardian 2>/dev/null; then
@@ -119,29 +133,90 @@ else
     echo "[3/5] Config already exists, skipping..."
 fi
 
-# Unload existing service if running
 echo "[4/5] Installing LaunchAgent..."
-if launchctl list | grep -q com.guardian.guardiand 2>/dev/null; then
-    launchctl unload "$LAUNCH_AGENTS/$PLIST_NAME" 2>/dev/null || true
+
+# Render and lint the plist BEFORE touching the running service, so a bad path can never
+# leave the machine with the old daemon unloaded and no new one to load.
+mkdir -p "$LAUNCH_AGENTS"
+PLIST_TMP="$(mktemp "$LAUNCH_AGENTS/.$PLIST_NAME.XXXXXX")"
+trap 'rm -f "$PLIST_TMP"' EXIT
+
+# Values go into XML via sed: escape XML metacharacters first, then sed's replacement ones.
+plist_value() {
+    printf '%s' "$1" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        | sed -e 's/[&|\\]/\\&/g'
+}
+sed \
+    -e "s|__GUARDIAND_PATH__|$(plist_value "$GUARDIAND_BIN")|g" \
+    -e "s|__HOME__|$(plist_value "$HOME")|g" \
+    "$PLIST_TEMPLATE" > "$PLIST_TMP"
+plutil -lint "$PLIST_TMP" >/dev/null
+
+# launchd never rotates the daemon log; keep the tail of an oversized one and start fresh.
+STDERR_LOG="$GUARDIAN_DIR/guardiand.stderr.log"
+if [ -f "$STDERR_LOG" ] && [ ! -L "$STDERR_LOG" ]; then
+    log_bytes=$(wc -c < "$STDERR_LOG" 2>/dev/null | tr -d ' ' || echo 0)
+    if [ "${log_bytes:-0}" -gt 10485760 ] 2>/dev/null; then
+        tail -n 500 "$STDERR_LOG" > "$STDERR_LOG.old" 2>/dev/null || true
+        : > "$STDERR_LOG" 2>/dev/null || true
+        echo "  Rotated oversized daemon log ($(( log_bytes / 1048576 )) MB) — last 500 lines kept in guardiand.stderr.log.old"
+    fi
 fi
 
-mkdir -p "$LAUNCH_AGENTS"
+guardiand_pid() {
+    # "PID" = 1234; is present only while the job has a live process.
+    launchctl list com.guardian.guardiand 2>/dev/null | awk '/"PID"/ { gsub(/[^0-9]/, ""); print; exit }'
+}
 
-# Generate plist with actual paths
-sed \
-    -e "s|__GUARDIAND_PATH__|$GUARDIAND_BIN|g" \
-    -e "s|__HOME__|$HOME|g" \
-    "$PLIST_TEMPLATE" > "$LAUNCH_AGENTS/$PLIST_NAME"
+state_mtime() {
+    stat -f %m "$GUARDIAN_DIR/state.json" 2>/dev/null || echo 0
+}
 
-# Load the service
+# Swap the service: unload the old job (if any), move the new plist into place, load it.
+if launchctl list com.guardian.guardiand >/dev/null 2>&1; then
+    launchctl unload "$LAUNCH_AGENTS/$PLIST_NAME" 2>/dev/null || true
+fi
+mv -f "$PLIST_TMP" "$LAUNCH_AGENTS/$PLIST_NAME"
+
 echo "[5/5] Starting guardiand..."
+# The old daemon writes one last state.json as it shuts down. Only samples written strictly
+# after this point count as proof that the NEW daemon is sampling.
+sleep 1
+load_ts=$(date +%s)
 launchctl load "$LAUNCH_AGENTS/$PLIST_NAME"
 
-sleep 1
+# Success = two successive samples newer than the load, written while the same PID stays up.
+# ("launchctl list" alone also lists a job that is crash-looping.)
+daemon_pid=""
+first_pid=""
+first_mtime=0
+healthy=false
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 1
+    daemon_pid=$(guardiand_pid)
+    m=$(state_mtime)
+    case "$daemon_pid" in
+        ''|*[!0-9]*) first_pid=""; first_mtime=0; continue ;;
+    esac
+    if [ "$m" -le "$load_ts" ]; then
+        continue
+    fi
+    if [ -z "$first_pid" ] || [ "$daemon_pid" != "$first_pid" ]; then
+        first_pid="$daemon_pid"
+        first_mtime="$m"
+        continue
+    fi
+    if [ "$m" -gt "$first_mtime" ]; then
+        healthy=true
+        break
+    fi
+done
 
-if launchctl list | grep -q com.guardian.guardiand; then
+if [ "$healthy" = "true" ]; then
     echo ""
-    echo "Guardian daemon installed and running."
+    echo "Guardian daemon installed and running (pid $daemon_pid)."
+    echo "  Daemon:  $GUARDIAND_BIN"
     echo "  Config:  $GUARDIAN_DIR/config.toml"
     echo "  State:   $GUARDIAN_DIR/state.json"
     echo "  Logs:    $GUARDIAN_DIR/guardiand.stderr.log"
@@ -149,8 +224,15 @@ if launchctl list | grep -q com.guardian.guardiand; then
     echo ""
     echo "To check status:  launchctl list com.guardian.guardiand"
     echo "To view state:    cat ~/.guardian/state.json"
+    echo ""
+    echo "Hooks (run the ones you use):"
+    echo "  Cursor:       bash hooks/install-hooks.sh"
+    echo "  Claude Code:  bash scripts/install-claude-hooks.sh"
+    echo "  Codex:        bash scripts/install-codex-hooks.sh"
 else
     echo ""
-    echo "WARNING: daemon may not have started. Check logs:"
-    echo "  cat $GUARDIAN_DIR/guardiand.stderr.log"
+    echo "ERROR: guardiand is not sampling — no fresh $GUARDIAN_DIR/state.json from a stable process (launchd pid: ${daemon_pid:-none})."
+    echo "  Status:  launchctl list com.guardian.guardiand"
+    echo "  Logs:    tail -n 40 $GUARDIAN_DIR/guardiand.stderr.log"
+    exit 1
 fi
