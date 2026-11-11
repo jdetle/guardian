@@ -10,6 +10,14 @@
         <string>__GUARDIAND_PATH__</string>
     </array>
 
+    <!-- launchd's default PATH has no /usr/local/bin or Homebrew, so `docker` (used for
+         container throttling) could not be found and every sample logged an exec error. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:__HOME__/.docker/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
 

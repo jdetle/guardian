@@ -17,10 +17,10 @@ use docker::stats::DockerClient;
 use sampler::cpu::{cpu_usage_percent, CpuSnapshot};
 use sampler::disk::compute_disk_state;
 use sampler::memory::MemoryInfo;
-use sampler::process::{cursor_rss_megabytes, ProcessInfo};
+use sampler::process::{AgentRss, ProcessInfo};
 use sampler::swap::SwapInfo;
 use sampler::thermal::ThermalState;
-use state::{CursorState, DiskState, DockerState, GuardianState, write_state};
+use state::{AgentsState, CursorState, DiskState, DockerState, GuardianState, write_state};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -56,6 +56,11 @@ const PROTECTED_NAMES: &[&str] = &[
     "UserEventAgent",
     "corebrightnessd",
     "CrashReporter",
+    // Claude / Codex agents
+    "Claude",
+    "claude",
+    "Codex",
+    "codex",
     // Cursor / VS Code
     "Cursor",
     "Cursor Helper",
@@ -118,7 +123,37 @@ const PROTECTED_NAMES: &[&str] = &[
     "Spotify",
 ];
 
+/// Cap for `~/.guardian/guardiand.stderr.log`; launchd never rotates it, and a full disk
+/// plus per-sample error logging once grew it past 100 MB.
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+/// Re-check the log size every N samples (~30 min at the default 2 s interval).
+const LOG_CAP_CHECK_EVERY: u64 = 900;
+
+/// Truncate our own stderr log once it exceeds `max_bytes`. launchd opens StandardErrorPath in
+/// append mode (`lsof +fg` shows the `AP` flag on fd 2), so writes continue at the new end
+/// after truncation instead of leaving a sparse file.
+fn cap_log_file(path: &std::path::Path, max_bytes: u64) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() <= max_bytes {
+        return false;
+    }
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => f.set_len(0).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn cap_daemon_log() {
+    let path = config::guardian_dir().join("guardiand.stderr.log");
+    if cap_log_file(&path, MAX_LOG_BYTES) {
+        eprintln!("[guardiand] log exceeded {} MB — truncated", MAX_LOG_BYTES / (1024 * 1024));
+    }
+}
+
 pub fn run_daemon() {
+    cap_daemon_log();
     eprintln!("[guardiand] starting (pid {})", std::process::id());
 
     let config = load_config();
@@ -173,9 +208,15 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
     let mut docker_throttled = false;
     let mut hysteresis_counter: i32 = 0;
     let hysteresis_threshold: i32 = 3;
+    let mut samples: u64 = 0;
 
     loop {
         thread::sleep(interval);
+
+        samples = samples.wrapping_add(1);
+        if samples % LOG_CAP_CHECK_EVERY == 0 {
+            cap_daemon_log();
+        }
 
         if SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("[guardiand] received shutdown signal, exiting gracefully");
@@ -241,7 +282,14 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
         // Process killer: identify and kill top resource abusers
         handle_process_killer(config, &procs, pressure);
 
-        let cursor_rss_mb = cursor_rss_megabytes();
+        let agent_rss = AgentRss::sample();
+        let cursor_rss_mb = agent_rss.cursor_mb;
+        let agents_state = AgentsState {
+            cursor_mb: agent_rss.cursor_mb,
+            claude_mb: agent_rss.claude_mb,
+            codex_mb: agent_rss.codex_mb,
+            total_mb: agent_rss.total_mb(),
+        };
         let cursor_state = CursorState {
             active_sessions: count_cursor_sessions(),
             process_count: procs
@@ -263,6 +311,7 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
             thermal_state: thermal,
             docker: docker_state,
             cursor: cursor_state,
+            agents: agents_state,
             disk: disk_state,
             process_count: procs.as_ref().map(|p| p.total_count).unwrap_or(0),
             max_proc_per_uid: procs.as_ref().map(|p| p.max_proc_per_uid).unwrap_or(0),
@@ -287,6 +336,7 @@ fn write_shutdown_state() {
         thermal_state: ThermalState::Unknown,
         docker: DockerState::default(),
         cursor: CursorState::default(),
+        agents: AgentsState::default(),
         disk: DiskState::default(),
         process_count: 0,
         max_proc_per_uid: 0,
@@ -679,5 +729,38 @@ mod tests {
     #[test]
     fn not_protected_empty_string() {
         assert!(!is_protected(""));
+    }
+
+    #[test]
+    fn protected_claude_and_codex_agents() {
+        assert!(is_protected("claude"));
+        assert!(is_protected("Claude Helper (Renderer)"));
+        assert!(is_protected("codex"));
+    }
+
+    // --- log cap tests ---
+
+    #[test]
+    fn log_cap_truncates_oversized_file() {
+        let path = std::env::temp_dir().join(format!("guardian-logcap-{}.log", std::process::id()));
+        std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+        assert!(cap_log_file(&path, 1024));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_cap_leaves_small_file_alone() {
+        let path = std::env::temp_dir().join(format!("guardian-logcap-small-{}.log", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(!cap_log_file(&path, 1024));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_cap_missing_file_is_noop() {
+        let path = std::env::temp_dir().join("guardian-logcap-does-not-exist.log");
+        assert!(!cap_log_file(&path, 1024));
     }
 }

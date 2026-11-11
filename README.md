@@ -4,7 +4,7 @@
 
 **Keep agents useful—and keep your Mac from melting down.**
 
-Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and Cursor process usage, writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
+Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and per-agent memory (Cursor, Claude, Codex), writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
 
 ---
 
@@ -35,7 +35,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 
 | Piece | Location | Role |
 |---|---|---|
-| `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, Cursor RSS (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
+| `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, per-agent RSS for Cursor / Claude / Codex (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
 | `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
 | Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … (`~/.cursor/hooks.json`) |
 | Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI — `UserPromptSubmit`, `SessionStart` (`~/.codex/hooks.json`; enable `[features] codex_hooks` in Codex config). See [docs/codex.md](docs/codex.md). |
@@ -74,6 +74,8 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 bash scripts/install.sh
 bash hooks/install-hooks.sh
 ```
+
+`install.sh` copies **`guardiand`** to **`~/.guardian/guardiand`** and points the LaunchAgent there, so `cargo clean` or a disk-space sweep of `target/` no longer kills the daemon. It exits non-zero unless the new daemon is actually writing fresh `state.json`.
 
 Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates without recompiling).
 
@@ -154,7 +156,7 @@ critical_memory_available_ratio = 0.08
 
 ```bash
 launchctl list com.guardian.guardiand
-cat ~/.guardian/state.json | jq '{pressure, cursor, disk}'
+cat ~/.guardian/state.json | jq '{pressure, agents, disk, sampled_at}'   # sampled_at must be seconds old
 cat ~/.guardian/hook_policy.json
 cat ~/.cursor/hooks.json | jq '.hooks | keys'
 ```
@@ -209,7 +211,7 @@ cat ~/.guardian/state.json | jq '{
   memory_available_gb,
   swap_used_percent,
   disk,
-  cursor,
+  agents,
   sampled_at
 }'
 ```
@@ -223,7 +225,8 @@ cat ~/.guardian/state.json | jq '{
 | **`memory_available_gb`** / **`memory_total_gb`** | Free RAM vs total — tight free memory plus high swap usually means memory pressure. |
 | **`swap_used_percent`** | High values (often **well above** the rough bands in the pressure table) mean the kernel is paging — treat memory as constrained even if CPU looks fine. |
 | **`disk`** | Home volume: **`available_gb`**, **`used_percent`**, and **`level`** (`clear` / `warn` / `critical` from `[disk]` in `config.toml`). **Disk can hit `critical` while `pressure` is only `strained`** — free space still matters for builds, indexers, and swap files. |
-| **`cursor`** | Aggregate Cursor **`resident_memory_megabytes`**, **`process_count`**, and related diagnostics. |
+| **`agents`** | Resident memory per coding agent, in MB: **`cursor_mb`**, **`claude_mb`** (desktop app + Claude Code CLI), **`codex_mb`**, and **`total_mb`**. Matched on executable path via `ps`; agents launched through a generic runtime (e.g. an npm install running as `node`) are not attributed. |
+| **`cursor`** | Aggregate Cursor **`resident_memory_megabytes`** (processes running from `Cursor.app`), **`process_count`**, and related diagnostics. |
 | **`docker`** | Running-container CPU/memory when Docker is available. |
 | **`sampled_at`** | Time of this sample (RFC3339). Shell hooks **fail-open** if the file is missing or **stale** (typically older than ~30 seconds): they assume `clear` so a stopped daemon does not block you forever. |
 
