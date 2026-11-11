@@ -10,13 +10,13 @@ mod state;
 mod validation;
 pub mod zeno;
 
-use classifier::{classify, ClassifierInput, PressureLevel};
+use classifier::{classify_with_reasons, ClassifierInput, PressureLevel};
 use config::{load_config, GuardianConfig};
 use hook_policy::write_hook_policy;
 use docker::stats::DockerClient;
 use sampler::cpu::{cpu_usage_percent, CpuSnapshot};
 use sampler::disk::compute_disk_state;
-use sampler::memory::MemoryInfo;
+use sampler::memory::{MemoryInfo, MemoryPressureLevel};
 use sampler::process::{AgentRss, ProcessInfo};
 use sampler::swap::SwapInfo;
 use sampler::thermal::ThermalState;
@@ -208,6 +208,7 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
     let mut docker_throttled = false;
     let mut hysteresis_counter: i32 = 0;
     let hysteresis_threshold: i32 = 3;
+    let mut held_reasons: Vec<String> = Vec::new();
     let mut samples: u64 = 0;
 
     loop {
@@ -230,6 +231,7 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
         let mem = MemoryInfo::sample();
         let swap = SwapInfo::sample();
         let thermal = ThermalState::sample();
+        let memory_pressure = MemoryPressureLevel::sample();
         let procs = ProcessInfo::sample();
 
         let docker_state = docker_client
@@ -248,6 +250,7 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
             swap_used_percent: swap_pct,
             thermal,
             process_usage_ratio: proc_ratio,
+            memory_pressure,
         };
 
         let steps = crate::zeno::load_zeno_steps();
@@ -259,7 +262,8 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
             last_hook_steps = steps;
         }
 
-        let raw_pressure = classify(&input, &merged.thresholds);
+        let classification = classify_with_reasons(&input, &merged.thresholds);
+        let raw_pressure = classification.level;
 
         // Hysteresis: require consecutive samples before escalating/de-escalating
         let pressure = apply_hysteresis(
@@ -269,10 +273,28 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
             hysteresis_threshold,
         );
 
+        update_held_reasons(
+            &mut held_reasons,
+            raw_pressure,
+            pressure,
+            &classification.reasons,
+        );
+
         if pressure != prev_pressure {
             eprintln!(
-                "[guardiand] pressure transition: {} -> {} (cpu={:.1}%, mem_avail={:.1}GB, swap={:.1}%)",
-                prev_pressure, pressure, cpu_pct, mem_available_gb, swap_pct
+                "[guardiand] pressure transition: {} -> {} (cpu={:.1}%, mem_avail={:.1}GB, swap={:.1}%, kernel_mem={}, thermal={}; {})",
+                prev_pressure,
+                pressure,
+                cpu_pct,
+                mem_available_gb,
+                swap_pct,
+                memory_pressure,
+                thermal,
+                if classification.reasons.is_empty() {
+                    "no active causes".to_string()
+                } else {
+                    classification.reasons.join("; ")
+                }
             );
         }
 
@@ -304,10 +326,12 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
         let now = chrono::Utc::now().to_rfc3339();
         let guardian_state = GuardianState {
             pressure,
+            pressure_reasons: held_reasons.clone(),
             cpu_percent: (cpu_pct * 10.0).round() / 10.0,
             memory_available_gb: (mem_available_gb * 100.0).round() / 100.0,
             memory_total_gb: (mem_total_gb * 100.0).round() / 100.0,
             swap_used_percent: (swap_pct * 10.0).round() / 10.0,
+            memory_pressure_level: memory_pressure,
             thermal_state: thermal,
             docker: docker_state,
             cursor: cursor_state,
@@ -329,10 +353,12 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
 fn write_shutdown_state() {
     let shutdown_state = GuardianState {
         pressure: PressureLevel::Clear,
+        pressure_reasons: Vec::new(),
         cpu_percent: 0.0,
         memory_available_gb: 0.0,
         memory_total_gb: 0.0,
         swap_used_percent: 0.0,
+        memory_pressure_level: MemoryPressureLevel::Unknown,
         thermal_state: ThermalState::Unknown,
         docker: DockerState::default(),
         cursor: CursorState::default(),
@@ -349,6 +375,25 @@ fn write_shutdown_state() {
     let tmp_path = config::guardian_dir().join("state.json.tmp");
     if tmp_path.exists() {
         let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+/// Keep the reasons that explain the level hooks will actually see.
+///
+/// Hysteresis holds a level for a few samples after the raw classification moves on. The
+/// reasons published with a held level must be the ones that established it — not the current
+/// sample's, which would justify a `critical` block with a merely `strained` cause, or with
+/// nothing at all. So reasons are replaced only when the raw level agrees with the held one.
+fn update_held_reasons(
+    held: &mut Vec<String>,
+    raw: PressureLevel,
+    level: PressureLevel,
+    reasons: &[String],
+) {
+    if level == PressureLevel::Clear {
+        held.clear();
+    } else if raw == level {
+        *held = reasons.to_vec();
     }
 }
 
@@ -656,6 +701,62 @@ mod tests {
         let r = apply_hysteresis(PressureLevel::Clear, PressureLevel::Strained, &mut counter, 3);
         assert_eq!(r, PressureLevel::Clear);
         assert_eq!(counter, 1);
+    }
+
+    // --- held reasons tests ---
+
+    fn r(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn held_reasons_follow_the_level_when_raw_agrees() {
+        let mut held = Vec::new();
+        update_held_reasons(
+            &mut held,
+            PressureLevel::Critical,
+            PressureLevel::Critical,
+            &r(&["thermal pressure heavy"]),
+        );
+        assert_eq!(held, r(&["thermal pressure heavy"]));
+    }
+
+    #[test]
+    fn held_critical_keeps_its_cause_while_raw_is_only_strained() {
+        let mut held = r(&["only 0.3 GB RAM available"]);
+        update_held_reasons(
+            &mut held,
+            PressureLevel::Strained,
+            PressureLevel::Critical,
+            &r(&["CPU 75%"]),
+        );
+        assert_eq!(held, r(&["only 0.3 GB RAM available"]));
+    }
+
+    #[test]
+    fn held_critical_keeps_its_cause_while_raw_is_clear() {
+        let mut held = r(&["swap 95% used"]);
+        update_held_reasons(&mut held, PressureLevel::Clear, PressureLevel::Critical, &[]);
+        assert_eq!(held, r(&["swap 95% used"]));
+    }
+
+    #[test]
+    fn pending_escalation_does_not_leak_critical_causes_into_strained() {
+        let mut held = r(&["swap 30% used"]);
+        update_held_reasons(
+            &mut held,
+            PressureLevel::Critical,
+            PressureLevel::Strained,
+            &r(&["thermal pressure critical"]),
+        );
+        assert_eq!(held, r(&["swap 30% used"]));
+    }
+
+    #[test]
+    fn clear_level_has_no_reasons() {
+        let mut held = r(&["swap 30% used"]);
+        update_held_reasons(&mut held, PressureLevel::Strained, PressureLevel::Clear, &r(&["x"]));
+        assert!(held.is_empty());
     }
 
     // --- parse_etime tests ---

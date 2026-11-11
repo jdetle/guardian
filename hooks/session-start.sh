@@ -82,13 +82,14 @@ case "$HOOK_FORMAT" in
     *) snooze_hint="/guardian-snooze · ${G_home}/guardian snooze 15" ;;
 esac
 
+why=$(read_state_reasons_suffix)
 context=""
 case "$pressure" in
     critical)
-        context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%. Ease up; sends may block. Work serially — no subagents, no heavy containers. Snooze: ${snooze_hint}."
+        context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up; sends may block. Work serially — no subagents, no heavy containers. Snooze: ${snooze_hint}."
         ;;
     strained)
-        context="${banner} Load strained: CPU ${cpu}%, ${mem} GB free, swap ${swap}%. Prefer serial work; at most one subagent at a time."
+        context="${banner} Load strained: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Prefer serial work; at most one subagent at a time."
         if [ "$block_on_hint" = "critical" ]; then
             context="${context} Gates block at critical — snooze early: ${snooze_hint}."
         fi

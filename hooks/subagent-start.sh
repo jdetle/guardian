@@ -13,6 +13,7 @@ cpu=$(read_state_field "cpu_percent" "?")
 mem=$(read_state_field "memory_available_gb" "?")
 cursor_mb=$(read_state_field "cursor.resident_memory_megabytes" "0")
 cursor_procs=$(read_state_field "cursor.process_count" "0")
+why=$(read_state_reasons_suffix)
 
 disk_level=$(read_state_field "disk.level" "clear")
 disk_used=$(read_state_field "disk.used_percent" "0")
@@ -25,12 +26,12 @@ fi
 case "$pressure" in
     strained)
         json_output "$(jq -n \
-            --arg msg "Guardian: Strained — CPU ${cpu}%, ${mem} GB free, Cursor ${cursor_mb} MB / ${cursor_procs} procs.${disk_frag} Fewer subagents." \
+            --arg msg "Guardian: Strained — CPU ${cpu}%, ${mem} GB free, Cursor ${cursor_mb} MB / ${cursor_procs} procs.${disk_frag} Fewer subagents.${why}" \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     critical)
         json_output "$(jq -n \
-            --arg msg "Guardian: Critical — CPU ${cpu}%, ${mem} GB free, Cursor ${cursor_mb} MB / ${cursor_procs} procs.${disk_frag} Serial work only." \
+            --arg msg "Guardian: Critical — CPU ${cpu}%, ${mem} GB free, Cursor ${cursor_mb} MB / ${cursor_procs} procs.${disk_frag} Serial work only.${why}" \
             '{permission: "allow", agent_message: $msg}')"
         ;;
     *)

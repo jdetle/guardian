@@ -30,10 +30,11 @@ guardian_tool_gate_eval() {
         return 0
     fi
 
-    local cpu mem swap tool
+    local cpu mem swap tool why
     cpu=$(read_state_field "cpu_percent" "?")
     mem=$(read_state_field "memory_available_gb" "?")
     swap=$(read_state_field "swap_used_percent" "?")
+    why=$(read_state_reasons_suffix)
     tool=$(printf '%s' "$input" | jq -r 'try (.tool_name // "" | tostring) catch ""' 2>/dev/null || echo "")
 
     if guardian_tool_is_subagent_spawn "$tool" && ! guardian_snooze_active; then
@@ -45,7 +46,7 @@ guardian_tool_gate_eval() {
         case "${deny_on}:${TG_PRESSURE}" in
             critical:critical|strained:critical|strained:strained)
                 TG_OUTCOME="deny"
-                TG_MESSAGE="Guardian: Subagent blocked — ${TG_PRESSURE} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%). Do this work yourself, serially, in the current session; do not retry the spawn. The user can lift this with: ${GUARDIAN_DIR}/guardian snooze 15"
+                TG_MESSAGE="Guardian: Subagent blocked — ${TG_PRESSURE} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%).${why} Do this work yourself, serially, in the current session; do not retry the spawn. The user can lift this with: ${GUARDIAN_DIR}/guardian snooze 15"
                 return 0
                 ;;
         esac
@@ -54,10 +55,10 @@ guardian_tool_gate_eval() {
     TG_OUTCOME="advise"
     case "$TG_PRESSURE" in
         strained)
-            TG_MESSAGE="Guardian: Moderate load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Go easy on parallelism."
+            TG_MESSAGE="Guardian: Moderate load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Go easy on parallelism.${why}"
             ;;
         critical)
-            TG_MESSAGE="Guardian: High load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Serial work; skip heavy containers."
+            TG_MESSAGE="Guardian: High load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Serial work; skip heavy containers.${why}"
             ;;
     esac
     return 0

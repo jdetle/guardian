@@ -121,6 +121,8 @@ Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_ag
 
 Copy in blocked **`user_message`** repeats these hints.
 
+**What zeno can and cannot relax:** `zeno bump` loosens Guardian's own numeric thresholds (CPU, available RAM, swap, disk, Cursor RSS). It does not override macOS's verdicts — kernel memory pressure and thermal pressure still escalate at any zeno step. When a block's `Why:` names one of those, use **snooze** or **once**.
+
 ### Session budget (Cursor memory)
 
 **`[session_budget]`** uses aggregate **Cursor RSS** in megabytes (`state.json` → `cursor.resident_memory_megabytes`, summed from `Cursor*` processes via `ps`). **`warn_cursor_rss_megabytes`** drives an advisory in **`sessionStart`**.
@@ -211,7 +213,23 @@ Every pull request runs the same checks in GitHub Actions ([`.github/workflows/c
 | `strained` | 70–90% | 1–2 GB | 25–50% |
 | `critical` | > 90% | < 1 GB | > 50% |
 
-Thermal state and process usage ratio can also escalate. Optional **available/total RAM** ratios in config add another signal. **Hysteresis** dampens flapping.
+Two kernel signals sit alongside those thresholds:
+
+| Signal | Source | Effect |
+|---|---|---|
+| **Memory pressure** | `kern.memorystatus_vm_pressure_level` — what Activity Monitor's memory graph shows | `warn` → `strained`, `critical` → `critical` |
+| **Thermal pressure** | `com.apple.system.thermalpressurelevel` (Apple Silicon; Intel uses `machdep.xcpm.thermal_pressure`) | `moderate` → `strained`, `heavy` or worse → `critical` |
+
+**Corroborated criticals.** Swap % and CPU % are noisy on their own: macOS grows swap on demand, so "90% of the current swap file" is reached moments before the file is enlarged, and a compile pegs every core without endangering anything. By default they only reach `critical` when a second signal agrees — the kernel also reports memory pressure (for swap), or the machine is also heating up (for CPU). Alone they count as `strained`. Low available RAM, kernel memory pressure, thermal pressure and a full process table never need corroboration. Where the corroborating signal is unavailable (`unknown`), the old behavior applies. Thermal pressure is `unknown` only where it cannot be read or cannot be trusted — in practice, inside a virtual machine, where the notification reads 0 whether or not anything publishes it; on physical Macs 0 is taken as `nominal`. To let every threshold reach `critical` by itself:
+
+```toml
+[thresholds]
+corroborate_critical = false
+```
+
+Process usage ratio can also escalate. Optional **available/total RAM** ratios in config add another signal. **Hysteresis** dampens flapping.
+
+`state.json` → **`pressure_reasons`** lists what is driving the current level in plain words (`"swap 93% used"`, `"thermal pressure heavy"`); hooks append it to advisories, subagent denials and block messages as **`Why: …`**. While hysteresis is holding a level, the reasons shown are the ones that established that level.
 
 ### Querying pressure (`state.json`)
 
@@ -225,6 +243,9 @@ cat ~/.guardian/state.json | jq '{
   cpu_percent,
   memory_available_gb,
   swap_used_percent,
+  pressure_reasons,
+  memory_pressure_level,
+  thermal_state,
   disk,
   agents,
   sampled_at
@@ -236,6 +257,9 @@ cat ~/.guardian/state.json | jq '{
 | Field | What it tells you |
 |--------|-------------------|
 | **`pressure`** | Overall label: `clear`, `strained`, or `critical` (see table above). |
+| **`pressure_reasons`** | What is driving the level right now, e.g. `["macOS reports memory pressure", "swap 76% used"]`. Empty when `clear`. |
+| **`memory_pressure_level`** | The kernel's verdict: `normal`, `warn`, `critical` (or `unknown`). |
+| **`thermal_state`** | `nominal`, `fair` (moderate), `serious` (heavy), `critical`, or `unknown` (no trustworthy source — e.g. a virtual machine). |
 | **`cpu_percent`** | Host CPU load (representative sample). |
 | **`memory_available_gb`** / **`memory_total_gb`** | Free RAM vs total — tight free memory plus high swap usually means memory pressure. |
 | **`swap_used_percent`** | High values (often **well above** the rough bands in the pressure table) mean the kernel is paging — treat memory as constrained even if CPU looks fine. |
