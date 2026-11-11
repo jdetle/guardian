@@ -9,8 +9,14 @@ HOOKS_DIR="$CURSOR_DIR/hooks/guardian"
 
 echo "=== Guardian Hooks Installer ==="
 
+# The hooks themselves need jq on every call; fail before copying anything.
+if ! command -v jq &>/dev/null; then
+    echo "ERROR: jq is required (hooks parse JSON with it). Install it — e.g. brew install jq — and re-run." >&2
+    exit 1
+fi
+
 # Copy hook scripts
-echo "[1/3] Installing hook scripts to $HOOKS_DIR..."
+echo "[1/2] Installing hook scripts to $HOOKS_DIR..."
 mkdir -p "$HOOKS_DIR"
 cp "$SCRIPT_DIR/lib.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/prompt-gate-common.sh" "$HOOKS_DIR/"
@@ -70,46 +76,14 @@ if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ] && [ -f "$SCRIPT_DIR/hook_policy.de
     echo "  Installed default ~/.guardian/hook_policy.json (edit to tune gates)"
 fi
 
-# Merge hooks.json
-echo "[2/3] Configuring hooks.json..."
+# Merge into ~/.cursor/hooks.json. Idempotent; other hooks on the same events are kept, and
+# only Guardian's own template commands are rewritten to absolute paths.
+echo "[2/2] Merging hooks.json..."
 HOOKS_JSON="$CURSOR_DIR/hooks.json"
-
-if [ -f "$HOOKS_JSON" ]; then
-    # Merge Guardian hooks into existing config
-    # Back up the original
-    cp "$HOOKS_JSON" "$HOOKS_JSON.bak"
-
-    # Use jq to merge; if jq fails, replace entirely
-    if command -v jq &>/dev/null; then
-        jq -s '
-            .[0] as $existing |
-            .[1] as $guardian |
-            $existing * {hooks: ($existing.hooks // {} | to_entries + ($guardian.hooks | to_entries) | from_entries)}
-        ' "$HOOKS_JSON" "$SCRIPT_DIR/hooks.json" > "$HOOKS_JSON.tmp" && mv "$HOOKS_JSON.tmp" "$HOOKS_JSON"
-        echo "  Merged into existing hooks.json (backup at hooks.json.bak)"
-    else
-        cp "$SCRIPT_DIR/hooks.json" "$HOOKS_JSON"
-        echo "  WARNING: jq not found; replaced hooks.json (backup at hooks.json.bak)"
-    fi
-else
-    # Install fresh
-    cp "$SCRIPT_DIR/hooks.json" "$HOOKS_JSON"
-    echo "  Created new hooks.json"
-fi
-
-# Update paths in hooks.json to use absolute paths for user-level hooks
-echo "[3/3] Resolving hook paths..."
-if command -v jq &>/dev/null; then
-    jq --arg dir "$HOOKS_DIR" '
-        .hooks |= with_entries(
-            .value |= map(
-                if .command | test("\\./hooks/") then
-                    .command = ($dir + "/" + (.command | split("/") | last))
-                else .
-                end
-            )
-        )
-    ' "$HOOKS_JSON" > "$HOOKS_JSON.tmp" && mv "$HOOKS_JSON.tmp" "$HOOKS_JSON"
+if ! bash "$SCRIPT_DIR/merge-agent-hooks.sh" "$HOOKS_JSON" "$SCRIPT_DIR/hooks.json" "./hooks" "$HOOKS_DIR" "$HOOKS_JSON.bak"; then
+    echo "Guardian hook scripts were copied to $HOOKS_DIR but are NOT registered in $HOOKS_JSON." >&2
+    echo "Fix the problem above and re-run this installer." >&2
+    exit 1
 fi
 
 echo ""

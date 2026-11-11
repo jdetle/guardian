@@ -1,6 +1,6 @@
 [package]
 name = "guardian-daemon"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "System resource monitor daemon for Cursor, Claude Code, and Codex agent throttling"
 license = "MIT"

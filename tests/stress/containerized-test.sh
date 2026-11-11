@@ -838,7 +838,7 @@ else
 fi
 
 refuse_ok=1
-for bad in '{"hooks":{"PreToolUse":{"matcher":"x"}}}' '{"hooks":[]}' '[1,2]' ''; do
+for bad in '{"hooks":{"PreToolUse":{"matcher":"x"}}}' '{"hooks":[]}' '[1,2]' '{"a":1}{"b":2}' 'not json'; do
     printf '%s' "$bad" >"$merge_dir/bad.json"
     cp "$merge_dir/bad.json" "$merge_dir/bad.orig"
     if run_merge "$merge_dir/bad.json" /home/u/.claude/hooks/guardian; then
@@ -863,6 +863,86 @@ if [ "$n" = "3" ] && [ "$unmatched" = "0" ]; then
 else
     fail "installer merge: legacy upgrade left n=$n unmatched=$unmatched"
 fi
+# Cursor's flat hook shape goes through the same helper
+cat >"$merge_dir/cursor.json" <<'JSON'
+{"version":1,"hooks":{"preToolUse":[{"command":"./hooks/my-own.sh","matcher":"Shell"},{"command":"/home/u/.cursor/hooks/guardian/pre-tool-use.sh","matcher":"Shell|Task","timeout":3}],"afterFileEdit":[{"command":"./hooks/format.sh"}]}}
+JSON
+bash "$MERGE" "$merge_dir/cursor.json" "$HOOKS_DIR/hooks.json" "./hooks" /home/u/.cursor/hooks/guardian "$merge_dir/cursor.json.bak" >/dev/null 2>&1
+own=$(jq -r '.hooks.preToolUse[0].command' "$merge_dir/cursor.json" 2>/dev/null)
+fmt=$(jq -r '.hooks.afterFileEdit[0].command' "$merge_dir/cursor.json" 2>/dev/null)
+g=$(jq '[.hooks[][] | select(.command | contains("/hooks/guardian/"))] | length' "$merge_dir/cursor.json" 2>/dev/null)
+rel=$(jq '[.hooks[][] | select((.command | startswith("./hooks/")) and (.command | test("my-own|format") | not))] | length' "$merge_dir/cursor.json" 2>/dev/null)
+if [ "$own" = "./hooks/my-own.sh" ] && [ "$fmt" = "./hooks/format.sh" ] && [ "$g" = "7" ] && [ "$rel" = "0" ]; then
+    pass "cursor merge: user's own ./hooks/ commands and same-event hooks survive; Guardian's 7 are absolute, no duplicates"
+else
+    fail "cursor merge: own=$own fmt=$fmt guardian=$g relative=$rel"
+fi
+
+bash "$MERGE" --remove "$merge_dir/cursor.json" /home/u/.cursor/hooks/guardian "$merge_dir/cursor.un.bak" >/dev/null 2>&1
+left=$(jq -c '.hooks' "$merge_dir/cursor.json" 2>/dev/null)
+if [ "$left" = '{"preToolUse":[{"command":"./hooks/my-own.sh","matcher":"Shell"}],"afterFileEdit":[{"command":"./hooks/format.sh"}]}' ]; then
+    pass "uninstall: --remove strips only Guardian entries and the events it emptied (Cursor shape)"
+else
+    fail "uninstall: unexpected Cursor config after remove: $left"
+fi
+
+echo '{"model":"x","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/other.sh"}]}]}}' >"$merge_dir/rt.json"
+cp "$merge_dir/rt.json" "$merge_dir/rt.orig"
+run_merge "$merge_dir/rt.json" /home/u/.claude/hooks/guardian
+bash "$MERGE" --remove "$merge_dir/rt.json" /home/u/.claude/hooks/guardian "$merge_dir/rt.un.bak" >/dev/null 2>&1
+if [ "$(jq -S -c . "$merge_dir/rt.json")" = "$(jq -S -c . "$merge_dir/rt.orig")" ]; then
+    pass "uninstall: install then --remove restores the original Claude Code settings"
+else
+    fail "uninstall: round trip changed settings: $(cat "$merge_dir/rt.json")"
+fi
+
+printf '%s' '{"hooks":[]}' >"$merge_dir/rm-bad.json"
+if ! bash "$MERGE" --remove "$merge_dir/rm-bad.json" /home/u/.claude/hooks/guardian "$merge_dir/rm-bad.bak" >/dev/null 2>&1 \
+    && [ "$(cat "$merge_dir/rm-bad.json")" = '{"hooks":[]}' ] \
+    && bash "$MERGE" --remove "$merge_dir/does-not-exist.json" /home/u/.claude/hooks/guardian "$merge_dir/x.bak" >/dev/null 2>&1; then
+    pass "uninstall: --remove refuses unparseable shapes untouched and is a no-op for a missing file"
+else
+    fail "uninstall: --remove mishandled a bad or missing config"
+fi
+
+# Only commands under THIS agent's Guardian root are Guardian's
+cat >"$merge_dir/foreign.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/proj/hooks/guardian/other.sh"},{"type":"command","command":"/home/u/.claude/hooks/guardian/claude/pre-tool-use.sh"}]}]}}
+JSON
+run_merge "$merge_dir/foreign.json" /home/u/.claude/hooks/guardian
+kept_after_merge=$(jq '[.hooks[][] | .hooks[] | select(.command == "/proj/hooks/guardian/other.sh")] | length' "$merge_dir/foreign.json" 2>/dev/null)
+bash "$MERGE" --remove "$merge_dir/foreign.json" /home/u/.claude/hooks/guardian "$merge_dir/foreign.un.bak" >/dev/null 2>&1
+after_remove=$(jq -c '[.hooks[][] | .hooks[] | .command]' "$merge_dir/foreign.json" 2>/dev/null)
+if [ "$kept_after_merge" = "1" ] && [ "$after_remove" = '["/proj/hooks/guardian/other.sh"]' ]; then
+    pass "installer merge: someone else's hook in another hooks/guardian directory survives merge and --remove"
+else
+    fail "installer merge: foreign hooks/guardian entry mishandled (merge kept=$kept_after_merge, after remove=$after_remove)"
+fi
+
+# The first backup is the pre-Guardian file and must survive later changing runs
+echo '{"orig":true}' >"$merge_dir/bk.json"
+run_merge "$merge_dir/bk.json" /home/u/.claude/hooks/guardian
+jq '.hooks.PreToolUse[0].hooks[0].timeout = 99' "$merge_dir/bk.json" >"$merge_dir/bk.tmp" && cat "$merge_dir/bk.tmp" >"$merge_dir/bk.json"
+run_merge "$merge_dir/bk.json" /home/u/.claude/hooks/guardian
+n_backups=$(ls "$merge_dir" | grep -c '^bk\.json\.bak')
+if [ "$(jq -c . "$merge_dir/bk.json.bak" 2>/dev/null)" = '{"orig":true}' ] && [ "$n_backups" = "2" ]; then
+    pass "installer merge: a later changing run keeps the original backup and writes a timestamped one"
+else
+    fail "installer merge: original backup lost (backups=$n_backups, first=$(cat "$merge_dir/bk.json.bak" 2>/dev/null))"
+fi
+
+# An empty config file means "no config yet", not an error
+: >"$merge_dir/empty.json"
+printf '  \n' >"$merge_dir/blank.json"
+if run_merge "$merge_dir/empty.json" /home/u/.claude/hooks/guardian \
+    && jq -e '.hooks.UserPromptSubmit | length == 1' "$merge_dir/empty.json" >/dev/null 2>&1 \
+    && bash "$MERGE" --remove "$merge_dir/blank.json" /home/u/.claude/hooks/guardian "$merge_dir/blank.bak" >/dev/null 2>&1 \
+    && [ ! -e "$merge_dir/blank.bak" ]; then
+    pass "installer merge: a 0-byte config is populated; --remove on a blank one is a no-op"
+else
+    fail "installer merge: empty or blank config mishandled"
+fi
+
 rm -rf "$merge_dir"
 
 reset_policy

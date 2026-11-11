@@ -77,7 +77,7 @@ bash scripts/install-claude-hooks.sh # Claude Code
 bash scripts/install-codex-hooks.sh  # OpenAI Codex
 ```
 
-Run the hook installers for the agents you use; all three read the same **`~/.guardian/`** state and policy.
+Run the hook installers for the agents you use; all three read the same **`~/.guardian/`** state and policy. Each one merges into the agent's existing config: re-running is safe, hooks you added yourself are kept (including on the same events), and a config it cannot parse is left untouched.
 
 `install.sh` copies **`guardiand`** to **`~/.guardian/guardiand`** and points the LaunchAgent there, so `cargo clean` or a disk-space sweep of `target/` no longer kills the daemon. It exits non-zero unless the new daemon is actually writing fresh `state.json`.
 
@@ -180,11 +180,10 @@ cat ~/.codex/hooks.json | jq '.hooks | keys'
 
 ```bash
 bash scripts/uninstall.sh
-rm -rf ~/.cursor/hooks/guardian/ ~/.claude/hooks/guardian/ ~/.codex/hooks/guardian/
-rm -rf ~/.guardian/
+rm -rf ~/.guardian/   # optional: config, state, session history
 ```
 
-Also delete the Guardian entries (commands containing `/hooks/guardian/`) from `~/.cursor/hooks.json`, `~/.claude/settings.json`, and `~/.codex/hooks.json` — otherwise each agent keeps trying to run scripts that no longer exist.
+`uninstall.sh` stops the daemon, removes Guardian's entries from `~/.cursor/hooks.json`, `~/.claude/settings.json` and `~/.codex/hooks.json` (your other hooks and settings are kept; the previous file is saved as `*.guardian-uninstall.bak`), then deletes the hook scripts and Cursor slash commands. If a config cannot be edited safely it is left alone, along with its scripts, and the script says so.
 
 ---
 
