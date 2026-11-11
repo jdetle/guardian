@@ -41,7 +41,11 @@ if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ]; then
 fi
 
 echo "[2/3] Merging $CODEX_HOOKS_JSON..."
-bash "$HOOKS_SRC/merge-agent-hooks.sh" "$CODEX_HOOKS_JSON" "$HOOKS_SRC/codex-hooks.json" "__GUARDIAN_CODEX_HOOK_ROOT__" "$DEST" "$CODEX_HOOKS_JSON.bak"
+if ! bash "$HOOKS_SRC/merge-agent-hooks.sh" "$CODEX_HOOKS_JSON" "$HOOKS_SRC/codex-hooks.json" "__GUARDIAN_CODEX_HOOK_ROOT__" "$DEST" "$CODEX_HOOKS_JSON.bak"; then
+    echo "Guardian hook scripts were copied to $DEST but are NOT registered in $CODEX_HOOKS_JSON." >&2
+    echo "Fix the problem above and re-run this installer." >&2
+    exit 1
+fi
 
 echo "[3/3] Done."
 echo ""

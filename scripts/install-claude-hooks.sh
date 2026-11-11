@@ -43,7 +43,11 @@ if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ]; then
 fi
 
 echo "[2/3] Merging $SETTINGS_JSON..."
-bash "$HOOKS_SRC/merge-agent-hooks.sh" "$SETTINGS_JSON" "$HOOKS_SRC/claude-code-hooks.json" "__GUARDIAN_CLAUDE_HOOK_ROOT__" "$DEST" "$SETTINGS_JSON.guardian.bak"
+if ! bash "$HOOKS_SRC/merge-agent-hooks.sh" "$SETTINGS_JSON" "$HOOKS_SRC/claude-code-hooks.json" "__GUARDIAN_CLAUDE_HOOK_ROOT__" "$DEST" "$SETTINGS_JSON.guardian.bak"; then
+    echo "Guardian hook scripts were copied to $DEST but are NOT registered in $SETTINGS_JSON." >&2
+    echo "Fix the problem above and re-run this installer." >&2
+    exit 1
+fi
 
 echo "[3/3] Done."
 echo ""
