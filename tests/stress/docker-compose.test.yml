@@ -16,8 +16,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8.0"
-          memory: 8G
+          cpus: "2.0"
+          memory: 1G
     privileged: false
     environment:
       - GUARDIAN_DIR=/root/.guardian
