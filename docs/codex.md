@@ -42,7 +42,7 @@ Until you do, Guardian is installed but inert in Codex.
 | Event | Script | Behavior |
 |---|---|---|
 | `SessionStart` (`startup\|resume`) | `codex/session-start.sh` | Same context line as Cursor's `sessionStart`, in Codex's `hookSpecificOutput` shape, plus per-agent RAM. |
-| `UserPromptSubmit` | `codex/user-prompt-submit.sh` | Same policy as Cursor's `beforeSubmitPrompt` (pressure, RSS, snooze, `proceed_once`, queue enqueue). |
+| `UserPromptSubmit` | `codex/user-prompt-submit.sh` | Applies the shared [prompt policy](../README.md#prompt-gates-and-resume), with a Codex-specific mode override. |
 | `PreToolUse` (`Bash\|Agent\|spawn_agent`) | `codex/pre-tool-use.sh` | Silent when clear; rate-limited advisory at `strained` / `critical`; opt-in deny of `spawn_agent` via `[tool_gate] deny_subagents_on` (see [claude-code.md](claude-code.md#stopping-subagent-fan-out-under-pressure-opt-in)). |
 
 ## Differences vs Cursor

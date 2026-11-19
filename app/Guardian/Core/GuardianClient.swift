@@ -7,9 +7,15 @@ final class GuardianClient: ObservableObject {
     @Published var sessions: [SessionRecord] = []
     @Published var queueEntries: [AgentQueueEntry] = []
 
+    @Published private(set) var snoozeUntil: Date?
+    @Published private(set) var allowOncePending = false
+    @Published private(set) var promptControlError: String?
+
+    private let guardianDir: URL
     private let stateFileURL: URL
     private let queueFileURL: URL
     private let dbPath: String
+    private let promptControlQueue = DispatchQueue(label: "guardian.prompt-controls")
     private var timer: Timer?
     private var sessionTimer: Timer?
 
@@ -18,16 +24,19 @@ final class GuardianClient: ObservableObject {
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let guardianDir = home.appendingPathComponent(".guardian")
+        self.guardianDir = guardianDir
         self.stateFileURL = guardianDir.appendingPathComponent("state.json")
         self.queueFileURL = guardianDir.appendingPathComponent("agent_queue.jsonl")
         self.dbPath = guardianDir.appendingPathComponent("sessions.db").path
     }
 
     func startPolling() {
+        loadPromptControls()
         loadState()
         loadQueue()
         loadSessions()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.loadPromptControls()
             self?.loadState()
             self?.loadQueue()
         }
@@ -41,6 +50,49 @@ final class GuardianClient: ObservableObject {
         timer = nil
         sessionTimer?.invalidate()
         sessionTimer = nil
+    }
+
+    func loadPromptControls() {
+        let marker = guardianDir.appendingPathComponent("snooze_until")
+        let text = try? String(contentsOf: marker, encoding: .utf8)
+        let expiry = text.flatMap {
+            ISO8601DateFormatter().date(from: $0.trimmingCharacters(in: .whitespacesAndNewlines))
+        }.flatMap { $0 > Date() ? $0 : nil }
+        if snoozeUntil != expiry { snoozeUntil = expiry }
+
+        let pending = FileManager.default.fileExists(
+            atPath: guardianDir.appendingPathComponent("proceed_once").path
+        )
+        if allowOncePending != pending { allowOncePending = pending }
+    }
+
+    func runPromptControl(_ arguments: [String]) {
+        promptControlError = nil
+        let executable = guardianDir.appendingPathComponent("guardian")
+        promptControlQueue.async {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            let errorPipe = Pipe()
+            process.standardError = errorPipe
+            let failure: String?
+            do {
+                try process.run()
+                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let message = String(decoding: errorData, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                failure = process.terminationStatus == 0 ? nil :
+                    (message.isEmpty ? "Guardian could not update prompt controls." : message)
+            } catch {
+                failure = error.localizedDescription
+            }
+            DispatchQueue.main.async {
+                self.promptControlError = failure
+                self.loadPromptControls()
+            }
+        }
     }
 
     private func loadState() {

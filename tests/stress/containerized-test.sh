@@ -290,10 +290,10 @@ fresh_state() {
 
 rm -f "$GUARDIAN_DIR/proceed_once" "$GUARDIAN_DIR/snooze_until"
 
-# Default hook_policy ships block_on_session_budget false; enable for RSS gate tests below
+# Exercise the opt-in strict thresholds and RSS cap.
 if [ -f "$GUARDIAN_DIR/hook_policy.json" ] && command -v jq &>/dev/null; then
     hp_tmp=$(mktemp)
-    jq '.prompt_gate.block_on_session_budget = true' "$GUARDIAN_DIR/hook_policy.json" >"$hp_tmp" \
+    jq '.prompt_gate |= (.mode = "strict" | .block_on_session_budget = true)' "$GUARDIAN_DIR/hook_policy.json" >"$hp_tmp" \
         && mv "$hp_tmp" "$GUARDIAN_DIR/hook_policy.json"
 fi
 
@@ -348,10 +348,10 @@ fresh_state strained 2 100 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
 cont=$(guardian_json_continue "$result")
 um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
-if [ "$cont" = "true" ] && echo "$um" | grep -q '/guardian-snooze'; then
-    pass "beforeSubmit: preempt snooze hint in agent UI while strained (before critical block)"
+if [ "$cont" = "true" ] && [ -z "$um" ]; then
+    pass "beforeSubmit: allows quietly below the strict pressure cutoff"
 else
-    fail "beforeSubmit: expected continue true + preempt snooze hint when strained (got $result)"
+    fail "beforeSubmit: expected quiet allow below the strict cutoff (got $result)"
 fi
 
 # RSS block only when pressure is not clear (see hooks/before-submit-prompt.sh)
@@ -397,7 +397,7 @@ result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
 mv "$GUARDIAN_DIR/hook_policy.json.bak.test" "$GUARDIAN_DIR/hook_policy.json"
 cont=$(guardian_json_continue "$result")
 um=$(echo "$result" | jq -r '.user_message // ""' 2>/dev/null)
-if [ "$cont" = "true" ] && echo "$um" | grep -q 'not valid JSON'; then
+if [ "$cont" = "true" ] && echo "$um" | grep -q 'hook_policy.json is invalid'; then
     pass "beforeSubmit: corrupt hook_policy.json fails open"
 else
     fail "beforeSubmit: expected fail-open + message on corrupt policy (got $result)"
@@ -598,17 +598,55 @@ else
     fail "cursor preTool: Shell must be allowed (got $result)"
 fi
 
-# Prompt gate through the Claude Code adapter
+# Adaptive mode uses the same criteria in all three adapters.
+assert_prompt() {
+    local hook="$1" prompt="$2" expected="$3" label="$4" output outcome
+    output=$(jq -nc --arg prompt "$prompt" '{prompt:$prompt}' | bash "$hook")
+    outcome=$(printf '%s' "$output" | jq -r '
+        if .decision == "block" or .continue == false then "block"
+        elif .hookSpecificOutput or .user_message then "advisory"
+        elif .continue == true then "allow"
+        else "unexpected" end
+    ')
+    if [ "$outcome" = "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label (expected $expected, got $output)"
+    fi
+}
+
 reset_policy
-fresh_state critical >"$STATE_FILE"
-result=$(echo '{"prompt":"do a thing","session_id":"s-p"}' | bash "$CLAUDE_HOOKS/user-prompt-submit.sh" 2>/dev/null)
-decision=$(echo "$result" | jq -r '.decision // ""' 2>/dev/null)
-reason=$(echo "$result" | jq -r '.reason // ""' 2>/dev/null)
-if [ "$decision" = "block" ] && echo "$reason" | grep -q 'guardian snooze 15' && ! echo "$reason" | grep -q '/guardian-snooze'; then
-    pass "claude promptGate: blocks at critical with CLI unblock hint (no Cursor slash commands)"
-else
-    fail "claude promptGate: expected block + CLI hint (got $result)"
-fi
+heavy_prompt="Please run the full test suite"
+fresh_state critical | jq '.memory_pressure_level = "critical"' >"$STATE_FILE"
+for hook in before-submit-prompt.sh claude/user-prompt-submit.sh codex/user-prompt-submit.sh; do
+    assert_prompt "$HOOKS_DIR/$hook" "Explain this error" allow "$hook allows light work under severe pressure"
+    assert_prompt "$HOOKS_DIR/$hook" "$heavy_prompt" block "$hook pauses explicit heavy work under severe pressure"
+done
+assert_prompt "$HOOKS_DIR/before-submit-prompt.sh" "How do I run all tests?" allow "Questions about heavy work are allowed"
+assert_prompt "$HOOKS_DIR/before-submit-prompt.sh" "Run the full test suite in CI" allow "Remote test runs are allowed"
+
+touch "$GUARDIAN_DIR/proceed_once"
+assert_prompt "$CODEX_HOOKS/user-prompt-submit.sh" "Summarize this file" allow "Ordinary send leaves Allow once armed"
+assert_prompt "$CLAUDE_HOOKS/user-prompt-submit.sh" "$heavy_prompt" allow "Allow once applies across clients"
+assert_prompt "$CODEX_HOOKS/user-prompt-submit.sh" "$heavy_prompt" block "Allow once is consumed exactly once"
+
+date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ >"$GUARDIAN_DIR/snooze_until"
+assert_prompt "$CLAUDE_HOOKS/user-prompt-submit.sh" "$heavy_prompt" allow "Active snooze bypasses the gate"
+date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ >"$GUARDIAN_DIR/snooze_until"
+assert_prompt "$CLAUDE_HOOKS/user-prompt-submit.sh" "$heavy_prompt" block "Expired snooze restores the gate"
+rm -f "$GUARDIAN_DIR/snooze_until"
+
+fresh_state critical | jq '.memory_pressure_level = "normal"' >"$STATE_FILE"
+assert_prompt "$CODEX_HOOKS/user-prompt-submit.sh" "$heavy_prompt" allow "Critical thresholds alone cannot block in adaptive mode"
+
+policy_file="$GUARDIAN_DIR/hook_policy.json"
+jq '.prompt_gate.clients = {claude:"advisory", codex:"strict"}' "$HOOKS_DIR/hook_policy.default.json" >"$policy_file"
+assert_prompt "$CLAUDE_HOOKS/user-prompt-submit.sh" "$heavy_prompt" advisory "Claude advisory override allows heavy work"
+assert_prompt "$CODEX_HOOKS/user-prompt-submit.sh" "Explain this error" block "Codex strict override applies independently"
+assert_prompt "$HOOKS_DIR/before-submit-prompt.sh" "$heavy_prompt" allow "Cursor still uses adaptive mode"
+jq '.prompt_gate |= (.mode = "strict" | .enabled = false)' "$HOOKS_DIR/hook_policy.default.json" >"$policy_file"
+assert_prompt "$CLAUDE_HOOKS/user-prompt-submit.sh" "$heavy_prompt" allow "Enabled false disables even strict gating"
+reset_policy
 
 fresh_state clear >"$STATE_FILE"
 result=$(echo '{"prompt":"do a thing","session_id":"s-p"}' | bash "$CLAUDE_HOOKS/user-prompt-submit.sh" 2>/dev/null)
@@ -619,8 +657,8 @@ else
     fail "claude promptGate: clear must not block (got $result)"
 fi
 
-echo '{"pressure":"critical","sampled_at":"2020-01-01T00:00:00+00:00"}' >"$STATE_FILE"
-result=$(echo '{"prompt":"do a thing"}' | bash "$CLAUDE_HOOKS/user-prompt-submit.sh" 2>/dev/null)
+echo '{"pressure":"critical","memory_pressure_level":"critical","sampled_at":"2020-01-01T00:00:00+00:00"}' >"$STATE_FILE"
+result=$(jq -nc --arg prompt "$heavy_prompt" '{prompt:$prompt}' | bash "$CLAUDE_HOOKS/user-prompt-submit.sh" 2>/dev/null)
 decision=$(echo "$result" | jq -r '.decision // "none"' 2>/dev/null)
 if [ "$decision" = "none" ]; then
     pass "claude promptGate: stale state fails open"
@@ -683,6 +721,7 @@ reasons_state() {
 }
 
 reset_policy
+jq '.prompt_gate.mode = "strict"' "$HOOKS_DIR/hook_policy.default.json" >"$GUARDIAN_DIR/hook_policy.json"
 reasons_state critical '["thermal pressure heavy","swap 93% used"]' >"$STATE_FILE"
 result=$(echo '{"prompt":"x","session_id":"s-why"}' | bash "$CLAUDE_HOOKS/user-prompt-submit.sh" 2>/dev/null)
 reason=$(echo "$result" | jq -r '.reason // ""' 2>/dev/null)

@@ -22,6 +22,10 @@ struct MenuBarView: View {
 
             Divider()
 
+            promptControls
+
+            Divider()
+
             metricRow(label: "CPU", value: String(format: "%.1f%%", client.state.cpuPercent), progress: client.state.cpuPercent / 100)
             metricRow(label: "Memory Free", value: String(format: "%.1f GB", client.state.memoryAvailableGb), progress: 1.0 - (client.state.memoryAvailableGb / max(client.state.memoryTotalGb, 1)))
             metricRow(label: "Swap", value: String(format: "%.1f%%", client.state.swapUsedPercent), progress: client.state.swapUsedPercent / 100)
@@ -67,6 +71,44 @@ struct MenuBarView: View {
         }
         .padding()
         .frame(width: 340)
+    }
+
+    private var promptControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let expiry = client.snoozeUntil {
+                HStack {
+                    Text("Snoozed until \(expiry.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption)
+                    Spacer()
+                    Button("Resume now") { client.runPromptControl(["clear-snooze"]) }
+                }
+            } else {
+                HStack {
+                    Button("Snooze 15 min") { client.runPromptControl(["snooze", "15"]) }
+                    Menu {
+                        Button("5 minutes") { client.runPromptControl(["snooze", "5"]) }
+                        Button("30 minutes") { client.runPromptControl(["snooze", "30"]) }
+                        Button("60 minutes") { client.runPromptControl(["snooze", "60"]) }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .accessibilityLabel("More snooze durations")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    Spacer()
+                    Button(client.allowOncePending ? "Allow once armed" : "Allow once") {
+                        client.runPromptControl(["once"])
+                    }
+                    .disabled(client.allowOncePending)
+                }
+            }
+
+            if let error = client.promptControlError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
     }
 
     @ViewBuilder

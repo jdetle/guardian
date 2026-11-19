@@ -26,9 +26,11 @@ struct GuardianApp: App {
         MenuBarExtra {
             MenuBarView()
                 .environmentObject(client)
+                .onAppear { client.loadPromptControls() }
         } label: {
             menuBarLabel
         }
+        .menuBarExtraStyle(.window)
     }
 
     @ViewBuilder
