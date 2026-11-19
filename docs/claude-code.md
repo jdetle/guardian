@@ -29,7 +29,7 @@ Sessions snapshot their hooks at startup — **start a new session** (or open `/
 | Event | Script | Behavior |
 |---|---|---|
 | `SessionStart` | `claude/session-start.sh` | Adds one line of context: pressure, free RAM, per-agent RAM (Claude / Codex / Cursor), disk. Says so loudly when the daemon is not running. |
-| `UserPromptSubmit` | `claude/user-prompt-submit.sh` | The prompt gate. Returns `decision: "block"` when `[prompt_gate]` says so (default: `critical` pressure). At `strained` it adds a short advisory instead. |
+| `UserPromptSubmit` | `claude/user-prompt-submit.sh` | Applies the shared [prompt policy](../README.md#prompt-gates-and-resume). Adaptive mode pauses explicit heavy local work during severe system pressure. |
 | `PreToolUse` (`Bash\|Agent\|Task`) | `claude/pre-tool-use.sh` | Silent when load is clear. At `strained` / `critical` adds an advisory as `additionalContext`, at most once per 2 minutes per session. Optionally **denies subagent spawns** (see below). |
 
 The `PreToolUse` hook **never returns `permissionDecision: "allow"`** — that would skip Claude Code's

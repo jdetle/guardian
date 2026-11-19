@@ -112,14 +112,33 @@ Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_ag
 
 ### Prompt gates and resume
 
-| Action | Command / file |
-|--------|------------------|
-| Allow **one** blocked send | `~/.guardian/guardian once` (or `touch ~/.guardian/proceed_once`) then submit again |
-| Snooze gates ~15 minutes | `~/.guardian/guardian snooze 15` (or `bash scripts/guardian-resume.sh snooze 15`) |
-| Clear snooze | `~/.guardian/guardian clear-snooze` |
-| Relax limits (zeno) | `~/.guardian/guardian zeno bump` — `zeno rollback` (undo one bump) — `zeno status` / `zeno reset` |
+The default `adaptive` mode pauses a prompt only when a fresh sample shows critical pressure with critical macOS memory pressure or serious thermal pressure, and the prompt explicitly requests heavy local work. Examples include “Run the full test suite” and “Rebuild all Docker containers.” Questions, ordinary edits, ambiguous requests, and low available RAM alone pass through. The estimate uses local text rules and can miss heavy work implied by prior context.
 
-Copy in blocked **`user_message`** repeats these hints.
+Set a default or override individual clients in `~/.guardian/config.toml`, then restart `guardiand`.
+
+```toml
+[prompt_gate]
+mode = "adaptive"
+block_on = "critical"
+
+[prompt_gate.clients]
+cursor = "adaptive"
+claude = "advisory"
+codex = "adaptive"
+```
+
+- **Adaptive** uses the default workload and system-pressure checks.
+- **Advisory** lets prompts through and warns on explicit heavy work during critical pressure.
+- **Strict** pauses prompts at the configured `block_on` pressure (`critical` or `strained`) and supports the optional Cursor RSS cap.
+- Set `enabled = false` under `[prompt_gate]` to switch off prompt gating across clients. `block_on = "never"` disables pressure-based gating.
+
+Existing configurations without a mode pick up the adaptive default when the hooks are updated. Set `mode = "strict"` to keep pressure-only blocking.
+
+Use the **Guardian menu bar** to snooze for 5, 15, 30, or 60 minutes, see when snooze ends, or resume early. **Allow once** stays armed until a prompt would otherwise be paused. Snooze and Allow once are shared across Cursor, Claude Code, and Codex.
+
+- `~/.guardian/guardian once` allows one paused prompt. Resend it afterward.
+- `~/.guardian/guardian snooze 15` snoozes hooks for 15 minutes.
+- `~/.guardian/guardian clear-snooze` resumes hooks immediately.
 
 **What zeno can and cannot relax:** `zeno bump` loosens Guardian's own numeric thresholds (CPU, available RAM, swap, disk, Cursor RSS). It does not override macOS's verdicts — kernel memory pressure and thermal pressure still escalate at any zeno step. When a block's `Why:` names one of those, use **snooze** or **once**.
 
@@ -127,7 +146,7 @@ Copy in blocked **`user_message`** repeats these hints.
 
 **`[session_budget]`** uses aggregate **Cursor RSS** in megabytes (`state.json` → `cursor.resident_memory_megabytes`, summed from `Cursor*` processes via `ps`). **`warn_cursor_rss_megabytes`** drives an advisory in **`sessionStart`**.
 
-**Prompt blocking** from RSS is controlled by **`[prompt_gate].block_on_session_budget`** (default **off** in new installs). When enabled, **`beforeSubmitPrompt`** only blocks for RSS when **pressure is not `clear`** *and* RSS is above **`max_cursor_rss_megabytes`**—so a healthy machine (clear CPU/memory/swap) is not blocked just because Cursor is using a few GB. Set **`max_cursor_rss_megabytes = 0`** to disable RSS-based blocking entirely.
+**Strict-mode prompt blocking** from RSS is controlled by **`[prompt_gate].block_on_session_budget`** (default **off** in new installs). When enabled, **`beforeSubmitPrompt`** only blocks for RSS when **pressure is not `clear`** *and* RSS is above **`max_cursor_rss_megabytes`**—so a healthy machine (clear CPU/memory/swap) is not blocked just because Cursor is using a few GB. Set **`max_cursor_rss_megabytes = 0`** to disable RSS-based blocking entirely.
 
 If you still see messages about **“Parallel workspace load”** and **`~/.cursor/projects` count**, your **`~/.cursor/hooks/guardian/`** scripts are outdated; run **`bash hooks/install-hooks.sh`** from this repo and restart **`guardiand`** so **`~/.guardian/hook_policy.json`** matches **`config.toml`**.
 

@@ -3,18 +3,71 @@
 # Source after lib.sh. Call: guardian_prompt_gate_eval "$input_json"
 # Guardian slash commands (/guardian-snooze, /guardian-once) and guardian-install / guardian-upgrade
 # skill paths never block — users must always reach snooze/install flows under load.
-# Sets:
-#   PG_OUTCOME=pass|pass_msg|block
-#   PG_MESSAGE=""           # primary user-facing string (block reason or advisory)
-#   PG_ATTACH_ONLY=false    # if true and outcome pass_msg, message is attachment advisory only
+# Sets PG_OUTCOME (pass, pass_msg, block) and PG_MESSAGE.
+
+# Match explicit requests for broad local work. Anchoring at the start keeps
+# questions, quoted commands and incidental mentions out of the blocking path.
+guardian_prompt_heavy_work() {
+    local prompt containers tests build agents
+    prompt=$(printf '%s' "$1" | jq -r '
+        [ .prompt, .promptText, .text, .message, .input, .content ]
+        | map(select(type == "string" and test("\\S")))
+        | (first // "")[:1024] | ascii_downcase
+        | sub("^\\s*(please\\s+)?"; "")
+    ' 2>/dev/null) || return 0
+    containers='^(rebuild (all (the )?)?(docker |compose )?containers|(run )?docker( compose)? build|(run )?docker compose up --build)([^[:alnum:]_-]|$)'
+    tests='^run (the )?((full|entire|whole) (test suite|regression suite)|all (the )?(tests|integration tests|end-to-end tests))([^[:alnum:]_-]|$)'
+    build='^(build|rebuild|compile) (the )?(entire|whole|full) (workspace|project|monorepo|repository)([^[:alnum:]_-]|$)'
+    agents='^(launch|spawn|start|run) ((multiple|several|[2-9][0-9]*|1[0-9]+) (parallel )?subagents|subagents in parallel)([^[:alnum:]_-]|$)'
+    local remote='(^|[[:space:]])(in ci|remotely|on github actions)([^[:alnum:]_-]|$)'
+    if [[ "$prompt" =~ $remote ]]; then
+        return 0
+    fi
+    case "$prompt" in
+        *\?|*" without running"*|*" do not run"*|*" don't run"*|*"dry run"*|*"dry-run"*) return 0 ;;
+    esac
+    if [[ "$prompt" =~ $containers ]]; then
+        printf '%s' 'container builds'
+    elif [[ "$prompt" =~ $tests ]]; then
+        printf '%s' 'a full test run'
+    elif [[ "$prompt" =~ $build ]]; then
+        printf '%s' 'a full project build'
+    elif [[ "$prompt" =~ $agents ]]; then
+        printf '%s' 'multiple subagents'
+    fi
+    return 0
+}
 
 guardian_prompt_gate_eval() {
     local input="$1"
     PG_OUTCOME="pass"
     PG_MESSAGE=""
-    PG_ATTACH_ONLY=false
 
     if guardian_snooze_active; then
+        return 0
+    fi
+
+    local policy_file policy
+    policy_file=$(guardian_hook_policy_file)
+    [ -n "$policy_file" ] || return 0
+
+    if ! policy=$(jq -ce 'select(type == "object")' "$policy_file" 2>/dev/null); then
+        PG_OUTCOME="pass_msg"
+        PG_MESSAGE="Guardian: hook_policy.json is invalid. Prompt gate skipped."
+        return 0
+    fi
+
+    local mode block_on block_sess max_rss
+    if ! IFS=$'\t' read -r mode block_on block_sess max_rss < <(
+        printf '%s' "$policy" | jq -r --arg client "${GUARDIAN_HOOK_FORMAT:-cursor}" '
+            (.prompt_gate // {}) as $gate
+            | select($gate.enabled != false)
+            | [($gate.clients[$client] // $gate.mode // "adaptive"),
+               ($gate.block_on // "critical"),
+               ($gate.block_on_session_budget == true),
+               (.session_budget.max_cursor_rss_megabytes // 8192)] | @tsv
+        ' 2>/dev/null
+    ); then
         return 0
     fi
 
@@ -24,91 +77,52 @@ guardian_prompt_gate_eval() {
         return 0
     fi
 
-    if guardian_consume_proceed_once; then
-        PG_OUTCOME="pass_msg"
-        PG_MESSAGE="Guardian: One-shot bypass applied — send again."
+    local sample
+    [ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ] || return 0
+    sample=$(cat "$STATE_FILE" 2>/dev/null) || return 0
+    if ! is_daemon_active "$sample"; then
         return 0
     fi
 
-    local policy_file
-    policy_file=$(guardian_hook_policy_file)
-    if [ -z "${policy_file:-}" ]; then
+    local pressure memory_pressure thermal cursor_mb
+    if ! IFS=$'\t' read -r pressure memory_pressure thermal cursor_mb < <(
+        printf '%s' "$sample" | jq -r '
+            [(.pressure // "clear"), (.memory_pressure_level // "unknown"),
+             (.thermal_state // "unknown"), (.cursor.resident_memory_megabytes // 0)] | @tsv
+        ' 2>/dev/null
+    ); then
         return 0
     fi
 
-    if ! jq empty "$policy_file" 2>/dev/null; then
-        PG_OUTCOME="pass_msg"
-        PG_MESSAGE="Guardian: hook_policy.json not valid JSON — prompt gate off."
-        return 0
-    fi
-
-    local enabled="true"
-    local e
-    e=$(jq -r '.prompt_gate.enabled // true' "$policy_file" 2>/dev/null) && enabled="$e"
-    if [ "$enabled" != "true" ]; then
-        return 0
-    fi
-
-    if ! is_daemon_active; then
-        PG_OUTCOME="pass_msg"
-        PG_MESSAGE="Guardian: No fresh metrics (guardiand quiet?) — gate off."
-        return 0
-    fi
-
-    local pressure mem cpu swap cursor_mb block_on block_sess max_rss hints
-    pressure=$(read_state_pressure)
-    mem=$(read_state_field "memory_available_gb" "?")
-    cpu=$(read_state_field "cpu_percent" "?")
-    swap=$(read_state_field "swap_used_percent" "?")
-    cursor_mb=$(read_state_field "cursor.resident_memory_megabytes" "0")
-
-    block_on=$(jq -r '.prompt_gate.block_on // "critical"' "$policy_file" 2>/dev/null || echo "never")
-    case "$block_on" in
-        never|strained|critical) ;;
-        *) block_on="never" ;;
+    local block_reason="" workload="" advisory=""
+    case "$mode" in
+        adaptive|advisory)
+            if [ "$pressure" = "critical" ] && [ "$block_on" != "never" ]; then
+                workload=$(guardian_prompt_heavy_work "$input")
+                if [ -n "$workload" ]; then
+                    if [ "$mode" = "advisory" ]; then
+                        advisory="Guardian: Critical system pressure. Consider postponing $workload."
+                    elif [ "$memory_pressure" = "critical" ] || [[ "$thermal" = serious || "$thermal" = critical ]]; then
+                        block_reason="pressure"
+                    fi
+                fi
+            fi
+            ;;
+        strict)
+            local cursor_rss="${cursor_mb%%.*}" rss_limit="${max_rss%%.*}"
+            if [ "$block_sess" = "true" ] && [[ "$pressure" = strained || "$pressure" = critical ]] \
+                && [ "$rss_limit" -gt 0 ] 2>/dev/null && [ "$cursor_rss" -gt "$rss_limit" ] 2>/dev/null; then
+                block_reason="session_budget"
+            elif [[ "$block_on" = critical || "$block_on" = strained ]] && [ "$pressure" = critical ]; then
+                block_reason="pressure"
+            elif [ "$block_on" = strained ] && [ "$pressure" = strained ]; then
+                block_reason="pressure"
+            fi
+            ;;
     esac
 
-    block_sess="true"
-    local b
-    b=$(jq -r '.prompt_gate.block_on_session_budget // false' "$policy_file" 2>/dev/null) && block_sess="$b"
-    max_rss="8192"
-    local m
-    m=$(jq -r '.session_budget.max_cursor_rss_megabytes // 8192' "$policy_file" 2>/dev/null) && max_rss="$m"
-
-    hints=$(guardian_resume_hint_text)
-
-    local blocked=0
-    local block_reason=""
-
-    if [ "$block_sess" = "true" ]; then
-        local cm mx
-        cm="${cursor_mb%%.*}"
-        mx="${max_rss%%.*}"
-        if [ "$pressure" != "clear" ] 2>/dev/null \
-            && [ "${mx:-0}" -gt 0 ] 2>/dev/null \
-            && [ "${cm:-0}" -gt 0 ] 2>/dev/null \
-            && [ "${cm:-0}" -gt "${mx:-0}" ] 2>/dev/null; then
-            blocked=1
-            block_reason="session_budget"
-        fi
-    fi
-
-    if [ "$blocked" -eq 0 ]; then
-        case "$block_on" in
-            never) ;;
-            critical)
-                if [ "$pressure" = "critical" ]; then
-                    blocked=1
-                    block_reason="pressure"
-                fi
-                ;;
-            strained)
-                if [ "$pressure" = "critical" ] || [ "$pressure" = "strained" ]; then
-                    blocked=1
-                    block_reason="pressure"
-                fi
-                ;;
-        esac
+    if [ -n "$block_reason" ] && guardian_consume_proceed_once; then
+        return 0
     fi
 
     local attach_notes=""
@@ -134,57 +148,33 @@ guardian_prompt_gate_eval() {
         done < <(guardian_hook_attachment_paths "$input")
     fi
 
-    if [ "$blocked" -eq 1 ]; then
-        local msg=""
-        case "$block_reason" in
-            session_budget)
-                msg="Guardian: Blocked — Cursor RAM ${cursor_mb} MB (cap ${max_rss} MB) with ${pressure} load. Lighten work or snooze."$'\n'"${hints}"
-                ;;
-            pressure)
-                msg="Guardian: Blocked — ${pressure} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%).$(read_state_reasons_suffix) Cool down or snooze."$'\n'"${hints}"
-                ;;
-            *)
-                msg="Guardian: Blocked by policy."$'\n'"${hints}"
-                ;;
-        esac
-        if [ -n "$attach_notes" ]; then
-            msg="${msg}"$'\n\n'"${attach_notes}"
-        fi
-        local q_enqueue qid
-        q_enqueue=$(jq -r '.queue.enqueue_on_blocked_submit // false' "$policy_file" 2>/dev/null || echo "false")
-        qid=""
-        if [ "$q_enqueue" = "true" ]; then
-            local qbin
-            if qbin=$(guardian_queue_cli); then
-                qid=$(printf '%s' "$input" | "$qbin" enqueue-blocked-json 2>/dev/null || true)
+    if [ -n "$block_reason" ]; then
+        local msg
+        if [ "$block_reason" = "session_budget" ]; then
+            msg="Guardian paused this prompt. Cursor uses ${cursor_mb} MB of RAM (cap ${max_rss} MB) under ${pressure} system pressure."
+        else
+            msg="Guardian paused this prompt under ${pressure} system pressure.$(read_state_reasons_suffix "$sample")"
+            if [ -n "$workload" ]; then
+                msg="$msg This request appears to start $workload."
             fi
         fi
-        if [ -n "$qid" ]; then
-            msg="${msg}"$'\n'"Queued as #${qid} — ~/.guardian/guardian-queue.sh list"
+        msg="$msg"$'\n'"$(guardian_resume_hint_text)"
+        if [ -n "$attach_notes" ]; then
+            msg="$msg"$'\n\n'"$attach_notes"
+        fi
+        local qbin qid
+        if printf '%s' "$policy" | jq -e '.queue.enqueue_on_blocked_submit == true' >/dev/null 2>&1 \
+            && qbin=$(guardian_queue_cli); then
+            qid=$(printf '%s' "$input" | "$qbin" enqueue-blocked-json 2>/dev/null || true)
+            if [ -n "$qid" ]; then
+                msg="$msg"$'\n'"Queued as #${qid}. Run ~/.guardian/guardian-queue.sh list to view it."
+            fi
         fi
         PG_OUTCOME="block"
         PG_MESSAGE="$msg"
-        return 0
-    fi
-
-    local preempt
-    preempt=$(guardian_preempt_snooze_hint "$pressure" "$block_on" "$block_sess" "$cursor_mb" "$max_rss")
-
-    if [ -n "$attach_notes" ]; then
+    elif [ -n "$attach_notes$advisory" ]; then
         PG_OUTCOME="pass_msg"
-        PG_MESSAGE="$attach_notes"
-        if [ -n "$preempt" ]; then
-            PG_MESSAGE="${attach_notes}"$'\n'"${preempt}"
-        fi
-        PG_ATTACH_ONLY=true
-        return 0
+        PG_MESSAGE="$attach_notes$advisory"
     fi
-
-    if [ -n "$preempt" ]; then
-        PG_OUTCOME="pass_msg"
-        PG_MESSAGE="$preempt"
-        return 0
-    fi
-
     return 0
 }

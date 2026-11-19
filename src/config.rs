@@ -112,12 +112,18 @@ fn default_disk_critical_used_percent() -> f64 {
 pub struct PromptGateConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// `never` | `strained` | `critical` — block prompt submit when pressure is at or above this band.
+    /// Pressure cutoff in strict mode (never, strained, or critical).
     #[serde(default = "default_block_on")]
     pub block_on: String,
-    /// When true, block submits if Cursor RSS exceeds session budget — only while pressure is not `clear` (see hooks).
+    /// In strict mode, also block when Cursor RSS exceeds the cap under strained or critical pressure.
     #[serde(default = "default_false")]
     pub block_on_session_budget: bool,
+    /// Default mode for clients without an override.
+    #[serde(default = "default_prompt_gate_mode")]
+    pub mode: String,
+    /// Overrides keyed by cursor, claude, or codex.
+    #[serde(default)]
+    pub clients: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for PromptGateConfig {
@@ -126,8 +132,14 @@ impl Default for PromptGateConfig {
             enabled: true,
             block_on: default_block_on(),
             block_on_session_budget: false,
+            mode: default_prompt_gate_mode(),
+            clients: Default::default(),
         }
     }
+}
+
+fn default_prompt_gate_mode() -> String {
+    "adaptive".to_string()
 }
 
 fn default_block_on() -> String {

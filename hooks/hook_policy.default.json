@@ -1,6 +1,8 @@
 {
   "prompt_gate": {
     "enabled": true,
+    "mode": "adaptive",
+    "clients": {},
     "block_on": "critical",
     "block_on_session_budget": false
   },

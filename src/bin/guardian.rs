@@ -1,5 +1,6 @@
 //! User-facing `guardian` CLI — snooze / one-shot resume / zeno relaxation.
 
+use chrono::{Duration, Local, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use guardian_daemon::config::{guardian_dir, load_config};
 use guardian_daemon::zeno::{self, apply_zeno, ZenoState};
@@ -16,12 +17,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Snooze beforeSubmitPrompt gates until N minutes from now (default 15).
+    /// Snooze Guardian hooks across clients (default 15 minutes).
     Snooze {
-        #[arg(default_value_t = 15)]
+        #[arg(default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..))]
         minutes: u32,
     },
-    /// Allow the next gated submit once (same as touching ~/.guardian/proceed_once).
+    /// Allow the next prompt that Guardian would pause.
     Once,
     /// Remove snooze immediately.
     ClearSnooze,
@@ -45,61 +46,40 @@ enum ZenoAction {
 }
 
 fn write_snooze_minutes(minutes: u32) -> Result<(), std::io::Error> {
-    let ts = compute_snooze_iso(minutes)?;
+    let expiry = Utc::now() + Duration::minutes(i64::from(minutes));
+    let ts = expiry.to_rfc3339_opts(SecondsFormat::Secs, true);
     let dir = guardian_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("snooze_until"), format!("{ts}\n"))?;
-    println!("Guardian snoozed until {ts} (UTC)");
+    let tmp = dir.join(format!("snooze_until.{}.tmp", std::process::id()));
+    let result = std::fs::write(&tmp, format!("{ts}\n"))
+        .and_then(|()| std::fs::rename(&tmp, dir.join("snooze_until")));
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result?;
+    println!(
+        "Guardian snoozed until {}.",
+        expiry.with_timezone(&Local).format("%H:%M %Z")
+    );
     Ok(())
-}
-
-fn compute_snooze_iso(minutes: u32) -> Result<String, std::io::Error> {
-    // Prefer BSD date (macOS), then GNU date.
-    let bsd = std::process::Command::new("date")
-        .args(["-u", "-v", &format!("+{minutes}M"), "+%Y-%m-%dT%H:%M:%SZ"])
-        .output();
-    if let Ok(out) = &bsd {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let line = s.lines().next().unwrap_or("").trim();
-            if !line.is_empty() {
-                return Ok(line.to_string());
-            }
-        }
-    }
-    let gnu = std::process::Command::new("date")
-        .args([
-            "-u",
-            "-d",
-            &format!("+{minutes} minutes"),
-            "+%Y-%m-%dT%H:%M:%SZ",
-        ])
-        .output()?;
-    if gnu.status.success() {
-        let s = String::from_utf8_lossy(&gnu.stdout);
-        let line = s.lines().next().unwrap_or("").trim();
-        if !line.is_empty() {
-            return Ok(line.to_string());
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "could not compute snooze time (need BSD or GNU date)",
-    ))
 }
 
 fn touch_proceed_once() -> Result<(), std::io::Error> {
     let p = guardian_dir().join("proceed_once");
     std::fs::create_dir_all(guardian_dir())?;
     std::fs::File::create(&p)?;
-    println!("Created {} — your next gated submit will consume this.", p.display());
+    println!("Guardian will allow the next prompt it would pause.");
     Ok(())
 }
 
 fn clear_snooze() -> Result<(), std::io::Error> {
     let p = guardian_dir().join("snooze_until");
-    let _ = std::fs::remove_file(p);
-    println!("Cleared snooze.");
+    match std::fs::remove_file(p) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    println!("Guardian resumed.");
     Ok(())
 }
 

@@ -74,8 +74,12 @@ is_daemon_active() {
     fi
 
     # No timestamp means we cannot tell how old the sample is: treat it as not live.
-    local sampled_at
-    sampled_at=$(jq -r 'try (.sampled_at // "" | tostring) catch ""' < "$STATE_FILE" 2>/dev/null) || sampled_at=""
+    local sampled_at timestamp_filter='try (.sampled_at // "" | tostring) catch ""'
+    if [ "$#" -gt 0 ]; then
+        sampled_at=$(printf '%s' "$1" | jq -r "$timestamp_filter" 2>/dev/null) || return 1
+    else
+        sampled_at=$(jq -r "$timestamp_filter" < "$STATE_FILE" 2>/dev/null) || return 1
+    fi
     if [ -z "$sampled_at" ]; then
         return 1
     fi
@@ -151,8 +155,7 @@ read_state_reasons_suffix() {
     if [ ! -f "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
         return 0
     fi
-    local reasons
-    reasons=$(jq -r 'try (
+    local reasons filter='try (
         (.pressure_reasons // [])
         | if type == "array" then (
               map(select(type == "string")) | .[0:4] | join("; ")
@@ -160,7 +163,12 @@ read_state_reasons_suffix() {
               # keep it one plain line.
               | gsub("[[:cntrl:]]"; " ") | .[0:200] | sub("[. ]+$"; "")
           ) else "" end
-    ) catch ""' < "$STATE_FILE" 2>/dev/null) || reasons=""
+    ) catch ""'
+    if [ "$#" -gt 0 ]; then
+        reasons=$(jq -r "$filter" <<< "$1" 2>/dev/null) || reasons=""
+    else
+        reasons=$(jq -r "$filter" < "$STATE_FILE" 2>/dev/null) || reasons=""
+    fi
     if [ -n "$reasons" ]; then
         printf ' Why: %s.' "$reasons"
     fi
@@ -297,74 +305,15 @@ guardian_snooze_active() {
     [ "$now_epoch" -lt "$until_epoch" ]
 }
 
-# Removes ~/.guardian/proceed_once if present; returns 0 if consumed.
+# Only the hook that removes the marker gets the bypass.
 guardian_consume_proceed_once() {
-    local f="$GUARDIAN_DIR/proceed_once"
-    if [ -f "$f" ]; then
-        rm -f "$f"
-        return 0
-    fi
-    return 1
+    rm "$GUARDIAN_DIR/proceed_once" 2>/dev/null
 }
 
 guardian_resume_hint_text() {
-    local D="${GUARDIAN_DIR:-$HOME/.guardian}"
-    case "${GUARDIAN_HOOK_FORMAT:-cursor}" in
-        claude|codex)
-            # No Guardian slash commands outside Cursor — point at the CLI.
-            printf '%s' "Unblock from a terminal: ${D}/guardian snooze 15 (or: ${D}/guardian once), then send again."$'\n'"Also: ${D}/guardian zeno bump · touch ${D}/proceed_once"
-            ;;
-        *)
-            # ~/.cursor/commands → /guardian-snooze etc. (install-hooks.sh). See hooks/resources.md.
-            printf '%s' "Unblock: /guardian-snooze · /guardian-once"$'\n'"${D}/guardian snooze 15 · once · zeno bump · touch ${D}/proceed_once"
-            ;;
-    esac
-}
-
-# Advisory text while submits are still allowed — snooze in the agent UI before a hard block (beforeSubmit pass_msg).
-# Args: pressure block_on block_on_session_budget cursor_mb max_cursor_rss_megabytes
-guardian_preempt_snooze_hint() {
-    local pressure="${1:-clear}"
-    local block_on="${2:-critical}"
-    local block_sess="${3:-false}"
-    local cursor_mb="${4:-0}"
-    local max_rss="${5:-8192}"
-    local D="${GUARDIAN_DIR:-$HOME/.guardian}"
-    local cm mx thr line1="" line2=""
-
-    cm="${cursor_mb%%.*}"
-    mx="${max_rss%%.*}"
-    if [ "${mx:-0}" -le 0 ] 2>/dev/null; then
-        mx=8192
-    fi
-
-    if [ "$pressure" = "strained" ] && [ "$block_on" = "critical" ]; then
-        case "${GUARDIAN_HOOK_FORMAT:-cursor}" in
-            claude|codex)
-                line1="Guardian: Strained load — prompts still go through until it hits critical. Prefer serial work; avoid subagents and heavy containers. (User can snooze gates: ${D}/guardian snooze 15.)"
-                ;;
-            *)
-                line1="Guardian: Strained load — you can still send until it hits critical. Snooze gates now: /guardian-snooze or ${D}/guardian snooze 15."
-                ;;
-        esac
-    fi
-
-    if [ "$block_sess" = "true" ] && [ "$pressure" != "clear" ] 2>/dev/null \
-        && [ "${mx:-0}" -gt 0 ] 2>/dev/null && [ "${cm:-0}" -gt 0 ] 2>/dev/null \
-        && [ "${cm:-0}" -le "${mx:-0}" ] 2>/dev/null; then
-        thr=$(( mx * 80 / 100 ))
-        if [ "${cm:-0}" -ge "${thr:-0}" ] 2>/dev/null; then
-            line2="Guardian: Cursor RAM is near your cap (${cursor_mb}/${mx} MB). Snooze before a block: /guardian-snooze."
-        fi
-    fi
-
-    if [ -n "$line1" ] && [ -n "$line2" ]; then
-        printf '%s\n%s' "$line1" "$line2"
-    elif [ -n "$line1" ]; then
-        printf '%s' "$line1"
-    elif [ -n "$line2" ]; then
-        printf '%s' "$line2"
-    fi
+    local cli
+    printf -v cli '%q' "${GUARDIAN_DIR}/guardian"
+    printf 'Use the Guardian menu bar or run %s once (one prompt) or %s snooze 15, then resend.' "$cli" "$cli"
 }
 
 # Path to guardian-queue CLI (installed to ~/.guardian by hooks/install-hooks.sh).

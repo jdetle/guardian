@@ -1,5 +1,5 @@
 #!/bin/bash
-# Claude Code UserPromptSubmit — prompt gate (blocks new prompts at critical load).
+# Claude Code UserPromptSubmit — shared Guardian prompt gate.
 # Claude Code and Codex share one hook protocol; the implementation lives in ../codex/.
 set -euo pipefail
 export GUARDIAN_HOOK_FORMAT=claude

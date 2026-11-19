@@ -111,9 +111,16 @@ kill_enabled = false
 # Prompt / session gates (also written to ~/.guardian/hook_policy.json by guardiand)
 [prompt_gate]
 enabled = true
+# adaptive | advisory | strict
+mode = "adaptive"
+# Pressure and Cursor RSS opt-ins for strict mode
 block_on = "critical"
-# When true, block if Cursor RSS exceeds [session_budget] max while pressure is strained/critical
 block_on_session_budget = false
+
+[prompt_gate.clients]
+# cursor = "adaptive"
+# claude = "advisory"
+# codex = "adaptive"
 
 # Tool-call gate (Cursor preToolUse, Claude Code / Codex PreToolUse). Advisory by default.
 [tool_gate]
