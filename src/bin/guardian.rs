@@ -2,9 +2,14 @@
 
 use chrono::{Duration, Local, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
-use guardian_daemon::config::{guardian_dir, load_config};
+use guardian_daemon::config::{
+    config_path, guardian_dir, load_config, load_config_report, ConfigSource,
+};
 use guardian_daemon::stats::PressureStats;
 use guardian_daemon::zeno::{self, apply_zeno, ZenoState};
+
+/// Longest snooze the hooks honor (`GUARDIAN_MAX_SNOOZE_SECS` in hooks/lib.sh).
+const MAX_SNOOZE_MINUTES: u32 = 120;
 
 #[derive(Parser)]
 #[command(name = "guardian", version)]
@@ -18,12 +23,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Snooze Guardian hooks across clients (default 15 minutes).
+    /// Snooze Guardian hooks across clients (default 15 minutes, at most 120).
+    /// To switch a gate off for longer, set it in config.toml where it stays visible.
     Snooze {
-        #[arg(default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..))]
+        #[arg(default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_SNOOZE_MINUTES)))]
         minutes: u32,
     },
-    /// Allow the next prompt that Guardian would pause.
+    /// Allow the next prompt that Guardian would pause (expires after 10 minutes).
     Once,
     /// Remove snooze immediately.
     ClearSnooze,
@@ -32,12 +38,24 @@ enum Commands {
         #[command(subcommand)]
         action: ZenoAction,
     },
+    /// Inspect ~/.guardian/config.toml.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Show how much time was spent at each pressure level, per day.
     Stats {
         /// How many of the most recent days to show.
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=30))]
         days: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Report syntax errors, misspelled settings and values that cannot work.
+    /// Exits non-zero if anything needs fixing.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -74,8 +92,11 @@ fn write_snooze_minutes(minutes: u32) -> Result<(), std::io::Error> {
 fn touch_proceed_once() -> Result<(), std::io::Error> {
     let p = guardian_dir().join("proceed_once");
     std::fs::create_dir_all(guardian_dir())?;
+    // Made afresh so the token's age starts now: truncating an existing empty file is not
+    // guaranteed to move its modification time, and the hooks expire the token by age.
+    let _ = std::fs::remove_file(&p);
     std::fs::File::create(&p)?;
-    println!("Guardian will allow the next prompt it would pause.");
+    println!("Guardian will allow the next prompt it would pause, for the next 10 minutes.");
     Ok(())
 }
 
@@ -88,6 +109,35 @@ fn clear_snooze() -> Result<(), std::io::Error> {
     }
     println!("Guardian resumed.");
     Ok(())
+}
+
+fn check_config() -> Result<(), String> {
+    let path = config_path();
+    let report = load_config_report();
+    match report.source {
+        ConfigSource::Missing => {
+            println!("{}: not present — built-in defaults are in use.", path.display());
+            return Ok(());
+        }
+        ConfigSource::File if report.problems.is_empty() => {
+            println!("{}: OK", path.display());
+            println!("guardiand applies edits within a few seconds; no restart needed.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    println!("{}:", path.display());
+    for problem in &report.problems {
+        println!("  - {problem}");
+    }
+    Err(match report.source {
+        ConfigSource::File => {
+            "The rest of the file is in force; the settings above are not doing what they say."
+                .to_string()
+        }
+        _ => "Fix the file; guardiand keeps its previous settings until it parses.".to_string(),
+    })
 }
 
 fn main() {
@@ -103,6 +153,9 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Snooze { minutes } => write_snooze_minutes(minutes).map_err(|e| e.to_string()),
         Commands::Once => touch_proceed_once().map_err(|e| e.to_string()),
         Commands::ClearSnooze => clear_snooze().map_err(|e| e.to_string()),
+        Commands::Config {
+            action: ConfigAction::Check,
+        } => check_config(),
         Commands::Stats { days } => {
             print!("{}", PressureStats::load().render(days as usize));
             Ok(())
@@ -193,7 +246,17 @@ mod tests {
     }
 
     #[test]
-    fn stats_parse() {
+    fn snooze_is_capped() {
+        assert!(parses(&["guardian", "snooze"]));
+        assert!(parses(&["guardian", "snooze", "120"]));
+        assert!(!parses(&["guardian", "snooze", "121"]));
+        assert!(!parses(&["guardian", "snooze", "0"]));
+        assert!(!parses(&["guardian", "snooze", "999999"]));
+    }
+
+    #[test]
+    fn config_check_and_stats_parse() {
+        assert!(parses(&["guardian", "config", "check"]));
         assert!(parses(&["guardian", "stats", "--days", "30"]));
         assert!(!parses(&["guardian", "stats", "--days", "0"]));
     }

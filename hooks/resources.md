@@ -23,4 +23,4 @@ Short checklist (also surfaced by hooks when load is high):
 - **macOS:** `~/.guardian/Guardian-*.command` or `open ~/.guardian/Guardian-Snooze-15m.command`.
 - **Claude Code:** [docs/claude-code.md](../docs/claude-code.md) — `install-claude-hooks.sh`; no slash commands, run `~/.guardian/guardian snooze 15` (or `once`) in a terminal, then send again.
 - **Codex:** [docs/codex.md](../docs/codex.md) — `install-codex-hooks.sh`, then trust the hooks once (`/hooks` in the CLI, Settings > Hooks in the app); no slash commands, use CLI / `.command`.
-- **Manual:** `touch ~/.guardian/proceed_once` · ISO in `~/.guardian/snooze_until` · `bash scripts/guardian-resume.sh snooze 15`.
+- **Manual:** `touch ~/.guardian/proceed_once` (good for 10 minutes) · ISO in `~/.guardian/snooze_until` · `bash scripts/guardian-resume.sh snooze 15`.

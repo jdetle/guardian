@@ -12,6 +12,10 @@ pub struct GuardianState {
     pub pressure: PressureLevel,
     /// Plain-language causes of the current sample's level (empty when clear).
     pub pressure_reasons: Vec<String>,
+    /// Problems with `config.toml` the user should fix (see `guardian config check`).
+    /// Absent when the file is clean.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub config_problems: Vec<String>,
     pub cpu_percent: f64,
     pub memory_available_gb: f64,
     pub memory_total_gb: f64,

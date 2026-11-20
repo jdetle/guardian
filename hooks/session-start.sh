@@ -141,6 +141,21 @@ case "$disk_level" in
         ;;
 esac
 
+# Overrides in force, so a forgotten snooze or allow-once is never silent.
+snooze_left=$(guardian_snooze_remaining_secs)
+if [ "${snooze_left:-0}" -gt 0 ] 2>/dev/null; then
+    context="${context} Snoozed for about $(( (snooze_left + 59) / 60 )) more min: pressure gates and subagent limits are off until then (end it: ${G_home}/guardian clear-snooze)."
+fi
+if guardian_proceed_once_armed; then
+    context="${context} Allow-once is armed: the next prompt Guardian would pause goes through."
+fi
+
+# A config.toml the daemon could not apply as written must not go unnoticed.
+config_problems=$(read_state_config_problems)
+if [ -n "$config_problems" ]; then
+    context="${context} Config problem: ${config_problems}. Run: ${G_home}/guardian config check"
+fi
+
 queue_file="${GUARDIAN_DIR:-$HOME/.guardian}/agent_queue.jsonl"
 if [ -f "$queue_file" ]; then
     qc=$(grep -c '^{' "$queue_file" 2>/dev/null || echo 0)

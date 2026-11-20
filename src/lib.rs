@@ -12,7 +12,7 @@ mod validation;
 pub mod zeno;
 
 use classifier::{classify_with_band, ClassifierInput, PressureLevel};
-use config::{load_config, GuardianConfig};
+use config::{load_config_report, parse_config, ConfigSource, GuardianConfig};
 use hook_policy::write_hook_policy;
 use docker::stats::DockerClient;
 use sampler::cpu::{cpu_usage_percent, CpuSnapshot};
@@ -24,7 +24,7 @@ use sampler::thermal::ThermalState;
 use state::{AgentsState, CursorState, DiskState, DockerState, GuardianState, write_state};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -157,7 +157,8 @@ pub fn run_daemon() {
     cap_daemon_log();
     eprintln!("[guardiand] starting (pid {})", std::process::id());
 
-    let config = load_config();
+    let mut watcher = ConfigWatcher::start();
+    let config = watcher.config.clone();
     let initial_steps = crate::zeno::load_zeno_steps();
     let merged = crate::zeno::apply_zeno(&config, initial_steps);
     eprintln!(
@@ -168,6 +169,9 @@ pub fn run_daemon() {
         config.hysteresis.deescalate_secs,
         config.hysteresis.band()
     );
+    for problem in &watcher.problems {
+        eprintln!("[guardiand] config problem: {problem}");
+    }
 
     if let Err(e) = write_hook_policy(&merged) {
         eprintln!("[guardiand] warning: could not write hook_policy.json: {e}");
@@ -184,7 +188,7 @@ pub fn run_daemon() {
         libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
     }
 
-    run_loop(&config, initial_steps);
+    run_loop(&mut watcher, initial_steps);
 
     write_shutdown_state();
     eprintln!("[guardiand] shutdown complete");
@@ -207,8 +211,129 @@ fn docker_client_for(config: &GuardianConfig) -> Option<DockerClient> {
     }
 }
 
-fn run_loop(config: &GuardianConfig, mut last_hook_steps: u32) {
-    let docker_client = docker_client_for(config);
+/// The settings in force, kept in step with `config.toml` while the daemon runs.
+///
+/// An edit is picked up within a couple of samples — no restart. A file that no longer parses is
+/// reported and **not applied**: the settings already in force stay, so a typo can never swap
+/// the user's thresholds for the built-in defaults mid-session.
+struct ConfigWatcher {
+    config: GuardianConfig,
+    /// What to tell the user about their config (published in `state.json`).
+    problems: Vec<String>,
+    /// Identity of the file version last examined: modification time and length.
+    seen: Option<(SystemTime, u64)>,
+    /// A changed version waiting to be confirmed: it is read once the file has looked the
+    /// same on two samples in a row, so an editor that truncates and then writes is never
+    /// caught halfway (an empty file parses, and means "all defaults").
+    pending: Option<Option<(SystemTime, u64)>>,
+    /// The file being watched (`~/.guardian/config.toml`).
+    path: std::path::PathBuf,
+    /// Where a copy of each version that parses is kept.
+    last_good: std::path::PathBuf,
+}
+
+impl ConfigWatcher {
+    fn fingerprint(path: &std::path::Path) -> Option<(SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    fn start() -> Self {
+        let path = config::config_path();
+        let last_good = config::last_good_path();
+        let seen = Self::fingerprint(&path);
+        let loaded = load_config_report();
+        if loaded.source == ConfigSource::File {
+            // Keep a copy to fall back to if a later edit breaks the file.
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if parse_config(&text).is_ok() {
+                    if let Err(e) = config::remember_last_good(&last_good, &text) {
+                        eprintln!("[guardiand] could not save config.last_good.toml: {e}");
+                    }
+                }
+            }
+        }
+        Self {
+            config: loaded.config,
+            problems: loaded.problems,
+            seen,
+            pending: None,
+            path,
+            last_good,
+        }
+    }
+
+    /// Re-read `config.toml` if it changed. Returns true when new settings are in force.
+    fn poll(&mut self) -> bool {
+        let now = Self::fingerprint(&self.path);
+        if now == self.seen {
+            self.pending = None;
+            return false;
+        }
+        if self.pending != Some(now) {
+            self.pending = Some(now);
+            return false;
+        }
+        self.pending = None;
+        self.seen = now;
+
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => {
+                let applied = self.apply_text(&text);
+                if applied {
+                    if let Err(e) = config::remember_last_good(&self.last_good, &text) {
+                        eprintln!("[guardiand] could not save config.last_good.toml: {e}");
+                    }
+                }
+                applied
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("[guardiand] config.toml removed — using built-in defaults");
+                self.config = GuardianConfig::default();
+                self.problems.clear();
+                true
+            }
+            Err(e) => {
+                // Not remembered as seen: a permissions fix changes neither the file's time
+                // nor its length, so the read is tried again.
+                self.seen = None;
+                self.reject(format!("config.toml could not be read ({e})"));
+                false
+            }
+        }
+    }
+
+    /// Apply new `config.toml` text. No file access, so this is what the tests exercise.
+    fn apply_text(&mut self, text: &str) -> bool {
+        match parse_config(text) {
+            Ok((config, problems)) => {
+                eprintln!("[guardiand] config.toml changed — new settings in force");
+                for problem in &problems {
+                    eprintln!("[guardiand] config problem: {problem}");
+                }
+                self.config = config;
+                self.problems = problems;
+                true
+            }
+            Err(e) => {
+                self.reject(format!("config.toml has an error ({e})"));
+                false
+            }
+        }
+    }
+
+    fn reject(&mut self, what: String) {
+        let problem =
+            format!("{what}; the change was not applied and the previous settings stay in force");
+        if self.problems.first() != Some(&problem) {
+            eprintln!("[guardiand] config problem: {problem}");
+        }
+        self.problems = vec![problem];
+    }
+}
+
+fn run_loop(watcher: &mut ConfigWatcher, mut last_hook_steps: u32) {
+    let mut docker_client = docker_client_for(&watcher.config);
     let mut prev_cpu = CpuSnapshot::sample().unwrap_or_default();
     let mut prev_pressure = PressureLevel::Clear;
     let mut docker_throttled = false;
@@ -220,8 +345,14 @@ fn run_loop(config: &GuardianConfig, mut last_hook_steps: u32) {
     let mut last_tick = Instant::now();
 
     loop {
-        thread::sleep(Duration::from_secs(config.sample_interval()));
+        thread::sleep(Duration::from_secs(watcher.config.sample_interval()));
 
+        // Pick up config.toml edits without a restart.
+        let config_changed = watcher.poll();
+        if config_changed {
+            docker_client = docker_client_for(&watcher.config);
+        }
+        let config = &watcher.config;
         let escalate_samples = config.hysteresis.escalate();
         let deescalate_samples = config
             .hysteresis
@@ -282,7 +413,7 @@ fn run_loop(config: &GuardianConfig, mut last_hook_steps: u32) {
 
         let steps = crate::zeno::load_zeno_steps();
         let merged = crate::zeno::apply_zeno(config, steps);
-        if steps != last_hook_steps {
+        if steps != last_hook_steps || config_changed {
             if let Err(e) = write_hook_policy(&merged) {
                 eprintln!("[guardiand] warning: could not write hook_policy.json: {e}");
             }
@@ -370,6 +501,7 @@ fn run_loop(config: &GuardianConfig, mut last_hook_steps: u32) {
         let guardian_state = GuardianState {
             pressure,
             pressure_reasons: held_reasons.clone(),
+            config_problems: watcher.problems.clone(),
             cpu_percent: (cpu_pct * 10.0).round() / 10.0,
             memory_available_gb: (mem_available_gb * 100.0).round() / 100.0,
             memory_total_gb: (mem_total_gb * 100.0).round() / 100.0,
@@ -413,6 +545,7 @@ fn write_shutdown_state() {
     let shutdown_state = GuardianState {
         pressure: PressureLevel::Clear,
         pressure_reasons: Vec::new(),
+        config_problems: Vec::new(),
         cpu_percent: 0.0,
         memory_available_gb: 0.0,
         memory_total_gb: 0.0,
@@ -823,6 +956,108 @@ mod tests {
     fn hysteresis_zero_sample_counts_behave_as_one() {
         assert_eq!(run(Clear, &[Critical], 0, 0), vec![Critical]);
         assert_eq!(run(Critical, &[Clear], 0, 0), vec![Clear]);
+    }
+
+    // --- config watcher tests ---
+
+    fn watcher() -> ConfigWatcher {
+        watcher_in(&std::env::temp_dir().join("guardian-watcher-unused"))
+    }
+
+    /// A watcher over `dir/config.toml`; nothing under ~/.guardian is touched.
+    fn watcher_in(dir: &std::path::Path) -> ConfigWatcher {
+        ConfigWatcher {
+            config: GuardianConfig::default(),
+            problems: Vec::new(),
+            seen: None,
+            pending: None,
+            path: dir.join("config.toml"),
+            last_good: dir.join("config.last_good.toml"),
+        }
+    }
+
+    #[test]
+    fn edits_on_disk_are_picked_up_and_broken_ones_are_not() {
+        let dir = std::env::temp_dir().join(format!("guardian-watcher-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut w = watcher_in(&dir);
+
+        // No file yet: nothing to do, and asking twice changes nothing.
+        assert!(!w.poll());
+        assert!(!w.poll());
+
+        std::fs::write(&w.path, "[thresholds]\ncritical_cpu_percent = 97.0\n").unwrap();
+        assert!(!w.poll(), "a change is applied only once it has settled");
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 90.0);
+        assert!(w.poll());
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 97.0);
+        assert!(!w.poll(), "an unchanged file is not re-applied");
+        let saved = std::fs::read_to_string(&w.last_good).unwrap();
+        assert!(saved.contains("97.0"));
+
+        // A typo mid-edit (different length, so the change is seen whatever the clock does).
+        std::fs::write(&w.path, "[thresholds\ncritical_cpu_percent = 12.0\n# oops\n").unwrap();
+        assert!(!w.poll());
+        assert!(w.problems.is_empty(), "not read until it has settled");
+        assert!(!w.poll());
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 97.0);
+        assert_eq!(w.problems.len(), 1);
+        // The last good copy still holds the version that worked.
+        assert!(std::fs::read_to_string(&w.last_good).unwrap().contains("97.0"));
+
+        // Fixed.
+        std::fs::write(&w.path, "[thresholds]\ncritical_cpu_percent = 96.5\n# fixed now\n").unwrap();
+        assert!(!w.poll());
+        assert!(w.poll());
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 96.5);
+        assert!(w.problems.is_empty());
+
+        // Removed: defaults, which is the same as never having had a file.
+        std::fs::remove_file(&w.path).unwrap();
+        assert!(!w.poll());
+        assert!(w.poll());
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 90.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_edit_is_applied() {
+        let mut w = watcher();
+        assert!(w.apply_text("[thresholds]\ncritical_cpu_percent = 97.0\n"));
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 97.0);
+        assert!(w.problems.is_empty());
+    }
+
+    #[test]
+    fn broken_edit_keeps_the_settings_in_force() {
+        let mut w = watcher();
+        assert!(w.apply_text("[thresholds]\ncritical_cpu_percent = 97.0\n"));
+        // A typo while editing: not TOML any more.
+        assert!(!w.apply_text("[thresholds\ncritical_cpu_percent = 12.0\n"));
+        assert_eq!(w.config.thresholds.critical_cpu_percent, 97.0);
+        assert_eq!(w.problems.len(), 1);
+        assert!(w.problems[0].contains("previous settings stay in force"), "{:?}", w.problems);
+    }
+
+    #[test]
+    fn fixing_the_file_clears_the_problem() {
+        let mut w = watcher();
+        assert!(!w.apply_text("not toml at all ]["));
+        assert_eq!(w.problems.len(), 1);
+        assert!(w.apply_text("sample_interval_secs = 3\n"));
+        assert!(w.problems.is_empty());
+        assert_eq!(w.config.sample_interval(), 3);
+    }
+
+    #[test]
+    fn warnings_are_published_but_the_edit_still_applies() {
+        let mut w = watcher();
+        assert!(w.apply_text("[hysteresis]\nexit_bnad = 0.3\ndeescalate_secs = 45\n"));
+        assert_eq!(w.config.hysteresis.deescalate_secs, 45);
+        assert_eq!(w.problems.len(), 1);
+        assert!(w.problems[0].contains("exit_bnad"), "{:?}", w.problems);
     }
 
     // --- held reasons tests ---

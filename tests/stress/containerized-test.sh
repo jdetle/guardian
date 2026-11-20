@@ -335,6 +335,32 @@ else
     fail "beforeSubmit: proceed_once should allow (got $result)"
 fi
 
+# An allow-once token that was armed and never needed must expire, not wave through a
+# block days later.
+touch -t 202001010000 "$GUARDIAN_DIR/proceed_once"
+fresh_state critical 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(guardian_json_continue "$result")
+if [ "$cont" = "false" ] && [ ! -e "$GUARDIAN_DIR/proceed_once" ]; then
+    pass "beforeSubmit: expired proceed_once grants nothing and is removed"
+else
+    fail "beforeSubmit: expired proceed_once should block and be removed (got $result)"
+fi
+rm -f "$GUARDIAN_DIR/proceed_once"
+
+# A snooze further out than the 2-hour cap is ignored.
+date -u -d '+500 minutes' +"%Y-%m-%dT%H:%M:%SZ" >"$GUARDIAN_DIR/snooze_until" 2>/dev/null \
+    || date -u -v+500M +"%Y-%m-%dT%H:%M:%SZ" >"$GUARDIAN_DIR/snooze_until"
+fresh_state critical 2 >"$STATE_FILE"
+result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
+cont=$(guardian_json_continue "$result")
+rm -f "$GUARDIAN_DIR/snooze_until"
+if [ "$cont" = "false" ]; then
+    pass "beforeSubmit: snooze beyond the cap is ignored"
+else
+    fail "beforeSubmit: over-long snooze should not lift the gate (got $result)"
+fi
+
 fresh_state clear 2 >"$STATE_FILE"
 result=$(echo '{}' | bash "$HOOKS_DIR/before-submit-prompt.sh" 2>/dev/null)
 cont=$(guardian_json_continue "$result")

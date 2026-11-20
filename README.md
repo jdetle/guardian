@@ -108,13 +108,13 @@ Tool hooks are advisory by default. To hard-stop subagent fan-out when the machi
 deny_subagents_on = "critical"   # "never" (default) | "strained" | "critical"
 ```
 
-Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_agent`). Shell commands are never denied; a snooze lifts the deny. Restart `guardiand` after editing.
+Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_agent`). Shell commands are never denied; a snooze lifts the deny.
 
 ### Prompt gates and resume
 
 The default `adaptive` mode pauses a prompt only when a fresh sample shows critical pressure with critical macOS memory pressure or serious thermal pressure, and the prompt explicitly requests heavy local work. Examples include “Run the full test suite” and “Rebuild all Docker containers.” Questions, ordinary edits, ambiguous requests, and low available RAM alone pass through. The estimate uses local text rules and can miss heavy work implied by prior context.
 
-Set a default or override individual clients in `~/.guardian/config.toml`, then restart `guardiand`.
+Set a default or override individual clients in `~/.guardian/config.toml`.
 
 ```toml
 [prompt_gate]
@@ -134,10 +134,10 @@ codex = "adaptive"
 
 Existing configurations without a mode pick up the adaptive default when the hooks are updated. Set `mode = "strict"` to keep pressure-only blocking.
 
-Use the **Guardian menu bar** to snooze for 5, 15, 30, or 60 minutes, see when snooze ends, or resume early. **Allow once** stays armed until a prompt would otherwise be paused. Snooze and Allow once are shared across Cursor, Claude Code, and Codex.
+Use the **Guardian menu bar** to snooze for 5, 15, 30, or 60 minutes, see when snooze ends, or resume early. **Allow once** stays armed for 10 minutes or until a prompt would otherwise be paused, whichever comes first. A new session is told when a snooze or allow-once is in force. Snooze and Allow once are shared across Cursor, Claude Code, and Codex.
 
-- `~/.guardian/guardian once` allows one paused prompt. Resend it afterward.
-- `~/.guardian/guardian snooze 15` snoozes hooks for 15 minutes.
+- `~/.guardian/guardian once` allows one paused prompt, within the next 10 minutes. Resend it afterward. An unused token expires instead of waiting for some later block.
+- `~/.guardian/guardian snooze 15` snoozes hooks for 15 minutes (120 at most; hooks ignore a `snooze_until` further out than that). To switch a gate off for longer, set it in `config.toml`, where it stays visible.
 - `~/.guardian/guardian clear-snooze` resumes hooks immediately.
 - `~/.guardian/guardian stats` shows the share of time spent at each pressure level per day.
 
@@ -176,7 +176,13 @@ Shipped patterns live in `hooks/cursorignore-checklist.json`. Per-repo exception
 
 Edit `~/.guardian/config.toml` (see `scripts/install.sh` for a full default including `[prompt_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]`).
 
-**Restart `guardiand` after changing `config.toml`** (for example re-run `bash scripts/install.sh`, or `launchctl unload` / `launchctl load` on `~/Library/LaunchAgents/com.guardian.guardiand.plist`). The daemon writes **`~/.guardian/hook_policy.json` at startup** from config; until it restarts, shell hooks keep using the previous snapshot, so prompt gates and cursorignore policy flags may not match your new thresholds or `[prompt_gate]` / `[session_budget]` / `[disk]` / `[queue]` / `[cursorignore_policy]` sections.
+**Edits to `config.toml` take effect within a few seconds; no restart.** `guardiand` re-reads the file once it has stopped changing and rewrites `~/.guardian/hook_policy.json` for the shell hooks.
+
+A file that no longer parses is **not applied**: the settings already in force stay, and at startup the daemon falls back to the last version that parsed (`~/.guardian/config.last_good.toml`) rather than to built-in defaults. Misspelled settings and values that cannot work (an unknown mode word, thresholds the wrong way round) are reported instead of silently ignored. Problems appear in `state.json` → `config_problems`, in the next session's start message, and in:
+
+```bash
+~/.guardian/guardian config check     # exits non-zero if anything needs fixing
+```
 
 Optional memory **ratio** thresholds (inside `[thresholds]`):
 
