@@ -65,24 +65,42 @@ guardian_tool_gate_eval() {
 }
 
 # Rate limit for advisories on agents that append hook context to the transcript (Claude Code,
-# Codex): repeat the same pressure level at most once per interval per session.
+# Codex). Each one costs context tokens, so a session hears about load when it first appears,
+# when it gets worse than anything already reported in the current interval, and otherwise at
+# most once per interval. A level that drops, or that flips back and forth, stays quiet.
 # Args: session_id level. Returns 0 when the advisory should be emitted now.
-GUARDIAN_ADVISE_INTERVAL_SECS="${GUARDIAN_ADVISE_INTERVAL_SECS:-120}"
+GUARDIAN_ADVISE_INTERVAL_SECS="${GUARDIAN_ADVISE_INTERVAL_SECS:-600}"
+
+guardian_pressure_rank() {
+    case "$1" in
+        critical) echo 2 ;;
+        strained) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
 
 guardian_advise_due() {
-    local sid level="$2" dir f now prev_level="" prev_epoch=""
+    local sid level="$2" dir f now prev_level="" prev_epoch="" interval
     sid=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9_-' | head -c 64)
     [ -n "$sid" ] || sid="nosession"
     dir="$GUARDIAN_DIR/advise"
     f="$dir/$sid"
     now=$(date -u +%s)
+    interval="$GUARDIAN_ADVISE_INTERVAL_SECS"
+    case "$interval" in
+        ''|*[!0-9]*) interval=600 ;;
+    esac
 
     if [ -f "$f" ] && [ ! -L "$f" ]; then
         read -r prev_level prev_epoch < "$f" 2>/dev/null || true
         case "$prev_epoch" in
             ''|*[!0-9]*) prev_epoch=0 ;;
         esac
-        if [ "$prev_level" = "$level" ] && [ $(( now - prev_epoch )) -lt "$GUARDIAN_ADVISE_INTERVAL_SECS" ]; then
+        # The stamp holds the worst level reported in this interval and when it was reported.
+        # It is left untouched while advisories are suppressed, so critical -> strained ->
+        # critical inside one interval is reported once.
+        if [ $(( now - prev_epoch )) -lt "$interval" ] && [ "$prev_epoch" -le "$now" ] \
+            && [ "$(guardian_pressure_rank "$level")" -le "$(guardian_pressure_rank "$prev_level")" ]; then
             return 1
         fi
     fi

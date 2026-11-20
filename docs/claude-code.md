@@ -69,7 +69,7 @@ Then send again. macOS double-click helpers (`~/.guardian/Guardian-*.command`) w
 | Config | `~/.cursor/hooks.json` | `~/.claude/settings.json` (`hooks` key) |
 | Prompt event | `beforeSubmitPrompt` | `UserPromptSubmit` |
 | Block shape | `continue: false`, `user_message` | `decision: "block"`, `reason` |
-| Tool advisory | `agent_message` on every call | `additionalContext`, rate limited |
+| Tool advisory | `agent_message` on every call | `additionalContext`, rate limited per session: when load first appears, when it gets worse, otherwise at most every 10 minutes (`GUARDIAN_ADVISE_INTERVAL_SECS`, default 600) |
 | Session id | `conversation_id` | `session_id` (stored in the same `sessions.db` column) |
 | Not ported | — | `beforeReadFile` (`.cursorignore` advisory), `postToolUse` / `stop` ROI tracking |
 

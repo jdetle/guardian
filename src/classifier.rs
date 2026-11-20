@@ -2,7 +2,8 @@ use crate::config::ThresholdConfig;
 use crate::sampler::memory::MemoryPressureLevel;
 use crate::sampler::thermal::ThermalState;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+// Variant order is severity order: `Clear < Strained < Critical`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PressureLevel {
     Clear,
@@ -56,14 +57,82 @@ pub fn classify(input: &ClassifierInput, cfg: &ThresholdConfig) -> PressureLevel
 /// reach `critical` when a second signal agrees; otherwise they count as `strained`:
 ///
 /// * **Swap used %** — macOS grows swap on demand, so "90% of the current swap file" is
-///   routinely reached moments before the file is enlarged. It is critical only if the kernel
-///   also reports memory pressure (warn or critical).
+///   routinely reached moments before the file is enlarged, and a small-RAM Mac sits near the
+///   top of its swap file all day while the kernel reports nothing worse than `warn`. It is
+///   critical only if the kernel itself reports *critical* memory pressure. (Before 0.8 a
+///   kernel `warn` was enough, which made swap hovering at the threshold flip the level
+///   dozens of times a day.)
 /// * **CPU %** — a compile pegs every core without endangering the machine. It is critical
 ///   only if the machine is also heating up (thermal fair or worse).
 ///
 /// When the corroborating signal is `Unknown` (not available on this machine) the old
 /// behavior applies: the noisy signal alone is enough.
 pub fn classify_with_reasons(input: &ClassifierInput, cfg: &ThresholdConfig) -> Classification {
+    evaluate(input, cfg).into_classification()
+}
+
+/// Classify one sample with an exit band around the numeric thresholds.
+///
+/// A level is *entered* at the configured thresholds but only *left* once the numbers have
+/// moved `band` (a fraction, e.g. `0.10`) past them — so a value hovering at a threshold holds
+/// its level instead of flipping on every sample. `held` is the level currently published.
+/// The kernel memory-pressure and thermal levels are discrete and have no band; the dwell time
+/// in the daemon loop covers those.
+pub fn classify_with_band(
+    input: &ClassifierInput,
+    cfg: &ThresholdConfig,
+    held: PressureLevel,
+    band: f64,
+) -> Classification {
+    let enter = evaluate(input, cfg);
+    let enter_level = enter.level();
+    if band.is_nan() || band <= 0.0 || enter_level >= held {
+        return enter.into_classification();
+    }
+
+    // Below the held level by the entry thresholds: is the sample still inside its exit band?
+    let exit = evaluate(input, &cfg.with_exit_band(band));
+    let level = enter_level.max(exit.level().min(held));
+    if level == enter_level {
+        return enter.into_classification();
+    }
+    let reasons = match level {
+        PressureLevel::Critical => exit.critical,
+        // Held at strained: everything still inside a band is a cause, whichever band it is.
+        _ => exit.critical.into_iter().chain(exit.strained).collect(),
+    };
+    Classification { level, reasons }
+}
+
+/// Causes found in one sample, split by the level each can establish.
+struct Evaluation {
+    critical: Vec<String>,
+    strained: Vec<String>,
+}
+
+impl Evaluation {
+    fn level(&self) -> PressureLevel {
+        if !self.critical.is_empty() {
+            PressureLevel::Critical
+        } else if !self.strained.is_empty() {
+            PressureLevel::Strained
+        } else {
+            PressureLevel::Clear
+        }
+    }
+
+    fn into_classification(self) -> Classification {
+        let level = self.level();
+        let reasons = match level {
+            PressureLevel::Critical => self.critical,
+            PressureLevel::Strained => self.strained,
+            PressureLevel::Clear => Vec::new(),
+        };
+        Classification { level, reasons }
+    }
+}
+
+fn evaluate(input: &ClassifierInput, cfg: &ThresholdConfig) -> Evaluation {
     let mut critical: Vec<String> = Vec::new();
     let mut strained: Vec<String> = Vec::new();
 
@@ -102,7 +171,7 @@ pub fn classify_with_reasons(input: &ClassifierInput, cfg: &ThresholdConfig) -> 
     let swap_corroborated = !cfg.corroborate_critical
         || matches!(
             input.memory_pressure,
-            MemoryPressureLevel::Unknown | MemoryPressureLevel::Warn | MemoryPressureLevel::Critical
+            MemoryPressureLevel::Unknown | MemoryPressureLevel::Critical
         );
     if input.swap_used_percent > cfg.critical_swap_percent {
         let reason = format!("swap {:.0}% used", input.swap_used_percent);
@@ -153,22 +222,7 @@ pub fn classify_with_reasons(input: &ClassifierInput, cfg: &ThresholdConfig) -> 
         ));
     }
 
-    if !critical.is_empty() {
-        Classification {
-            level: PressureLevel::Critical,
-            reasons: critical,
-        }
-    } else if !strained.is_empty() {
-        Classification {
-            level: PressureLevel::Strained,
-            reasons: strained,
-        }
-    } else {
-        Classification {
-            level: PressureLevel::Clear,
-            reasons: Vec::new(),
-        }
-    }
+    Evaluation { critical, strained }
 }
 
 #[cfg(test)]
@@ -400,11 +454,28 @@ mod tests {
     }
 
     #[test]
-    fn swap_plus_kernel_warn_is_critical() {
+    fn swap_plus_kernel_warn_is_only_strained() {
+        // An 8 GB Mac lives here all day: swap file nearly full, kernel says "warn".
         let mut input = nominal_input();
         input.swap_used_percent = 99.0;
         input.memory_pressure = MemoryPressureLevel::Warn;
-        assert_eq!(classify(&input, &defaults()), PressureLevel::Critical);
+        let c = classify_with_reasons(&input, &defaults());
+        assert_eq!(c.level, PressureLevel::Strained);
+        assert_eq!(
+            c.reasons,
+            vec![
+                "macOS reports memory pressure".to_string(),
+                "swap 99% used".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn swap_plus_kernel_warn_is_critical_without_corroboration() {
+        let mut input = nominal_input();
+        input.swap_used_percent = 99.0;
+        input.memory_pressure = MemoryPressureLevel::Warn;
+        assert_eq!(classify(&input, &uncorroborated()), PressureLevel::Critical);
     }
 
     #[test]
@@ -450,13 +521,19 @@ mod tests {
     }
 
     #[test]
-    fn corroborated_swap_is_the_reported_critical_cause() {
+    fn corroborated_swap_is_reported_alongside_the_kernel_verdict() {
         let mut input = nominal_input();
-        input.memory_pressure = MemoryPressureLevel::Warn; // corroborates swap; itself only strained
+        input.memory_pressure = MemoryPressureLevel::Critical;
         input.swap_used_percent = 99.0;
         let c = classify_with_reasons(&input, &defaults());
         assert_eq!(c.level, PressureLevel::Critical);
-        assert_eq!(c.reasons, vec!["swap 99% used".to_string()]);
+        assert_eq!(
+            c.reasons,
+            vec![
+                "macOS reports critical memory pressure".to_string(),
+                "swap 99% used".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -470,5 +547,92 @@ mod tests {
             c.reasons,
             vec!["swap 30% used".to_string(), "CPU 99%".to_string()]
         );
+    }
+
+    // --- exit band ---
+
+    const BAND: f64 = 0.10;
+
+    #[test]
+    fn levels_are_ordered_by_severity() {
+        assert!(PressureLevel::Clear < PressureLevel::Strained);
+        assert!(PressureLevel::Strained < PressureLevel::Critical);
+    }
+
+    #[test]
+    fn band_does_not_change_entry() {
+        // 25% is the strained swap threshold: 24% does not enter from clear, band or no band.
+        let mut input = nominal_input();
+        input.swap_used_percent = 24.0;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Clear, BAND);
+        assert_eq!(c.level, PressureLevel::Clear);
+        assert!(c.reasons.is_empty());
+    }
+
+    #[test]
+    fn value_just_under_threshold_holds_the_level() {
+        // Entered strained above 25%; 24% is inside the exit band (leaves below 22.5%).
+        let mut input = nominal_input();
+        input.swap_used_percent = 24.0;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Strained, BAND);
+        assert_eq!(c.level, PressureLevel::Strained);
+        assert_eq!(c.reasons, vec!["swap 24% used".to_string()]);
+    }
+
+    #[test]
+    fn value_past_the_band_releases_the_level() {
+        let mut input = nominal_input();
+        input.swap_used_percent = 22.0;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Strained, BAND);
+        assert_eq!(c.level, PressureLevel::Clear);
+    }
+
+    #[test]
+    fn low_memory_holds_critical_inside_its_band() {
+        // Critical below 1.0 GB; leaves critical only above 1.1 GB.
+        let mut input = nominal_input();
+        input.memory_available_gb = 1.06;
+        let held = classify_with_band(&input, &defaults(), PressureLevel::Critical, BAND);
+        assert_eq!(held.level, PressureLevel::Critical);
+        assert_eq!(held.reasons, vec!["only 1.1 GB RAM available".to_string()]);
+
+        input.memory_available_gb = 1.2;
+        let released = classify_with_band(&input, &defaults(), PressureLevel::Critical, BAND);
+        assert_eq!(released.level, PressureLevel::Strained);
+    }
+
+    #[test]
+    fn band_never_raises_above_the_held_level() {
+        // 1.06 GB is inside critical's exit band, but the held level is only strained.
+        let mut input = nominal_input();
+        input.memory_available_gb = 1.06;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Strained, BAND);
+        assert_eq!(c.level, PressureLevel::Strained);
+    }
+
+    #[test]
+    fn leaving_critical_lands_on_strained_while_inside_the_strained_band() {
+        // 2.1 GB: above strained entry (2.0) but inside its exit band (2.2).
+        let mut input = nominal_input();
+        input.memory_available_gb = 2.1;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Critical, BAND);
+        assert_eq!(c.level, PressureLevel::Strained);
+        assert!(!c.reasons.is_empty());
+    }
+
+    #[test]
+    fn escalation_ignores_the_band() {
+        let mut input = nominal_input();
+        input.thermal = ThermalState::Serious;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Clear, BAND);
+        assert_eq!(c.level, PressureLevel::Critical);
+    }
+
+    #[test]
+    fn zero_band_matches_plain_classification() {
+        let mut input = nominal_input();
+        input.swap_used_percent = 24.0;
+        let c = classify_with_band(&input, &defaults(), PressureLevel::Strained, 0.0);
+        assert_eq!(c, classify_with_reasons(&input, &defaults()));
     }
 }

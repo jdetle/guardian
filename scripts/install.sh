@@ -90,10 +90,17 @@ strained_memory_gb = 2.0
 critical_memory_gb = 1.0
 strained_swap_percent = 25.0
 critical_swap_percent = 50.0
-# Swap % and CPU % reach critical only when a second signal agrees (kernel memory pressure
-# for swap, thermal pressure for CPU); alone they count as strained. Set false to let each
-# threshold reach critical by itself.
+# Swap % and CPU % reach critical only when a second signal agrees (the kernel reporting
+# *critical* memory pressure for swap, thermal pressure for CPU); alone they count as
+# strained. Set false to let each threshold reach critical by itself.
 corroborate_critical = true
+
+# How quickly the published level may change. Escalation is fast; a level is left only
+# after the numbers move past the threshold by exit_band and stay there for deescalate_secs.
+[hysteresis]
+escalate_samples = 2
+deescalate_secs = 30
+exit_band = 0.10
 
 [docker]
 enabled = true

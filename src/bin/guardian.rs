@@ -1,12 +1,13 @@
-//! User-facing `guardian` CLI — snooze / one-shot resume / zeno relaxation.
+//! User-facing `guardian` CLI — snooze / one-shot resume / zeno relaxation / pressure history.
 
 use chrono::{Duration, Local, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use guardian_daemon::config::{guardian_dir, load_config};
+use guardian_daemon::stats::PressureStats;
 use guardian_daemon::zeno::{self, apply_zeno, ZenoState};
 
 #[derive(Parser)]
-#[command(name = "guardian")]
+#[command(name = "guardian", version)]
 #[command(
     about = "System Guardian — snooze prompt gates, allow one submit, or relax thresholds (zeno)"
 )]
@@ -30,6 +31,12 @@ enum Commands {
     Zeno {
         #[command(subcommand)]
         action: ZenoAction,
+    },
+    /// Show how much time was spent at each pressure level, per day.
+    Stats {
+        /// How many of the most recent days to show.
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=30))]
+        days: u32,
     },
 }
 
@@ -96,6 +103,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Snooze { minutes } => write_snooze_minutes(minutes).map_err(|e| e.to_string()),
         Commands::Once => touch_proceed_once().map_err(|e| e.to_string()),
         Commands::ClearSnooze => clear_snooze().map_err(|e| e.to_string()),
+        Commands::Stats { days } => {
+            print!("{}", PressureStats::load().render(days as usize));
+            Ok(())
+        }
         Commands::Zeno { action } => match action {
             ZenoAction::Bump => {
                 let mut z = zeno::load_zeno().unwrap_or_default();
@@ -170,5 +181,20 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parses(args: &[&str]) -> bool {
+        Cli::try_parse_from(args).is_ok()
+    }
+
+    #[test]
+    fn stats_parse() {
+        assert!(parses(&["guardian", "stats", "--days", "30"]));
+        assert!(!parses(&["guardian", "stats", "--days", "0"]));
     }
 }

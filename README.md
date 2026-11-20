@@ -139,6 +139,7 @@ Use the **Guardian menu bar** to snooze for 5, 15, 30, or 60 minutes, see when s
 - `~/.guardian/guardian once` allows one paused prompt. Resend it afterward.
 - `~/.guardian/guardian snooze 15` snoozes hooks for 15 minutes.
 - `~/.guardian/guardian clear-snooze` resumes hooks immediately.
+- `~/.guardian/guardian stats` shows the share of time spent at each pressure level per day.
 
 **What zeno can and cannot relax:** `zeno bump` loosens Guardian's own numeric thresholds (CPU, available RAM, swap, disk, Cursor RSS). It does not override macOS's verdicts — kernel memory pressure and thermal pressure still escalate at any zeno step. When a block's `Why:` names one of those, use **snooze** or **once**.
 
@@ -238,14 +239,40 @@ Two kernel signals sit alongside those thresholds:
 | **Memory pressure** | `kern.memorystatus_vm_pressure_level` — what Activity Monitor's memory graph shows | `warn` → `strained`, `critical` → `critical` |
 | **Thermal pressure** | `com.apple.system.thermalpressurelevel` (Apple Silicon; Intel uses `machdep.xcpm.thermal_pressure`) | `moderate` → `strained`, `heavy` or worse → `critical` |
 
-**Corroborated criticals.** Swap % and CPU % are noisy on their own: macOS grows swap on demand, so "90% of the current swap file" is reached moments before the file is enlarged, and a compile pegs every core without endangering anything. By default they only reach `critical` when a second signal agrees — the kernel also reports memory pressure (for swap), or the machine is also heating up (for CPU). Alone they count as `strained`. Low available RAM, kernel memory pressure, thermal pressure and a full process table never need corroboration. Where the corroborating signal is unavailable (`unknown`), the old behavior applies. Thermal pressure is `unknown` only where it cannot be read or cannot be trusted — in practice, inside a virtual machine, where the notification reads 0 whether or not anything publishes it; on physical Macs 0 is taken as `nominal`. To let every threshold reach `critical` by itself:
+**Corroborated criticals.** Swap % and CPU % are noisy on their own: macOS grows swap on demand, so "90% of the current swap file" is reached moments before the file is enlarged, and a compile pegs every core without endangering anything. By default they only reach `critical` when a second signal agrees — the kernel reports **critical** memory pressure (for swap), or the machine is also heating up (for CPU). Alone they count as `strained`. Low available RAM, kernel memory pressure, thermal pressure and a full process table never need corroboration. Where the corroborating signal is unavailable (`unknown`), the uncorroborated behavior applies. Thermal pressure is `unknown` only where it cannot be read or cannot be trusted — in practice, inside a virtual machine, where the notification reads 0 whether or not anything publishes it; on physical Macs 0 is taken as `nominal`.
+
+Before 0.8 a kernel `warn` was enough to corroborate swap. On a small-RAM Mac the kernel reports `warn` and the swap file sits near full for most of the day, so the level flipped between `strained` and `critical` every time swap crossed the threshold. A nearly full swap file now reads as `strained` until the kernel itself says `critical` or available RAM falls under `critical_memory_gb`.
+
+To let every threshold reach `critical` by itself:
 
 ```toml
 [thresholds]
 corroborate_critical = false
 ```
 
-Process usage ratio can also escalate. Optional **available/total RAM** ratios in config add another signal. **Hysteresis** dampens flapping.
+Process usage ratio can also escalate. Optional **available/total RAM** ratios in config add another signal.
+
+**Hysteresis.** The level rises after `escalate_samples` consecutive higher samples and falls only after `deescalate_secs` of consecutively lower ones. Numeric thresholds also have an exit band: a level entered at a threshold is left only once the value has moved `exit_band` past it (with the defaults, `critical` entered below 1.0 GB available is left above 1.1 GB). A value hovering at a threshold therefore holds its level. The kernel memory-pressure and thermal levels are discrete and rely on the dwell time alone.
+
+```toml
+[hysteresis]
+escalate_samples = 2
+deescalate_secs = 30
+exit_band = 0.10      # 0 disables the band
+```
+
+These are limited so that a typo cannot freeze the level: at most 30 samples to escalate, at most one hour to de-escalate, and `sample_interval_secs` between 1 and 30 (hooks ignore a `state.json` older than 30 seconds).
+
+### How much time is spent at each level (`guardian stats`)
+
+`guardiand` records the time spent at each published level per day in `~/.guardian/pressure_stats.json` (30 days kept). Print it with:
+
+```bash
+~/.guardian/guardian stats            # last 7 days
+~/.guardian/guardian stats --days 30
+```
+
+`critical` is meant to be the exception. If it stays above about 5% of sampled time, or `changes` runs into the dozens per day, the thresholds do not fit the machine: read `pressure_reasons` to see which signal is responsible. Level changes in `guardiand.stderr.log` carry a local timestamp.
 
 `state.json` → **`pressure_reasons`** lists what is driving the current level in plain words (`"swap 93% used"`, `"thermal pressure heavy"`); hooks append it to advisories, subagent denials and block messages as **`Why: …`**. While hysteresis is holding a level, the reasons shown are the ones that established that level.
 

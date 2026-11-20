@@ -7,10 +7,11 @@ mod hook_policy;
 mod sampler;
 mod session_db;
 mod state;
+pub mod stats;
 mod validation;
 pub mod zeno;
 
-use classifier::{classify_with_reasons, ClassifierInput, PressureLevel};
+use classifier::{classify_with_band, ClassifierInput, PressureLevel};
 use config::{load_config, GuardianConfig};
 use hook_policy::write_hook_policy;
 use docker::stats::DockerClient;
@@ -23,7 +24,7 @@ use sampler::thermal::ThermalState;
 use state::{AgentsState, CursorState, DiskState, DockerState, GuardianState, write_state};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -160,8 +161,12 @@ pub fn run_daemon() {
     let initial_steps = crate::zeno::load_zeno_steps();
     let merged = crate::zeno::apply_zeno(&config, initial_steps);
     eprintln!(
-        "[guardiand] config loaded: interval={}s, zeno_steps={}",
-        config.sample_interval_secs, initial_steps
+        "[guardiand] config loaded: interval={}s, zeno_steps={}, escalate={} samples, deescalate={}s, exit_band={}",
+        config.sample_interval(),
+        initial_steps,
+        config.hysteresis.escalate_samples,
+        config.hysteresis.deescalate_secs,
+        config.hysteresis.band()
     );
 
     if let Err(e) = write_hook_policy(&merged) {
@@ -179,45 +184,67 @@ pub fn run_daemon() {
         libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
     }
 
-    let docker_client = if config.docker.enabled {
-        let client = DockerClient::new(&config.docker.socket_path);
-        if client.available() {
-            eprintln!(
-                "[guardiand] docker socket found at {}",
-                config.docker.socket_path
-            );
-            Some(client)
-        } else {
-            eprintln!("[guardiand] docker socket not found, docker monitoring disabled");
-            None
-        }
-    } else {
-        None
-    };
-
-    run_loop(&config, docker_client.as_ref(), initial_steps);
+    run_loop(&config, initial_steps);
 
     write_shutdown_state();
     eprintln!("[guardiand] shutdown complete");
 }
 
-fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut last_hook_steps: u32) {
-    let interval = Duration::from_secs(config.sample_interval_secs);
+fn docker_client_for(config: &GuardianConfig) -> Option<DockerClient> {
+    if !config.docker.enabled {
+        return None;
+    }
+    let client = DockerClient::new(&config.docker.socket_path);
+    if client.available() {
+        eprintln!(
+            "[guardiand] docker socket found at {}",
+            config.docker.socket_path
+        );
+        Some(client)
+    } else {
+        eprintln!("[guardiand] docker socket not found, docker monitoring disabled");
+        None
+    }
+}
+
+fn run_loop(config: &GuardianConfig, mut last_hook_steps: u32) {
+    let docker_client = docker_client_for(config);
     let mut prev_cpu = CpuSnapshot::sample().unwrap_or_default();
     let mut prev_pressure = PressureLevel::Clear;
     let mut docker_throttled = false;
-    let mut hysteresis_counter: i32 = 0;
-    let hysteresis_threshold: i32 = 3;
+    let mut hysteresis = Hysteresis::default();
     let mut held_reasons: Vec<String> = Vec::new();
+    let mut last_strained_reasons: Vec<String> = Vec::new();
     let mut samples: u64 = 0;
+    let mut stats = stats::PressureStats::load();
+    let mut last_tick = Instant::now();
 
     loop {
-        thread::sleep(interval);
+        thread::sleep(Duration::from_secs(config.sample_interval()));
+
+        let escalate_samples = config.hysteresis.escalate();
+        let deescalate_samples = config
+            .hysteresis
+            .deescalate_samples(config.sample_interval());
+        let exit_band = config.hysteresis.band();
+        // A sample that took far longer than the interval (slow Docker, a stalled disk) is
+        // not evidence about the level for that whole time.
+        let max_tick_secs = (config.sample_interval() * 5) as f64;
+        let docker_client = docker_client.as_ref();
 
         samples = samples.wrapping_add(1);
         if samples % LOG_CAP_CHECK_EVERY == 0 {
             cap_daemon_log();
         }
+
+        // Account the time just slept to the level that was published during it.
+        let day = stats::today_key();
+        stats.record(
+            &day,
+            prev_pressure,
+            last_tick.elapsed().as_secs_f64().min(max_tick_secs),
+        );
+        last_tick = Instant::now();
 
         if SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("[guardiand] received shutdown signal, exiting gracefully");
@@ -262,27 +289,43 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
             last_hook_steps = steps;
         }
 
-        let classification = classify_with_reasons(&input, &merged.thresholds);
+        // Exit band: a level is entered at the thresholds but left only once the numbers
+        // have moved past them, so a value hovering at a threshold holds its level.
+        let classification =
+            classify_with_band(&input, &merged.thresholds, prev_pressure, exit_band);
         let raw_pressure = classification.level;
 
-        // Hysteresis: require consecutive samples before escalating/de-escalating
-        let pressure = apply_hysteresis(
+        // Dwell: escalate after a couple of samples, de-escalate only after a sustained drop.
+        let pressure = hysteresis.step(
             prev_pressure,
             raw_pressure,
-            &mut hysteresis_counter,
-            hysteresis_threshold,
+            escalate_samples,
+            deescalate_samples,
         );
 
+        if raw_pressure == PressureLevel::Strained {
+            last_strained_reasons = classification.reasons.clone();
+        }
+        // A dwell can end on a sample lower than the level it publishes (held at strained, last
+        // sample clear): explain that level with the sample that last showed it.
+        let reasons = if pressure != prev_pressure && raw_pressure < pressure {
+            &last_strained_reasons
+        } else {
+            &classification.reasons
+        };
         update_held_reasons(
             &mut held_reasons,
             raw_pressure,
             pressure,
-            &classification.reasons,
+            pressure != prev_pressure,
+            reasons,
         );
 
         if pressure != prev_pressure {
+            stats.record_transition(&day, pressure);
             eprintln!(
-                "[guardiand] pressure transition: {} -> {} (cpu={:.1}%, mem_avail={:.1}GB, swap={:.1}%, kernel_mem={}, thermal={}; {})",
+                "[guardiand] {} pressure transition: {} -> {} (cpu={:.1}%, mem_avail={:.1}GB, swap={:.1}%, kernel_mem={}, thermal={}; {})",
+                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z"),
                 prev_pressure,
                 pressure,
                 cpu_pct,
@@ -346,7 +389,23 @@ fn run_loop(config: &GuardianConfig, docker_client: Option<&DockerClient>, mut l
             eprintln!("[guardiand] write state error: {e}");
         }
 
+        if samples % STATS_SAVE_EVERY == 0 {
+            save_stats(&mut stats);
+        }
+
         prev_pressure = pressure;
+    }
+
+    save_stats(&mut stats);
+}
+
+/// Persist the per-day level accounting every N samples (~1 min at the default interval).
+const STATS_SAVE_EVERY: u64 = 30;
+
+fn save_stats(stats: &mut stats::PressureStats) {
+    stats.prune(stats::KEEP_DAYS);
+    if let Err(e) = stats.save() {
+        eprintln!("[guardiand] could not write pressure_stats.json: {e}");
     }
 }
 
@@ -380,57 +439,82 @@ fn write_shutdown_state() {
 
 /// Keep the reasons that explain the level hooks will actually see.
 ///
-/// Hysteresis holds a level for a few samples after the raw classification moves on. The
+/// The dwell time holds a level for a while after the raw classification moves on. The
 /// reasons published with a held level must be the ones that established it — not the current
 /// sample's, which would justify a `critical` block with a merely `strained` cause, or with
-/// nothing at all. So reasons are replaced only when the raw level agrees with the held one.
+/// nothing at all. So reasons are replaced when the raw level agrees with the held one, and
+/// when the level has just changed (the current sample's causes are what moved it).
 fn update_held_reasons(
     held: &mut Vec<String>,
     raw: PressureLevel,
     level: PressureLevel,
+    level_changed: bool,
     reasons: &[String],
 ) {
     if level == PressureLevel::Clear {
         held.clear();
-    } else if raw == level {
+    } else if raw == level || level_changed {
         *held = reasons.to_vec();
     }
 }
 
-fn apply_hysteresis(
-    current: PressureLevel,
-    proposed: PressureLevel,
-    counter: &mut i32,
-    threshold: i32,
-) -> PressureLevel {
-    if proposed == current {
-        *counter = 0;
-        return current;
-    }
+/// Dwell-time hysteresis on the published level.
+///
+/// A change is published only after an unbroken run of samples on the same side of the
+/// current level: `escalate_samples` to go up (respond fast to danger), `deescalate_samples`
+/// to come down (do not release early). A sample at the current level, or one on the other
+/// side, breaks the run.
+#[derive(Default, Debug)]
+struct Hysteresis {
+    /// Length of the current run: positive while escalating, negative while de-escalating.
+    run: i32,
+    /// For an escalating run: the lowest level proposed in it.
+    floor: Option<PressureLevel>,
+    /// For a de-escalating run: the highest level proposed in it.
+    ceiling: Option<PressureLevel>,
+}
 
-    let direction = match (&current, &proposed) {
-        (PressureLevel::Clear, PressureLevel::Strained)
-        | (PressureLevel::Clear, PressureLevel::Critical)
-        | (PressureLevel::Strained, PressureLevel::Critical) => 1,
-        _ => -1,
-    };
+impl Hysteresis {
+    fn step(
+        &mut self,
+        current: PressureLevel,
+        proposed: PressureLevel,
+        escalate_samples: u32,
+        deescalate_samples: u32,
+    ) -> PressureLevel {
+        if proposed == current {
+            *self = Self::default();
+            return current;
+        }
 
-    if direction > 0 {
-        // Escalation: only need 2 consecutive samples (respond fast to danger)
-        *counter += 1;
-        if *counter >= 2 {
-            *counter = 0;
-            return proposed;
+        let up = proposed > current;
+        if (up && self.run < 0) || (!up && self.run > 0) {
+            *self = Self::default();
         }
-    } else {
-        // De-escalation: need full threshold (don't release too early)
-        *counter += 1;
-        if *counter >= threshold {
-            *counter = 0;
-            return proposed;
+
+        if up {
+            // Escalate to the level every sample in the run supports: one `critical` spike
+            // after one `strained` sample publishes `strained`, not `critical`.
+            let floor = self.floor.map_or(proposed, |f| f.min(proposed));
+            self.floor = Some(floor);
+            self.run = self.run.saturating_add(1);
+            if self.run.unsigned_abs() >= escalate_samples.max(1) {
+                *self = Self::default();
+                return floor;
+            }
+        } else {
+            // De-escalate to the level every sample in the run stayed at or under: a dwell of
+            // `strained` samples that ends on one `clear` publishes `strained`, not `clear`.
+            let ceiling = self.ceiling.map_or(proposed, |c| c.max(proposed));
+            self.ceiling = Some(ceiling);
+            self.run = self.run.saturating_sub(1);
+            if self.run.unsigned_abs() >= deescalate_samples.max(1) {
+                *self = Self::default();
+                return ceiling;
+            }
         }
+        current
     }
-    current
 }
 
 fn handle_docker_throttle(
@@ -629,78 +713,116 @@ mod tests {
 
     // --- Hysteresis tests ---
 
+    use PressureLevel::{Clear, Critical, Strained};
+
+    /// Feed a sequence of raw levels through the hysteresis; return the published levels.
+    fn run(start: PressureLevel, raw: &[PressureLevel], up: u32, down: u32) -> Vec<PressureLevel> {
+        let mut h = Hysteresis::default();
+        let mut level = start;
+        raw.iter()
+            .map(|p| {
+                level = h.step(level, *p, up, down);
+                level
+            })
+            .collect()
+    }
+
     #[test]
-    fn hysteresis_same_level_resets_counter() {
-        let mut counter = 5;
-        let result = apply_hysteresis(PressureLevel::Clear, PressureLevel::Clear, &mut counter, 3);
-        assert_eq!(result, PressureLevel::Clear);
-        assert_eq!(counter, 0);
+    fn hysteresis_same_level_is_stable() {
+        assert_eq!(run(Clear, &[Clear, Clear, Clear], 2, 3), vec![Clear, Clear, Clear]);
     }
 
     #[test]
     fn hysteresis_escalation_needs_two_samples() {
-        let mut counter = 0;
-        let r1 = apply_hysteresis(PressureLevel::Clear, PressureLevel::Strained, &mut counter, 3);
-        assert_eq!(r1, PressureLevel::Clear);
-        assert_eq!(counter, 1);
-
-        let r2 = apply_hysteresis(PressureLevel::Clear, PressureLevel::Strained, &mut counter, 3);
-        assert_eq!(r2, PressureLevel::Strained);
-        assert_eq!(counter, 0);
+        assert_eq!(run(Clear, &[Strained, Strained], 2, 3), vec![Clear, Strained]);
     }
 
     #[test]
-    fn hysteresis_single_escalation_does_not_trigger() {
-        let mut counter = 0;
-        let result = apply_hysteresis(
-            PressureLevel::Clear,
-            PressureLevel::Critical,
-            &mut counter,
-            3,
+    fn hysteresis_single_spike_does_not_escalate() {
+        assert_eq!(run(Clear, &[Critical, Clear, Critical, Clear], 2, 3), vec![Clear; 4]);
+    }
+
+    #[test]
+    fn hysteresis_deescalation_needs_the_full_dwell() {
+        assert_eq!(
+            run(Critical, &[Clear, Clear, Clear], 2, 3),
+            vec![Critical, Critical, Clear]
         );
-        assert_eq!(result, PressureLevel::Clear);
-        assert_eq!(counter, 1);
     }
 
     #[test]
-    fn hysteresis_deescalation_needs_three_samples() {
-        let mut counter = 0;
-        let r1 = apply_hysteresis(PressureLevel::Critical, PressureLevel::Clear, &mut counter, 3);
-        assert_eq!(r1, PressureLevel::Critical);
-        assert_eq!(counter, 1);
-
-        let r2 = apply_hysteresis(PressureLevel::Critical, PressureLevel::Clear, &mut counter, 3);
-        assert_eq!(r2, PressureLevel::Critical);
-        assert_eq!(counter, 2);
-
-        let r3 = apply_hysteresis(PressureLevel::Critical, PressureLevel::Clear, &mut counter, 3);
-        assert_eq!(r3, PressureLevel::Clear);
-        assert_eq!(counter, 0);
+    fn hysteresis_deescalation_stops_at_the_highest_level_in_the_run() {
+        // Two strained samples and one clear: the machine was never clear for a whole dwell.
+        assert_eq!(
+            run(Critical, &[Strained, Strained, Clear], 2, 3),
+            vec![Critical, Critical, Strained]
+        );
+        // Clear then needs a dwell of its own.
+        assert_eq!(
+            run(Critical, &[Strained, Strained, Clear, Clear, Clear, Clear], 2, 3),
+            vec![Critical, Critical, Strained, Strained, Strained, Clear]
+        );
     }
 
     #[test]
-    fn hysteresis_two_deescalation_samples_insufficient() {
-        let mut counter = 0;
-        apply_hysteresis(PressureLevel::Strained, PressureLevel::Clear, &mut counter, 3);
-        let r = apply_hysteresis(PressureLevel::Strained, PressureLevel::Clear, &mut counter, 3);
-        assert_eq!(r, PressureLevel::Strained);
-        assert_eq!(counter, 2);
+    fn hysteresis_return_to_level_restarts_the_dwell() {
+        // Two low samples, back to critical, then two more low samples: never three in a row.
+        assert_eq!(
+            run(Critical, &[Strained, Strained, Critical, Strained, Strained], 2, 3),
+            vec![Critical; 5]
+        );
     }
 
     #[test]
-    fn hysteresis_interleaved_resets_accumulation() {
-        let mut counter = 0;
-        apply_hysteresis(PressureLevel::Clear, PressureLevel::Strained, &mut counter, 3);
-        assert_eq!(counter, 1);
+    fn hysteresis_mixed_escalation_publishes_the_level_both_samples_support() {
+        // strained then critical: two samples above clear, but only one says critical.
+        assert_eq!(run(Clear, &[Strained, Critical], 2, 3), vec![Clear, Strained]);
+        // ...and a second critical sample then completes the next step.
+        assert_eq!(
+            run(Clear, &[Strained, Critical, Critical], 2, 3),
+            vec![Clear, Strained, Strained]
+        );
+        assert_eq!(
+            run(Clear, &[Strained, Critical, Critical, Critical], 2, 3),
+            vec![Clear, Strained, Strained, Critical]
+        );
+    }
 
-        // Back to same level resets counter
-        apply_hysteresis(PressureLevel::Clear, PressureLevel::Clear, &mut counter, 3);
-        assert_eq!(counter, 0);
+    #[test]
+    fn hysteresis_low_samples_do_not_count_toward_escalation() {
+        // At strained: a long run of clear samples must not let one critical sample through.
+        assert_eq!(
+            run(Strained, &[Clear, Clear, Clear, Clear, Critical], 2, 15),
+            vec![Strained; 5]
+        );
+    }
 
-        // Start over — one sample is not enough
-        let r = apply_hysteresis(PressureLevel::Clear, PressureLevel::Strained, &mut counter, 3);
-        assert_eq!(r, PressureLevel::Clear);
-        assert_eq!(counter, 1);
+    #[test]
+    fn hysteresis_high_sample_breaks_a_deescalation_run() {
+        assert_eq!(
+            run(Strained, &[Clear, Clear, Critical, Clear, Clear], 2, 3),
+            vec![Strained; 5]
+        );
+    }
+
+    #[test]
+    fn hysteresis_threshold_hover_holds_for_the_dwell() {
+        // The flapping case: raw level alternates every two samples. With a 15-sample dwell
+        // the published level rises once and stays there.
+        let raw: Vec<PressureLevel> = (0..60)
+            .map(|i| if (i / 2) % 2 == 0 { Critical } else { Strained })
+            .collect();
+        let published = run(Strained, &raw, 2, 15);
+        assert_eq!(published[0], Strained);
+        assert_eq!(published[1], Critical);
+        let later_changes = published[1..].windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(later_changes, 0, "{published:?}");
+    }
+
+    #[test]
+    fn hysteresis_zero_sample_counts_behave_as_one() {
+        assert_eq!(run(Clear, &[Critical], 0, 0), vec![Critical]);
+        assert_eq!(run(Critical, &[Clear], 0, 0), vec![Clear]);
     }
 
     // --- held reasons tests ---
@@ -716,6 +838,7 @@ mod tests {
             &mut held,
             PressureLevel::Critical,
             PressureLevel::Critical,
+            false,
             &r(&["thermal pressure heavy"]),
         );
         assert_eq!(held, r(&["thermal pressure heavy"]));
@@ -728,6 +851,7 @@ mod tests {
             &mut held,
             PressureLevel::Strained,
             PressureLevel::Critical,
+            false,
             &r(&["CPU 75%"]),
         );
         assert_eq!(held, r(&["only 0.3 GB RAM available"]));
@@ -736,7 +860,7 @@ mod tests {
     #[test]
     fn held_critical_keeps_its_cause_while_raw_is_clear() {
         let mut held = r(&["swap 95% used"]);
-        update_held_reasons(&mut held, PressureLevel::Clear, PressureLevel::Critical, &[]);
+        update_held_reasons(&mut held, PressureLevel::Clear, PressureLevel::Critical, false, &[]);
         assert_eq!(held, r(&["swap 95% used"]));
     }
 
@@ -747,15 +871,31 @@ mod tests {
             &mut held,
             PressureLevel::Critical,
             PressureLevel::Strained,
+            false,
             &r(&["thermal pressure critical"]),
         );
         assert_eq!(held, r(&["swap 30% used"]));
     }
 
     #[test]
+    fn a_level_change_takes_the_current_samples_causes() {
+        // Clear -> strained published while the raw sample already reads critical: the
+        // advisory must still say why, using what the sample shows.
+        let mut held = Vec::new();
+        update_held_reasons(
+            &mut held,
+            PressureLevel::Critical,
+            PressureLevel::Strained,
+            true,
+            &r(&["thermal pressure heavy"]),
+        );
+        assert_eq!(held, r(&["thermal pressure heavy"]));
+    }
+
+    #[test]
     fn clear_level_has_no_reasons() {
         let mut held = r(&["swap 30% used"]);
-        update_held_reasons(&mut held, PressureLevel::Strained, PressureLevel::Clear, &r(&["x"]));
+        update_held_reasons(&mut held, PressureLevel::Strained, PressureLevel::Clear, true, &r(&["x"]));
         assert!(held.is_empty());
     }
 
