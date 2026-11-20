@@ -197,3 +197,121 @@ struct DayStats: Codable, Sendable {
 struct PressureStatsFile: Codable, Sendable {
     var days: [String: DayStats] = [:]
 }
+
+/// One row of `guardian disk --json`.
+struct DiskTarget: Codable, Sendable, Identifiable {
+    var id: String { path }
+    var path: String = ""
+    var displayPath: String = ""
+    /// cache | build | worktree
+    var kind: String = "cache"
+    var what: String = ""
+    var cost: String = ""
+    var remove: String = ""
+    /// regenerates | review
+    var safety: String = "review"
+    var bytes: UInt64 = 0
+    var complete: Bool = true
+    /// Whole days since the project or worktree was last touched; nil for tool caches.
+    var ageDays: Int?
+    var repo: String?
+    var branch: String?
+    /// What the scan found, e.g. "3 uncommitted or untracked files".
+    var note: String?
+    /// True when `guardian disk delete` will remove it (it re-checks first).
+    var deletable: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case displayPath = "display_path"
+        case kind, what, cost, remove, safety, bytes, complete
+        case ageDays = "age_days"
+        case repo, branch, note, deletable
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path)
+        displayPath = (try? c.decodeIfPresent(String.self, forKey: .displayPath)) ?? path
+        kind = (try? c.decodeIfPresent(String.self, forKey: .kind)) ?? "cache"
+        what = (try? c.decodeIfPresent(String.self, forKey: .what)) ?? ""
+        cost = (try? c.decodeIfPresent(String.self, forKey: .cost)) ?? ""
+        remove = (try? c.decodeIfPresent(String.self, forKey: .remove)) ?? ""
+        safety = (try? c.decodeIfPresent(String.self, forKey: .safety)) ?? "review"
+        bytes = (try? c.decodeIfPresent(UInt64.self, forKey: .bytes)) ?? 0
+        complete = (try? c.decodeIfPresent(Bool.self, forKey: .complete)) ?? true
+        ageDays = try? c.decodeIfPresent(Int.self, forKey: .ageDays)
+        repo = try? c.decodeIfPresent(String.self, forKey: .repo)
+        branch = try? c.decodeIfPresent(String.self, forKey: .branch)
+        note = try? c.decodeIfPresent(String.self, forKey: .note)
+        deletable = (try? c.decodeIfPresent(Bool.self, forKey: .deletable)) ?? false
+    }
+
+    var regenerates: Bool { safety == "regenerates" }
+
+    var sizeText: String {
+        let text = Self.sizeText(bytes)
+        return complete ? text : text + "+"
+    }
+
+    static func sizeText(_ bytes: UInt64) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        return gb >= 1 ? String(format: "%.1f GB", gb) : String(format: "%.0f MB", Double(bytes) / 1_048_576)
+    }
+
+    var ageText: String? {
+        guard let ageDays else { return nil }
+        switch ageDays {
+        case 0: return "used today"
+        case 1: return "untouched 1 day"
+        default: return "untouched \(ageDays) days"
+        }
+    }
+
+    /// The line under the path: how stale it is and what was found, or what removal costs.
+    var detailText: String {
+        var parts: [String] = []
+        if let ageText { parts.append(ageText) }
+        if let note, !note.isEmpty { parts.append(note) }
+        if parts.isEmpty { parts.append(cost) }
+        return parts.joined(separator: "; ")
+    }
+}
+
+/// Output of `guardian disk --json`.
+struct DiskReport: Codable, Sendable {
+    var targets: [DiskTarget]
+    let unmeasured: Int
+    let reposScanned: Int
+    let regeneratesBytes: UInt64
+    let reviewBytes: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case targets, unmeasured
+        case reposScanned = "repos_scanned"
+        case regeneratesBytes = "regenerates_bytes"
+        case reviewBytes = "review_bytes"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        targets = (try? c.decodeIfPresent([DiskTarget].self, forKey: .targets)) ?? []
+        unmeasured = (try? c.decodeIfPresent(Int.self, forKey: .unmeasured)) ?? 0
+        reposScanned = (try? c.decodeIfPresent(Int.self, forKey: .reposScanned)) ?? 0
+        regeneratesBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesBytes)) ?? 0
+        reviewBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .reviewBytes)) ?? 0
+    }
+}
+
+/// One element of `guardian disk delete --yes --json`.
+struct DeleteResult: Codable, Sendable {
+    let path: String
+    let ok: Bool
+    let freedBytes: UInt64?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case path, ok, error
+        case freedBytes = "freed_bytes"
+    }
+}
