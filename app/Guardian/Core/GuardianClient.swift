@@ -2,7 +2,22 @@ import Foundation
 import Combine
 
 final class GuardianClient: ObservableObject {
+    /// One client for the whole app: the menu bar, the dashboard window and notifications
+    /// all read the same polled state.
+    static let shared = GuardianClient()
+
+    /// Longest snooze the hooks honor (GUARDIAN_MAX_SNOOZE_SECS in hooks/lib.sh, plus slack).
+    static let maxSnoozeSeconds: TimeInterval = 7200 + 120
+    /// How long an allow-once token stays good (GUARDIAN_ONCE_TTL_MINUTES in hooks/lib.sh).
+    static let allowOnceSeconds: TimeInterval = 600
+    /// state.json older than this means guardiand is not reporting (hooks use the same 30 s).
+    static let staleSeconds: TimeInterval = 30
+
     @Published var state = GuardianStateData()
+    /// True when guardiand has stopped writing state.json: the numbers shown are old and
+    /// the hooks have failed open.
+    @Published private(set) var isStale = false
+    @Published private(set) var today: DayStats?
     @Published var history: [GuardianStateData] = []
     @Published var sessions: [SessionRecord] = []
     @Published var queueEntries: [AgentQueueEntry] = []
@@ -15,9 +30,10 @@ final class GuardianClient: ObservableObject {
     private let stateFileURL: URL
     private let queueFileURL: URL
     private let dbPath: String
+    private let statsFileURL: URL
     private let promptControlQueue = DispatchQueue(label: "guardian.prompt-controls")
+    private let scanQueue = DispatchQueue(label: "guardian.disk-scan", qos: .utility)
     private var timer: Timer?
-    private var sessionTimer: Timer?
 
     static let maxHistoryCount = 150
 
@@ -28,42 +44,65 @@ final class GuardianClient: ObservableObject {
         self.stateFileURL = guardianDir.appendingPathComponent("state.json")
         self.queueFileURL = guardianDir.appendingPathComponent("agent_queue.jsonl")
         self.dbPath = guardianDir.appendingPathComponent("sessions.db").path
+        self.statsFileURL = guardianDir.appendingPathComponent("pressure_stats.json")
     }
 
+    /// Start reading ~/.guardian. Safe to call more than once.
     func startPolling() {
+        guard timer == nil else { return }
         loadPromptControls()
         loadState()
         loadQueue()
-        loadSessions()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        loadStats()
+        // guardiand samples every 2 s; the menu bar icon does not need to be that fresh.
+        var ticks = 0
+        let t = Timer(timeInterval: 4.0, repeats: true) { [weak self] _ in
             self?.loadPromptControls()
             self?.loadState()
             self?.loadQueue()
+            // guardiand saves the day's totals about once a minute; keep "Today" in step,
+            // including across midnight.
+            ticks += 1
+            if ticks % 15 == 0 { self?.loadStats() }
         }
-        sessionTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
-            self?.loadSessions()
-        }
+        t.tolerance = 1.0
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func stopPolling() {
         timer?.invalidate()
         timer = nil
-        sessionTimer?.invalidate()
-        sessionTimer = nil
     }
 
     func loadPromptControls() {
         let marker = guardianDir.appendingPathComponent("snooze_until")
         let text = try? String(contentsOf: marker, encoding: .utf8)
+        let now = Date()
+        // Same rule as the hooks: a snooze further out than the cap is not honored.
         let expiry = text.flatMap {
             ISO8601DateFormatter().date(from: $0.trimmingCharacters(in: .whitespacesAndNewlines))
-        }.flatMap { $0 > Date() ? $0 : nil }
+        }.flatMap { $0 > now && $0.timeIntervalSince(now) <= Self.maxSnoozeSeconds ? $0 : nil }
         if snoozeUntil != expiry { snoozeUntil = expiry }
 
-        let pending = FileManager.default.fileExists(
-            atPath: guardianDir.appendingPathComponent("proceed_once").path
-        )
+        // An allow-once token expires; an old one is not "armed".
+        let oncePath = guardianDir.appendingPathComponent("proceed_once").path
+        let armedAt = (try? FileManager.default.attributesOfItem(atPath: oncePath))?[.modificationDate] as? Date
+        let pending = armedAt.map { now.timeIntervalSince($0) < Self.allowOnceSeconds } ?? false
         if allowOncePending != pending { allowOncePending = pending }
+    }
+
+    /// Today's share of time at each level, from guardiand's per-day accounting.
+    func loadStats() {
+        guard let data = try? Data(contentsOf: statsFileURL),
+              let file = try? JSONDecoder().decode(PressureStatsFile.self, from: data) else {
+            if today != nil { today = nil }
+            return
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        today = file.days[formatter.string(from: Date())]
     }
 
     func runPromptControl(_ arguments: [String]) {
@@ -96,16 +135,26 @@ final class GuardianClient: ObservableObject {
     }
 
     private func loadState() {
+        let written = (try? FileManager.default.attributesOfItem(atPath: stateFileURL.path))?[.modificationDate] as? Date
+        let stale = written.map { Date().timeIntervalSince($0) > Self.staleSeconds } ?? true
+        if isStale != stale { isStale = stale }
+
         guard let data = try? Data(contentsOf: stateFileURL) else { return }
         guard let decoded = try? JSONDecoder().decode(GuardianStateData.self, from: data) else { return }
 
-        DispatchQueue.main.async {
-            self.state = decoded
-            self.history.append(decoded)
-            if self.history.count > Self.maxHistoryCount {
-                self.history.removeFirst(self.history.count - Self.maxHistoryCount)
-            }
+        // Always called on the main thread (timer, launch, snapshot), so publish directly.
+        state = decoded
+        history.append(decoded)
+        if history.count > Self.maxHistoryCount {
+            history.removeFirst(history.count - Self.maxHistoryCount)
         }
+    }
+
+    /// Read everything once, synchronously (launch and `--render-panel`).
+    func refreshNow() {
+        loadPromptControls()
+        loadState()
+        loadStats()
     }
 
     private func loadQueue() {
