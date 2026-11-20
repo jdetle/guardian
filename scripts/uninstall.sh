@@ -15,6 +15,26 @@ if [ -f "$LAUNCH_AGENTS/$QUEUE_PLIST" ]; then
     rm -f "$LAUNCH_AGENTS/$QUEUE_PLIST"
 fi
 
+# Menu bar app (scripts/install-app.sh)
+MENUBAR_ID="com.guardian.menubar"
+MENUBAR_APP="$HOME/Applications/Guardian.app"
+osascript -e "tell application id \"$MENUBAR_ID\" to quit" >/dev/null 2>&1 || true
+launchctl bootout "gui/$(id -u)/$MENUBAR_ID" >/dev/null 2>&1 || true
+if [ -f "$LAUNCH_AGENTS/$MENUBAR_ID.plist" ]; then
+    rm -f "$LAUNCH_AGENTS/$MENUBAR_ID.plist"
+    echo "Removed menu bar app login item."
+fi
+if [ -d "$MENUBAR_APP" ]; then
+    # Only our own app: something else may be installed under this name.
+    MENUBAR_FOUND="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$MENUBAR_APP/Contents/Info.plist" 2>/dev/null || true)"
+    if [ "$MENUBAR_FOUND" = "$MENUBAR_ID" ]; then
+        rm -rf "$HOME/Applications/Guardian.app"
+        echo "Removed $MENUBAR_APP"
+    else
+        echo "Left $MENUBAR_APP in place: it is not the Guardian menu bar app."
+    fi
+fi
+
 # Stop and unload the service
 if launchctl list | grep -q com.guardian.guardiand 2>/dev/null; then
     echo "Stopping guardiand..."

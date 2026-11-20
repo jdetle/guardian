@@ -1,38 +1,61 @@
 import Foundation
 import UserNotifications
 
-final class NotificationManager: ObservableObject {
-    private var lastNotifiedPressure: PressureLevel = .clear
+/// Tells the person, not just the agent, when something needs them.
+///
+/// Only two events notify: the machine entering `critical` (rare by design since 0.8) and the
+/// disk crossing into `critical`. Strained and recovery are visible in the menu bar and do
+/// not interrupt.
+final class NotificationManager {
+    private var lastPressure: PressureLevel?
+    private var lastDiskLevel: String?
+
+    /// Notifications need a real app bundle; a bare `swift run` binary has none.
+    private var available: Bool { Bundle.main.bundleIdentifier != nil }
 
     func setup() {
+        guard available else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    func checkTransition(from old: PressureLevel, to new: PressureLevel) {
-        guard old != new, new != lastNotifiedPressure else { return }
-        lastNotifiedPressure = new
-
-        let content = UNMutableNotificationContent()
-        switch new {
-        case .critical:
-            content.title = "System Guardian"
-            content.body = "Resources critical — agent throttling active. Docker containers may be paused."
-            content.sound = .default
-        case .strained:
-            content.title = "System Guardian"
-            content.body = "Resources under moderate load. Parallel agent work limited."
-            content.sound = nil
-        case .clear:
-            content.title = "System Guardian"
-            content.body = "Resources recovered — throttling lifted."
-            content.sound = nil
+    func observe(_ state: GuardianStateData) {
+        // No sample yet: nothing to compare against.
+        guard !state.sampledAt.isEmpty else { return }
+        defer {
+            lastPressure = state.pressure
+            lastDiskLevel = state.disk.level
         }
+        // The first sample after launch sets the baseline without notifying.
+        guard let lastPressure, let lastDiskLevel else { return }
 
-        let request = UNNotificationRequest(
-            identifier: "guardian-pressure-\(new.rawValue)",
-            content: content,
-            trigger: nil
+        if state.pressure == .critical && lastPressure != .critical {
+            let why = state.pressureReasons.prefix(2).joined(separator: "; ")
+            post(
+                id: "guardian-pressure-critical",
+                title: "Guardian: load is critical",
+                body: why.isEmpty ? "Hold off on heavy work until it clears." : "\(why). Hold off on heavy work until it clears."
+            )
+        }
+        if state.disk.level == "critical" && lastDiskLevel != "critical" {
+            post(
+                id: "guardian-disk-critical",
+                title: "Guardian: disk is nearly full",
+                body: String(
+                    format: "%.1f GB free (%.0f%% used). Open Guardian in the menu bar and choose Find space to free.",
+                    state.disk.availableGb, state.disk.usedPercent
+                )
+            )
+        }
+    }
+
+    private func post(id: String, title: String, body: String) {
+        guard available else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: id, content: content, trigger: nil)
         )
-        UNUserNotificationCenter.current().add(request)
     }
 }

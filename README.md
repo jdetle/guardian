@@ -42,7 +42,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[tool_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
-| Guardian.app | `app/` | SwiftUI menu bar app (optional) — shows pressure + **queued agent jobs**; click a job to `open -a Cursor` on its workspace folder when `workspace_path` is stored |
+| Guardian.app | `app/`, `scripts/install-app.sh` | SwiftUI **menu bar app** (optional, no Dock icon) — level and why, snooze / allow once, memory, swap, disk, per-agent RAM, today's time at each level and config problems. See [Menu bar app](#menu-bar-app). |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
 | Resume + zeno | `~/.guardian/guardian`, `Guardian-*.command`, `/guardian-snooze` | CLI, macOS double-click helpers, Cursor slash commands (see `hooks/resources.md`) |
 
@@ -98,6 +98,25 @@ bash scripts/install-codex-hooks.sh
 ```
 
 Merges the same three events into **`~/.codex/hooks.json`**. Hooks are on by default in current Codex, but **Codex skips new or changed hooks until you trust them** — run **`/hooks`** in the CLI or open **Settings > Hooks** in the app. Details: [docs/codex.md](docs/codex.md).
+
+### Menu bar app
+
+```bash
+bash scripts/install-app.sh            # build, install to ~/Applications/Guardian.app, launch
+bash scripts/install-app.sh --login    # also start it at every login
+bash scripts/install-app.sh --no-login # stop starting it at login
+```
+
+A shield appears at the right of the menu bar; its shape follows the level (outline = clear, half-filled = strained, exclamation = critical, slashed = `guardiand` not reporting), and it adds `Disk NN%` when the disk is critical. Click it for:
+
+- the level and **why**, in the daemon's own words
+- **Snooze** (up to 2 hours) and **Allow once**, with what is currently switched off
+- memory, swap, CPU, disk, the kernel's memory-pressure and thermal verdicts, per-agent RAM
+- **Today**: share of time at each level and how often it changed
+- any **config problem** the daemon reported
+- **Open dashboard** for the larger System / Sessions / Docker / Settings window
+
+It notifies you only when load becomes critical or the disk becomes critical. The app needs macOS 14 and the Swift toolchain to build; it reads `~/.guardian/` and calls `~/.guardian/guardian`, so install the daemon first.
 
 ### Tool gate (`[tool_gate]`)
 
