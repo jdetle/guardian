@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct GuardianConfig {
     #[serde(default = "default_sample_interval_secs")]
     pub sample_interval_secs: u64,
@@ -23,6 +23,8 @@ pub struct GuardianConfig {
     pub queue: QueueConfig,
     #[serde(default)]
     pub tool_gate: ToolGateConfig,
+    #[serde(default)]
+    pub hysteresis: HysteresisConfig,
 }
 
 impl Default for GuardianConfig {
@@ -38,8 +40,81 @@ impl Default for GuardianConfig {
             disk: DiskConfig::default(),
             queue: QueueConfig::default(),
             tool_gate: ToolGateConfig::default(),
+            hysteresis: HysteresisConfig::default(),
         }
     }
+}
+
+/// How quickly the published pressure level may change (`[hysteresis]`).
+///
+/// Escalation stays fast; leaving a level takes both an exit band on the numeric thresholds
+/// and a dwell time, so a signal hovering at a threshold cannot flip the level every few
+/// seconds.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct HysteresisConfig {
+    /// Consecutive higher samples needed to raise the level.
+    #[serde(default = "default_escalate_samples")]
+    pub escalate_samples: u32,
+    /// Seconds of consecutively lower samples needed before the level drops.
+    #[serde(default = "default_deescalate_secs")]
+    pub deescalate_secs: u64,
+    /// Exit band as a fraction of each numeric threshold (0.10 = leave `critical` swap at 90%
+    /// only below 81%; leave 1.0 GB available only above 1.1 GB). `0` disables the band.
+    #[serde(default = "default_exit_band")]
+    pub exit_band: f64,
+}
+
+impl Default for HysteresisConfig {
+    fn default() -> Self {
+        Self {
+            escalate_samples: default_escalate_samples(),
+            deescalate_secs: default_deescalate_secs(),
+            exit_band: default_exit_band(),
+        }
+    }
+}
+
+/// Longest sampling interval the daemon uses: hooks treat a `state.json` older than 30
+/// seconds as stale and stop gating on it.
+pub const MAX_SAMPLE_INTERVAL_SECS: u64 = 30;
+/// Longest de-escalation dwell honored. A typo (`300000`) must not hold a level for days.
+pub const MAX_DEESCALATE_SECS: u64 = 3600;
+/// Most samples ever required to escalate. More would mean the level never rises.
+pub const MAX_ESCALATE_SAMPLES: u32 = 30;
+
+impl HysteresisConfig {
+    /// Consecutive higher samples required before escalating, limited to a sane range.
+    pub fn escalate(&self) -> u32 {
+        self.escalate_samples.clamp(1, MAX_ESCALATE_SAMPLES)
+    }
+
+    /// Samples of lower pressure required before de-escalating, at this sampling interval.
+    pub fn deescalate_samples(&self, sample_interval_secs: u64) -> u32 {
+        let interval = sample_interval_secs.max(1);
+        let secs = self.deescalate_secs.min(MAX_DEESCALATE_SECS);
+        let samples = secs.div_ceil(interval).max(1);
+        u32::try_from(samples).unwrap_or(u32::MAX)
+    }
+
+    /// The exit band, limited to a sane range (a typo must not pin the level forever).
+    pub fn band(&self) -> f64 {
+        if self.exit_band.is_nan() {
+            return 0.0;
+        }
+        self.exit_band.clamp(0.0, 0.5)
+    }
+}
+
+fn default_escalate_samples() -> u32 {
+    2
+}
+
+fn default_deescalate_secs() -> u64 {
+    30
+}
+
+fn default_exit_band() -> f64 {
+    0.10
 }
 
 /// Tool-call gate (preToolUse / PreToolUse hooks). Advisory-only unless configured otherwise.
@@ -79,7 +154,7 @@ impl Default for QueueConfig {
 }
 
 /// Thresholds for home-volume disk advisories (`state.json` → `disk`).
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct DiskConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -148,7 +223,7 @@ fn default_block_on() -> String {
 
 /// Gates derived from aggregate Cursor RSS (`state.json` → `cursor.resident_memory_megabytes`),
 /// not from `~/.cursor/projects` folder count (that field remains diagnostic-only in state).
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct SessionBudgetConfig {
     /// Block `beforeSubmitPrompt` when Cursor RSS exceeds this (MB). `0` disables RSS blocking.
     #[serde(default = "default_max_cursor_rss_mb")]
@@ -157,9 +232,9 @@ pub struct SessionBudgetConfig {
     #[serde(default = "default_warn_cursor_rss_mb")]
     pub warn_cursor_rss_megabytes: u64,
     /// Legacy keys — ignored for gates; kept so older `config.toml` still deserializes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_active_sessions: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warn_active_sessions: Option<u32>,
 }
 
@@ -218,9 +293,9 @@ pub struct ThresholdConfig {
     #[serde(default = "default_critical_swap")]
     pub critical_swap_percent: f64,
     /// When set, also escalate when `available_gb / total_gb` falls below this (e.g. 0.12 = 12% free).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strained_memory_available_ratio: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub critical_memory_available_ratio: Option<f64>,
     /// When true (default), swap % and CPU % can only reach `critical` if a second signal
     /// agrees (kernel memory pressure for swap, thermal pressure for CPU); alone they count as
@@ -245,6 +320,27 @@ impl Default for ThresholdConfig {
     }
 }
 
+impl ThresholdConfig {
+    /// The thresholds a sample must clear to *leave* a level: each numeric threshold moved
+    /// `band` (a fraction) further into safe territory. Usage percentages are lowered;
+    /// available-memory floors are raised.
+    pub fn with_exit_band(&self, band: f64) -> Self {
+        let lower = 1.0 - band;
+        let raise = 1.0 + band;
+        Self {
+            strained_cpu_percent: self.strained_cpu_percent * lower,
+            critical_cpu_percent: self.critical_cpu_percent * lower,
+            strained_memory_gb: self.strained_memory_gb * raise,
+            critical_memory_gb: self.critical_memory_gb * raise,
+            strained_swap_percent: self.strained_swap_percent * lower,
+            critical_swap_percent: self.critical_swap_percent * lower,
+            strained_memory_available_ratio: self.strained_memory_available_ratio.map(|r| r * raise),
+            critical_memory_available_ratio: self.critical_memory_available_ratio.map(|r| r * raise),
+            corroborate_critical: self.corroborate_critical,
+        }
+    }
+}
+
 fn default_strained_cpu() -> f64 {
     70.0
 }
@@ -264,7 +360,7 @@ fn default_critical_swap() -> f64 {
     50.0
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct DockerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -304,7 +400,7 @@ fn default_false() -> bool {
     false
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ForkGuardConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -348,5 +444,77 @@ pub fn load_config() -> GuardianConfig {
             GuardianConfig::default()
         }),
         Err(_) => GuardianConfig::default(),
+    }
+}
+
+impl GuardianConfig {
+    /// The sampling interval the daemon actually uses: 0 would spin the CPU, and a huge
+    /// value would leave the daemon asleep, deaf to the edit that fixes it.
+    pub fn sample_interval(&self) -> u64 {
+        self.sample_interval_secs.clamp(1, MAX_SAMPLE_INTERVAL_SECS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hysteresis_defaults_apply_when_section_is_missing() {
+        let cfg: GuardianConfig = toml::from_str("sample_interval_secs = 2\n").unwrap();
+        assert_eq!(cfg.hysteresis.escalate_samples, 2);
+        assert_eq!(cfg.hysteresis.deescalate_secs, 30);
+        assert_eq!(cfg.hysteresis.deescalate_samples(cfg.sample_interval_secs), 15);
+    }
+
+    #[test]
+    fn deescalate_samples_rounds_up_and_never_reaches_zero() {
+        let h = HysteresisConfig {
+            deescalate_secs: 5,
+            ..HysteresisConfig::default()
+        };
+        assert_eq!(h.deescalate_samples(2), 3);
+        assert_eq!(h.deescalate_samples(0), 5);
+        let instant = HysteresisConfig {
+            deescalate_secs: 0,
+            ..HysteresisConfig::default()
+        };
+        assert_eq!(instant.deescalate_samples(2), 1);
+    }
+
+    #[test]
+    fn runaway_timing_values_are_limited() {
+        let cfg: GuardianConfig = toml::from_str(
+            "sample_interval_secs = 999999999\n[hysteresis]\nescalate_samples = 4000000000\ndeescalate_secs = 300000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sample_interval(), MAX_SAMPLE_INTERVAL_SECS);
+        assert_eq!(cfg.hysteresis.escalate(), MAX_ESCALATE_SAMPLES);
+        assert_eq!(cfg.hysteresis.deescalate_samples(cfg.sample_interval()), 120);
+        let zero = HysteresisConfig {
+            escalate_samples: 0,
+            ..HysteresisConfig::default()
+        };
+        assert_eq!(zero.escalate(), 1);
+    }
+
+    #[test]
+    fn exit_band_is_clamped() {
+        let mut h = HysteresisConfig::default();
+        h.exit_band = 7.0;
+        assert_eq!(h.band(), 0.5);
+        h.exit_band = -1.0;
+        assert_eq!(h.band(), 0.0);
+        h.exit_band = f64::NAN;
+        assert_eq!(h.band(), 0.0);
+    }
+
+    #[test]
+    fn exit_band_moves_thresholds_toward_safety() {
+        let t = ThresholdConfig::default().with_exit_band(0.10);
+        assert!((t.critical_swap_percent - 45.0).abs() < 1e-9);
+        assert!((t.strained_cpu_percent - 63.0).abs() < 1e-9);
+        assert!((t.critical_memory_gb - 1.1).abs() < 1e-9);
+        assert!((t.strained_memory_gb - 2.2).abs() < 1e-9);
     }
 }

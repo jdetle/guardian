@@ -491,6 +491,33 @@ else
     fail "claude preTool: critical should re-advise after strained (got $result)"
 fi
 
+# Flapping: once critical has been reported, dropping to strained and returning to critical
+# inside the same interval must stay quiet (each advisory costs the agent context tokens).
+fresh_state strained >"$STATE_FILE"
+result=$(echo '{"tool_name":"Bash","session_id":"s-a"}' | bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
+if [ -z "$result" ]; then
+    pass "claude preTool: de-escalation to strained is not re-advised"
+else
+    fail "claude preTool: strained after critical should be silent (got $result)"
+fi
+
+fresh_state critical >"$STATE_FILE"
+result=$(echo '{"tool_name":"Bash","session_id":"s-a"}' | bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
+if [ -z "$result" ]; then
+    pass "claude preTool: flap back to critical within the interval is not re-advised"
+else
+    fail "claude preTool: repeated critical should be silent (got $result)"
+fi
+
+result=$(echo '{"tool_name":"Bash","session_id":"s-a"}' \
+    | GUARDIAN_ADVISE_INTERVAL_SECS=0 bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
+ctx=$(echo "$result" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)
+if [ -n "$ctx" ]; then
+    pass "claude preTool: advisory repeats once the interval has elapsed"
+else
+    fail "claude preTool: expired interval should re-advise (got $result)"
+fi
+
 reset_policy
 fresh_state critical >"$STATE_FILE"
 result=$(echo '{"tool_name":"Agent","session_id":"s-c"}' | bash "$CLAUDE_HOOKS/pre-tool-use.sh" 2>/dev/null)
