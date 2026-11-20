@@ -2,9 +2,11 @@
 
 use chrono::{Duration, Local, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use guardian_daemon::config::{
     config_path, guardian_dir, load_config, load_config_report, ConfigSource,
 };
+use guardian_daemon::disk_targets;
 use guardian_daemon::stats::PressureStats;
 use guardian_daemon::zeno::{self, apply_zeno, ZenoState};
 
@@ -43,11 +45,73 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Find disk space to free: old build output, git worktrees and tool caches across
+    /// all your git repositories. Listing is read-only; `clean` and `delete` remove things.
+    Disk {
+        #[command(flatten)]
+        scan: ScanArgs,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<DiskAction>,
+    },
     /// Show how much time was spent at each pressure level, per day.
     Stats {
         /// How many of the most recent days to show.
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=30))]
         days: u32,
+    },
+}
+
+#[derive(clap::Args, Clone)]
+struct ScanArgs {
+    /// How many targets to list.
+    #[arg(long, global = true, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..=100))]
+    top: u32,
+    /// Ignore anything smaller than this many megabytes.
+    #[arg(long, global = true, default_value_t = 100)]
+    min_mb: u64,
+    /// Time budget for the scan, in seconds.
+    #[arg(long, global = true, default_value_t = 45, value_parser = clap::value_parser!(u64).range(1..=600))]
+    seconds: u64,
+    /// Only list build folders and worktrees untouched for at least this many days.
+    #[arg(long, global = true, default_value_t = 0)]
+    older_than: u64,
+    /// Also search this folder (repeatable). Your home folder is always searched, except
+    /// Desktop, Documents and Downloads, which macOS guards with a permission prompt.
+    #[arg(long, global = true)]
+    root: Vec<PathBuf>,
+}
+
+impl ScanArgs {
+    fn options(&self) -> disk_targets::Options {
+        disk_targets::Options {
+            roots: self.root.clone(),
+            min_bytes: self.min_mb.saturating_mul(1024 * 1024),
+            top: self.top as usize,
+            budget: std::time::Duration::from_secs(self.seconds),
+            older_than_days: self.older_than,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum DiskAction {
+    /// Scan, then choose what to delete. Asks before deleting anything. Takes the same
+    /// scan options as `guardian disk`, before or after the word `clean`.
+    Clean,
+    /// Delete specific targets from a scan. Each is re-checked first: a build folder must
+    /// hold nothing git tracks, a worktree no uncommitted work.
+    Delete {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Print JSON results.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -111,6 +175,209 @@ fn clear_snooze() -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn home() -> Result<PathBuf, String> {
+    dirs::home_dir().ok_or_else(|| "could not find the home directory".to_string())
+}
+
+/// Ask a question on the terminal and read one line. Refuses when there is no terminal:
+/// nothing is ever deleted on the strength of piped input.
+fn ask(question: &str) -> Result<String, String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err("this needs a terminal to confirm in (or pass --yes to `disk delete`)".to_string());
+    }
+    print!("{question}");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+    Ok(line.trim().to_string())
+}
+
+fn said_yes(answer: &str) -> bool {
+    matches!(answer.to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Delete each path, reporting one line per target. Returns the bytes freed.
+fn delete_all(paths: &[PathBuf], home: &std::path::Path) -> (u64, usize) {
+    let (mut freed, mut failed) = (0u64, 0usize);
+    for path in paths {
+        let shown = disk_targets::display_path(path, home);
+        match disk_targets::delete_target(path, home) {
+            Ok(done) => {
+                freed += done.freed_bytes;
+                println!("  deleted {shown} ({})", disk_targets::human_size(done.freed_bytes));
+            }
+            Err(why) => {
+                failed += 1;
+                println!("  kept    {shown}: {why}");
+            }
+        }
+    }
+    (freed, failed)
+}
+
+fn print_free_space(home: &std::path::Path) {
+    if let Some((used, avail)) = disk_targets::volume_usage(home) {
+        println!("Disk now: {used:.1}% used, {avail:.1} GB free.");
+    }
+}
+
+fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
+    let home = home()?;
+    println!("Scanning your git repositories and tool caches (up to {} s)...", scan.seconds);
+    // Look at more than will be listed: only things Guardian can delete are offered.
+    let mut opts = scan.options();
+    opts.top = 100;
+    let report = disk_targets::survey(&opts).ok_or("could not find the home directory")?;
+    let offered: Vec<disk_targets::Target> = report
+        .targets
+        .into_iter()
+        .filter(|t| t.deletable)
+        .take(scan.top as usize)
+        .collect();
+    if offered.is_empty() {
+        println!("Nothing Guardian can delete was found. `guardian disk` lists everything, including items that need a tool or a decision.");
+        return Ok(());
+    }
+
+    println!(
+        "\nDisk: {:.1}% used, {:.1} GB free. {} git repositories scanned.\n",
+        report.used_percent, report.available_gb, report.repos_scanned
+    );
+    for (i, t) in offered.iter().enumerate() {
+        let mut details: Vec<String> = Vec::new();
+        if let Some(age) = t.age_text() {
+            details.push(age);
+        }
+        details.push(t.note.clone().unwrap_or_else(|| t.cost.clone()));
+        let flag = if t.safety == disk_targets::Safety::Review { "  LOOK FIRST" } else { "" };
+        println!(
+            "{:>3}. {:>9}  {} ({}){flag}\n                {}",
+            i + 1,
+            t.size_text(),
+            t.what,
+            t.display_path,
+            details.join("; ")
+        );
+    }
+    let old: Vec<&disk_targets::Target> = offered.iter().filter(|t| t.is_old_and_safe()).collect();
+    let old_bytes: u64 = old.iter().map(|t| t.bytes).sum();
+    println!();
+    if !old.is_empty() {
+        println!(
+            "`old` selects the {} item(s) that come back on their own and have gone untouched for {}+ days ({}).",
+            old.len(),
+            disk_targets::OLD_DAYS,
+            disk_targets::human_size(old_bytes)
+        );
+    }
+
+    let answer = ask("Delete which? Numbers (1 3 5, 2-4), `old`, or Enter for none: ")?;
+    let Some(picked) = disk_targets::parse_selection(&answer, &offered)? else {
+        println!("Nothing deleted.");
+        return Ok(());
+    };
+    // Deleting a worktree takes the build folders inside it along; do not ask for them twice.
+    let chosen: Vec<&disk_targets::Target> = picked.iter().map(|i| &offered[*i]).collect();
+    let paths: Vec<PathBuf> = chosen
+        .iter()
+        .filter(|t| {
+            !chosen
+                .iter()
+                .any(|outer| outer.path != t.path && t.path.starts_with(&outer.path))
+        })
+        .map(|t| t.path.clone())
+        .collect();
+    let total: u64 = chosen
+        .iter()
+        .filter(|t| paths.contains(&t.path))
+        .map(|t| t.bytes)
+        .sum();
+
+    println!();
+    for t in chosen.iter().filter(|t| paths.contains(&t.path)) {
+        let warn = if t.safety == disk_targets::Safety::Review {
+            format!("  <- {}", t.note.clone().unwrap_or_else(|| t.cost.clone()))
+        } else {
+            String::new()
+        };
+        println!("  {:>9}  {}{warn}", t.size_text(), t.display_path);
+    }
+    let confirm = ask(&format!(
+        "Delete these {} item(s), about {}? This cannot be undone. [y/N] ",
+        paths.len(),
+        disk_targets::human_size(total)
+    ))?;
+    if !said_yes(&confirm) {
+        println!("Nothing deleted.");
+        return Ok(());
+    }
+
+    let (freed, failed) = delete_all(&paths, &home);
+    println!("Freed about {}.", disk_targets::human_size(freed));
+    print_free_space(&home);
+    if failed > 0 {
+        return Err(format!("{failed} item(s) were kept; see above."));
+    }
+    Ok(())
+}
+
+fn disk_delete(paths: &[PathBuf], yes: bool, json: bool) -> Result<(), String> {
+    let home = home()?;
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    if json {
+        // Machine use (the menu bar app): the caller has already confirmed.
+        if !yes {
+            return Err("--json needs --yes: confirmation is the caller's job".to_string());
+        }
+        let results: Vec<serde_json::Value> = paths
+            .iter()
+            .map(|p| match disk_targets::delete_target(p, &home) {
+                Ok(done) => serde_json::json!({"path": p.to_string_lossy(), "ok": true, "freed_bytes": done.freed_bytes}),
+                Err(why) => serde_json::json!({"path": p.to_string_lossy(), "ok": false, "error": why}),
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(results));
+        return Ok(());
+    }
+
+    // Say what cannot be deleted before asking about the rest.
+    let mut deletable = Vec::new();
+    for p in &paths {
+        match disk_targets::why_not_deletable(p, &home) {
+            Some(why) => println!("  will keep {}: {why}", disk_targets::display_path(p, &home)),
+            None => deletable.push(p.clone()),
+        }
+    }
+    if deletable.is_empty() {
+        return Err("Nothing to delete.".to_string());
+    }
+    if !yes {
+        for p in &deletable {
+            println!("  will delete {}", disk_targets::display_path(p, &home));
+        }
+        let confirm = ask(&format!(
+            "Delete {} item(s)? This cannot be undone. [y/N] ",
+            deletable.len()
+        ))?;
+        if !said_yes(&confirm) {
+            println!("Nothing deleted.");
+            return Ok(());
+        }
+    }
+    let (freed, failed) = delete_all(&deletable, &home);
+    println!("Freed about {}.", disk_targets::human_size(freed));
+    print_free_space(&home);
+    if failed > 0 || deletable.len() < paths.len() {
+        return Err("Some items were kept; see above.".to_string());
+    }
+    Ok(())
+}
+
 fn check_config() -> Result<(), String> {
     let path = config_path();
     let report = load_config_report();
@@ -156,6 +423,23 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Config {
             action: ConfigAction::Check,
         } => check_config(),
+        Commands::Disk { scan, json, action } => match action {
+            None => {
+                let report = disk_targets::survey(&scan.options())
+                    .ok_or_else(|| "could not find the home directory".to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    print!("{}", report.render());
+                }
+                Ok(())
+            }
+            Some(DiskAction::Clean) => disk_clean(&scan),
+            Some(DiskAction::Delete { paths, yes, json }) => disk_delete(&paths, yes, json),
+        },
         Commands::Stats { days } => {
             print!("{}", PressureStats::load().render(days as usize));
             Ok(())
@@ -255,9 +539,27 @@ mod tests {
     }
 
     #[test]
+    fn scan_options_work_on_either_side_of_clean() {
+        let older_than = |args: &[&str]| match Cli::try_parse_from(args).ok().map(|c| c.command) {
+            Some(Commands::Disk { scan, action: Some(DiskAction::Clean), .. }) => Some(scan.older_than),
+            _ => None,
+        };
+        assert_eq!(older_than(&["guardian", "disk", "--older-than", "14", "clean"]), Some(14));
+        assert_eq!(older_than(&["guardian", "disk", "clean", "--older-than", "14"]), Some(14));
+        assert_eq!(older_than(&["guardian", "disk", "clean"]), Some(0));
+    }
+
+    #[test]
     fn config_check_and_stats_parse() {
         assert!(parses(&["guardian", "config", "check"]));
         assert!(parses(&["guardian", "stats", "--days", "30"]));
         assert!(!parses(&["guardian", "stats", "--days", "0"]));
+        assert!(parses(&["guardian", "disk"]));
+        assert!(parses(&["guardian", "disk", "--top", "5", "--root", "/tmp/a", "--root", "/tmp/b", "--json"]));
+        assert!(!parses(&["guardian", "disk", "--seconds", "0"]));
+        assert!(parses(&["guardian", "disk", "--older-than", "30"]));
+        assert!(parses(&["guardian", "disk", "clean", "--top", "20", "--older-than", "14"]));
+        assert!(parses(&["guardian", "disk", "delete", "/tmp/a", "/tmp/b", "--yes", "--json"]));
+        assert!(!parses(&["guardian", "disk", "delete"]));
     }
 }

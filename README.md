@@ -42,7 +42,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[tool_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
-| Guardian.app | `app/`, `scripts/install-app.sh` | SwiftUI **menu bar app** (optional, no Dock icon) — level and why, snooze / allow once, memory, swap, disk, per-agent RAM, today's time at each level and config problems. See [Menu bar app](#menu-bar-app). |
+| Guardian.app | `app/`, `scripts/install-app.sh` | SwiftUI **menu bar app** (optional, no Dock icon) — level and why, snooze / allow once, memory, swap, disk, per-agent RAM, today's time at each level, config problems, and **Find space to free**. See [Menu bar app](#menu-bar-app). |
 | Stress tests | `tests/stress/` | **Containerized** hook validation (no bare-metal stress) |
 | Resume + zeno | `~/.guardian/guardian`, `Guardian-*.command`, `/guardian-snooze` | CLI, macOS double-click helpers, Cursor slash commands (see `hooks/resources.md`) |
 
@@ -114,6 +114,7 @@ A shield appears at the right of the menu bar; its shape follows the level (outl
 - memory, swap, CPU, disk, the kernel's memory-pressure and thermal verdicts, per-agent RAM
 - **Today**: share of time at each level and how often it changed
 - any **config problem** the daemon reported
+- **Find space to free**: the `guardian disk` scan of all your git repositories, with each item's age and worktree status. Items Guardian can safely remove have a bin button that asks before deleting (through the same checks as `guardian disk delete`); the rest have a button that copies their removal command. Every row can be shown in Finder.
 - **Open dashboard** for the larger System / Sessions / Docker / Settings window
 
 It notifies you only when load becomes critical or the disk becomes critical. The app needs macOS 14 and the Swift toolchain to build; it reads `~/.guardian/` and calls `~/.guardian/guardian`, so install the daemon first.
@@ -175,6 +176,30 @@ If you still see messages about **“Parallel workspace load”** and **`~/.curs
 ### Disk (`[disk]`)
 
 **`[disk]`** samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
+
+### Finding space to free (`guardian disk`)
+
+```bash
+~/.guardian/guardian disk                  # list the biggest targets (read-only)
+~/.guardian/guardian disk --older-than 14  # only projects and worktrees untouched for 2+ weeks
+~/.guardian/guardian disk clean            # list, then choose what to delete
+~/.guardian/guardian disk delete ~/code/app/target   # delete specific targets
+```
+
+The scan walks your home folder for **every git repository** (skipping `Library`, media folders, and `Desktop` / `Documents` / `Downloads`, which macOS guards with a permission prompt; add one with `--root`) and reports:
+
+- **Build output and dependencies** inside projects: `target/`, `node_modules/`, `.next/`, `.build/`, `Pods/`, virtual environments, and similar.
+- **Linked git worktrees**, each checked for unsaved work: uncommitted or untracked files, commits on a detached HEAD that exist nowhere else, a lock, and ignored files git keeps no copy of (`.env` files, local databases, notes) anywhere in the worktree.
+- **Tool caches**: Cargo, npm, pnpm, Bun, pip, uv, Homebrew, Go, Gradle, Maven, Xcode and Simulator data, Playwright browsers, Docker's disk image, model caches and the Trash.
+
+Every target shows its size, how long the project has gone untouched, and whether it **comes back on its own** or needs a **look before deleting**. Projects are measured oldest first inside a time budget (`--seconds`, default 45), at background I/O priority, so the scan is safe to run on a machine that is already struggling; anything not reached is counted and reported.
+
+**Deleting is a separate, confirmed step.** `disk clean` numbers what it can delete and asks which (`1 3 5`, `2-4`, or `old` for everything that comes back on its own and has gone untouched for 14+ days), then asks once more before removing anything. Each target is re-checked at that moment:
+
+- a build or dependency folder is deleted only if git tracks nothing inside it;
+- a worktree is removed with `git worktree remove`, never `--force`, and only if it has no uncommitted work — its branch stays in the repository;
+- caches that have their own cleaner (`npm cache clean`, `brew cleanup`, `docker system prune`, …) are listed with that command and left for you to run;
+- nothing outside your home folder, nothing at its top level, and no symlink is ever deleted.
 
 ### Deferred work queue (`[queue]`)
 

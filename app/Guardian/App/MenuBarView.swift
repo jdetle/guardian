@@ -2,9 +2,10 @@ import AppKit
 import SwiftUI
 
 /// The panel that opens from the menu bar item: what the level is and why, what is switched
-/// off, and how today has gone.
+/// off, how today has gone, and where disk space can be found.
 struct MenuBarView: View {
     @EnvironmentObject private var client: GuardianClient
+    @State private var copiedPath: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -35,6 +36,9 @@ struct MenuBarView: View {
                 Divider()
                 todayRow(today)
             }
+
+            Divider()
+            diskSection
 
             if !client.queueEntries.isEmpty {
                 Divider()
@@ -234,6 +238,157 @@ struct MenuBarView: View {
             )
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Disk
+
+    private var diskSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Free up disk space")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                if client.diskScanning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Scanning…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button(client.diskReport == nil ? "Find space to free" : "Scan again") {
+                        client.scanDisk()
+                    }
+                }
+            }
+
+            if let error = client.diskScanError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let message = client.deleteMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let report = client.diskReport {
+                if report.targets.isEmpty {
+                    Text("Nothing large and easy to remove was found.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(summary(report))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(report.targets) { target in
+                                targetRow(target)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 260)
+                    Text("The bin deletes after asking, and only what is safe: nothing git tracks, no worktree with uncommitted work. Other rows copy a command to run yourself.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func summary(_ report: DiskReport) -> String {
+        var text = "\(report.reposScanned) git repositories scanned. "
+            + "\(DiskTarget.sizeText(report.regeneratesBytes)) comes back on its own, "
+            + "\(DiskTarget.sizeText(report.reviewBytes)) needs a look."
+        if report.unmeasured > 0 {
+            text += " \(report.unmeasured) recently used places were not measured."
+        }
+        return text
+    }
+
+    private func targetRow(_ target: DiskTarget) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(target.sizeText)
+                .font(.caption.monospacedDigit().weight(.medium))
+                .frame(width: 62, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(target.what)
+                    .font(.caption)
+                    .lineLimit(1)
+                Text(target.displayPath)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(target.detailText)
+                    .font(.caption2)
+                    .foregroundStyle(target.regenerates ? Color.secondary : Color.orange)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: target.path)])
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.borderless)
+            .help("Show in Finder")
+            if client.deletingPath == target.path {
+                ProgressView()
+                    .controlSize(.small)
+            } else if target.deletable {
+                Button {
+                    confirmDelete(target)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .disabled(client.deletingPath != nil)
+                .help("Delete (asks first)")
+            } else {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(target.remove, forType: .string)
+                    copiedPath = target.path
+                } label: {
+                    Image(systemName: copiedPath == target.path ? "checkmark" : "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .help("Copy: \(target.remove)")
+            }
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+    }
+
+    /// Ask before deleting. Cancel is the default button; the delete button is marked
+    /// destructive, so Return never deletes.
+    private func confirmDelete(_ target: DiskTarget) {
+        let alert = NSAlert()
+        alert.alertStyle = target.regenerates ? .informational : .warning
+        alert.messageText = "Delete \(target.what.lowercased()), \(target.sizeText)?"
+        var lines = [target.displayPath, target.detailText]
+        if target.kind == "worktree" {
+            lines.append("Removed with git worktree remove. Ignored files in it, such as .env files and installed dependencies, are deleted with it.")
+        } else {
+            lines.append("It comes back: \(target.cost).")
+        }
+        lines.append("This cannot be undone.")
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.addButton(withTitle: "Cancel")
+        let delete = alert.addButton(withTitle: "Delete")
+        delete.hasDestructiveAction = true
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            client.deleteTarget(target)
         }
     }
 

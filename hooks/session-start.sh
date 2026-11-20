@@ -137,7 +137,7 @@ case "$disk_level" in
         context="${context} Disk tight: ~${disk_used}% used (~${disk_avail} GB free on ${disk_vol})."
         ;;
     critical)
-        context="${context} Disk critical: ~${disk_used}% used (~${disk_avail} GB free on ${disk_vol}) — free space soon."
+        context="${context} Disk critical: ~${disk_used}% used (~${disk_avail} GB free on ${disk_vol}) — free space soon; ${G_home}/guardian disk lists quick targets."
         ;;
 esac
 

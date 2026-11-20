@@ -2,6 +2,7 @@
 
 mod classifier;
 pub mod config;
+pub mod disk_targets;
 mod docker;
 mod hook_policy;
 mod sampler;

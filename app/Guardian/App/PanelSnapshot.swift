@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// `Guardian --render-panel <file.png>` draws the menu bar panel to a PNG from
+/// `Guardian --render-panel <file.png> [--with-disk]` draws the menu bar panel to a PNG from
 /// the live ~/.guardian state and exits. It exists so the panel can be checked (and
 /// screenshotted for docs) without clicking through the menu bar.
 @MainActor
@@ -15,6 +15,12 @@ enum PanelSnapshot {
 
     static func render(to path: String, client: GuardianClient) -> Bool {
         client.refreshNow()
+        if CommandLine.arguments.contains("--with-disk") {
+            client.scanDisk()
+            while client.diskScanning {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            }
+        }
 
         let panel = MenuBarView()
             .environmentObject(client)

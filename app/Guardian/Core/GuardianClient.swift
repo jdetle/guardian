@@ -18,6 +18,13 @@ final class GuardianClient: ObservableObject {
     /// the hooks have failed open.
     @Published private(set) var isStale = false
     @Published private(set) var today: DayStats?
+    @Published private(set) var diskReport: DiskReport?
+    @Published private(set) var diskScanning = false
+    @Published private(set) var diskScanError: String?
+    /// The path being deleted right now, if any.
+    @Published private(set) var deletingPath: String?
+    /// The outcome of the last delete, in a sentence.
+    @Published private(set) var deleteMessage: String?
     @Published var history: [GuardianStateData] = []
     @Published var sessions: [SessionRecord] = []
     @Published var queueEntries: [AgentQueueEntry] = []
@@ -105,6 +112,42 @@ final class GuardianClient: ObservableObject {
         today = file.days[formatter.string(from: Date())]
     }
 
+    /// Run `guardian disk --json`: a read-only survey of what is cheap to delete.
+    func scanDisk() {
+        guard !diskScanning else { return }
+        diskScanning = true
+        diskScanError = nil
+        let executable = guardianDir.appendingPathComponent("guardian")
+        scanQueue.async {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["disk", "--json", "--top", "12", "--seconds", "45"]
+            let out = Pipe()
+            process.standardOutput = out
+            process.standardError = FileHandle.nullDevice
+            var report: DiskReport?
+            var failure: String?
+            do {
+                try process.run()
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                if process.terminationStatus == 0 {
+                    report = try? JSONDecoder().decode(DiskReport.self, from: data)
+                }
+                if report == nil {
+                    failure = "The scan needs guardian 0.8 or newer. Reinstall: bash scripts/install.sh"
+                }
+            } catch {
+                failure = error.localizedDescription
+            }
+            DispatchQueue.main.async {
+                self.diskScanning = false
+                self.diskScanError = failure
+                if let report { self.diskReport = report }
+            }
+        }
+    }
+
     func runPromptControl(_ arguments: [String]) {
         promptControlError = nil
         let executable = guardianDir.appendingPathComponent("guardian")
@@ -130,6 +173,45 @@ final class GuardianClient: ObservableObject {
             DispatchQueue.main.async {
                 self.promptControlError = failure
                 self.loadPromptControls()
+            }
+        }
+    }
+
+    /// Delete one scanned target with `guardian disk delete`. The CLI re-checks it first
+    /// (nothing git tracks, no uncommitted work in a worktree) and refuses otherwise.
+    /// Call only after the person has confirmed.
+    func deleteTarget(_ target: DiskTarget) {
+        guard deletingPath == nil else { return }
+        deletingPath = target.path
+        deleteMessage = nil
+        let executable = guardianDir.appendingPathComponent("guardian")
+        scanQueue.async {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["disk", "delete", "--yes", "--json", target.path]
+            let out = Pipe()
+            process.standardOutput = out
+            process.standardError = FileHandle.nullDevice
+            var result: DeleteResult?
+            do {
+                try process.run()
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                result = (try? JSONDecoder().decode([DeleteResult].self, from: data))?.first
+            } catch {
+                result = nil
+            }
+            DispatchQueue.main.async {
+                self.deletingPath = nil
+                if let result, result.ok {
+                    self.diskReport?.targets.removeAll {
+                        $0.path == target.path || $0.path.hasPrefix(target.path + "/")
+                    }
+                    self.deleteMessage = "Deleted \(target.displayPath), freeing about \(DiskTarget.sizeText(result.freedBytes ?? target.bytes))."
+                    self.loadState()
+                } else {
+                    self.deleteMessage = "Kept \(target.displayPath): \(result?.error ?? "the delete command did not run")."
+                }
             }
         }
     }
