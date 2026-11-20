@@ -39,7 +39,7 @@ own permission prompt. It either says nothing, adds context, or (opt-in) denies 
 
 The prompt gate only sees *new prompts*. A long agentic turn can keep spawning subagents — each one
 a separate process — after pressure has already gone critical. To stop that, set in
-`~/.guardian/config.toml` and restart `guardiand`:
+`~/.guardian/config.toml` (applied within a few seconds, no restart):
 
 ```toml
 [tool_gate]

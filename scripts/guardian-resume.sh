@@ -30,6 +30,14 @@ cmd="${1:-}"
 case "$cmd" in
     snooze)
         min="${2:-15}"
+        # Same limit as the guardian CLI: hooks ignore a snooze further out than 2 hours.
+        case "$min" in
+            ''|*[!0-9]*) echo "Minutes must be a whole number." >&2; exit 1 ;;
+        esac
+        if [ "$min" -lt 1 ] || [ "$min" -gt 120 ]; then
+            echo "Snooze is limited to 1-120 minutes. To switch a gate off for longer, set it in ~/.guardian/config.toml." >&2
+            exit 1
+        fi
         ts=""
         if ts=$(date -u -v+"${min}"M '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null); then
             :

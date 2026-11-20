@@ -174,6 +174,22 @@ read_state_reasons_suffix() {
     fi
 }
 
+# Problems guardiand found in config.toml (guardiand >= 0.8 writes config_problems), as one
+# plain line: "a; b". Empty when the file is clean. At most two, since this lands in agent
+# context; `guardian config check` lists them all.
+read_state_config_problems() {
+    if [ ! -f "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
+        return 0
+    fi
+    jq -r 'try (
+        (.config_problems // [])
+        | if type == "array" then (
+              map(select(type == "string")) | .[0:2] | join("; ")
+              | gsub("[[:cntrl:]]"; " ") | .[0:300] | sub("[. ]+$"; "")
+          ) else "" end
+    ) catch ""' < "$STATE_FILE" 2>/dev/null || true
+}
+
 read_full_state() {
     if [ ! -f "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; then
         echo "{}"
@@ -294,20 +310,58 @@ guardian_hook_is_guardian_meta_prompt() {
     return 1
 }
 
-guardian_snooze_active() {
-    local f="$GUARDIAN_DIR/snooze_until"
-    [ -f "$f" ] || return 1
-    local until_s until_epoch now_epoch
-    until_s=$(head -1 "$f" | tr -d '\r\n')
-    [ -n "$until_s" ] || return 1
+# Longest snooze the hooks honor. `guardian snooze` refuses more (MAX_SNOOZE_MINUTES in the
+# CLI); a snooze_until further out than this is ignored rather than trusted. A gate that
+# should be off for longer belongs in config.toml, where it stays visible.
+GUARDIAN_MAX_SNOOZE_SECS=7200
+
+# Seconds of snooze left; 0 when not snoozed (no file, expired, unreadable, or beyond the cap).
+guardian_snooze_remaining_secs() {
+    local f="$GUARDIAN_DIR/snooze_until" until_s until_epoch now_epoch left
+    if [ ! -f "$f" ]; then
+        echo 0
+        return 0
+    fi
+    until_s=$(head -1 "$f" 2>/dev/null | tr -d '\r\n')
     until_epoch=$(parse_iso_epoch "$until_s")
+    case "$until_epoch" in
+        ''|*[!0-9]*) until_epoch=0 ;;
+    esac
     now_epoch=$(date -u +%s)
-    [ "$now_epoch" -lt "$until_epoch" ]
+    left=$(( until_epoch - now_epoch ))
+    # Two minutes of slack: clock adjustments, and the moment between writing and reading.
+    if [ "$left" -le 0 ] || [ "$left" -gt $(( GUARDIAN_MAX_SNOOZE_SECS + 120 )) ]; then
+        echo 0
+        return 0
+    fi
+    echo "$left"
 }
 
-# Only the hook that removes the marker gets the bypass.
+guardian_snooze_active() {
+    [ "$(guardian_snooze_remaining_secs)" -gt 0 ]
+}
+
+# An allow-once token is good for about this long after `guardian once` (or
+# `touch ~/.guardian/proceed_once`). Without an expiry, a token armed and then not needed
+# would sit there and wave through some unrelated block days later.
+GUARDIAN_ONCE_TTL_MINUTES=10
+
+# Is an unexpired allow-once token present? Does not consume it.
+guardian_proceed_once_armed() {
+    local f="$GUARDIAN_DIR/proceed_once"
+    [ -f "$f" ] || return 1
+    # BSD find rounds the age up to whole minutes, GNU find does not: +1 keeps both at
+    # "at least the TTL".
+    [ -n "$(find "$f" -mmin "-$(( GUARDIAN_ONCE_TTL_MINUTES + 1 ))" 2>/dev/null)" ]
+}
+
+# Only the hook that removes the marker gets the bypass. An expired token is removed too,
+# but grants nothing.
 guardian_consume_proceed_once() {
-    rm "$GUARDIAN_DIR/proceed_once" 2>/dev/null
+    local fresh=1
+    guardian_proceed_once_armed || fresh=0
+    rm "$GUARDIAN_DIR/proceed_once" 2>/dev/null || return 1
+    [ "$fresh" = 1 ]
 }
 
 guardian_resume_hint_text() {

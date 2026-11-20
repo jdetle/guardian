@@ -436,22 +436,343 @@ pub fn guardian_dir() -> PathBuf {
         .join(".guardian")
 }
 
-pub fn load_config() -> GuardianConfig {
-    let path = guardian_dir().join("config.toml");
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
-            eprintln!("[guardian] config parse error: {e}, using defaults");
-            GuardianConfig::default()
-        }),
-        Err(_) => GuardianConfig::default(),
+const CONFIG_TOML: &str = "config.toml";
+const LAST_GOOD_TOML: &str = "config.last_good.toml";
+
+pub fn config_path() -> PathBuf {
+    guardian_dir().join(CONFIG_TOML)
+}
+
+pub fn last_good_path() -> PathBuf {
+    guardian_dir().join(LAST_GOOD_TOML)
+}
+
+/// Where the settings in a [`LoadedConfig`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// `config.toml` parsed.
+    File,
+    /// No `config.toml`: built-in defaults, which is a normal state.
+    Missing,
+    /// `config.toml` is broken; the last version that parsed is in use instead.
+    LastGood,
+    /// `config.toml` is broken and no earlier version is available.
+    Defaults,
+}
+
+/// Settings plus everything the user should be told about their `config.toml`.
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    pub config: GuardianConfig,
+    pub source: ConfigSource,
+    /// Plain-language problems; empty when the file is clean.
+    pub problems: Vec<String>,
+}
+
+/// Parse `config.toml` text.
+///
+/// `Err` means the file cannot be used at all (TOML syntax, wrong value type). `Ok` carries
+/// the settings and any warnings: unknown keys (a misspelled setting is otherwise silently
+/// ignored) and values that cannot mean what the user intended.
+pub fn parse_config(text: &str) -> Result<(GuardianConfig, Vec<String>), String> {
+    let value: toml::Value = toml::from_str(text).map_err(|e| one_line(&e.to_string()))?;
+    let config: GuardianConfig = toml::from_str(text).map_err(|e| one_line(&e.to_string()))?;
+
+    let mut warnings = Vec::new();
+    if let Ok(schema) = toml::Value::try_from(GuardianConfig::schema_example()) {
+        unknown_keys(&value, &schema, "", &mut warnings);
+    }
+    warnings.extend(config.validate());
+    Ok((config, warnings))
+}
+
+/// Read `config.toml`, falling back to the last version that parsed.
+///
+/// A broken file must never silently swap the user's thresholds for the built-in defaults:
+/// on a small-RAM Mac the defaults read as permanent pressure. Read-only; the daemon records
+/// the last good copy with [`remember_last_good`].
+pub fn load_config_report() -> LoadedConfig {
+    let text = match std::fs::read_to_string(config_path()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return LoadedConfig {
+                config: GuardianConfig::default(),
+                source: ConfigSource::Missing,
+                problems: Vec::new(),
+            }
+        }
+        Err(e) => return fall_back(format!("config.toml could not be read ({e})")),
+    };
+    match parse_config(&text) {
+        Ok((config, problems)) => LoadedConfig {
+            config,
+            source: ConfigSource::File,
+            problems,
+        },
+        Err(e) => fall_back(format!("config.toml has an error ({e})")),
     }
 }
 
+fn fall_back(what: String) -> LoadedConfig {
+    let last_good = std::fs::read_to_string(last_good_path())
+        .ok()
+        .and_then(|t| parse_config(&t).ok());
+    match last_good {
+        Some((config, _)) => LoadedConfig {
+            config,
+            source: ConfigSource::LastGood,
+            problems: vec![format!("{what}; using the last settings that worked")],
+        },
+        None => LoadedConfig {
+            config: GuardianConfig::default(),
+            source: ConfigSource::Defaults,
+            problems: vec![format!("{what}; using built-in defaults")],
+        },
+    }
+}
+
+/// Settings only, for callers that do not report problems.
+pub fn load_config() -> GuardianConfig {
+    load_config_report().config
+}
+
+/// Keep a copy of a `config.toml` that parsed, for [`load_config_report`] to fall back to.
+pub fn remember_last_good(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    // An empty file is never worth falling back to: it means "all defaults", which is what
+    // a missing file means already, and it may be an editor caught mid-save.
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == text) {
+        return Ok(());
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// TOML errors span several lines with a source excerpt; problems are shown on one line.
+fn one_line(s: &str) -> String {
+    let joined = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    joined.chars().take(240).collect()
+}
+
+/// Keys present in `user` that the schema does not have, as `section.key`.
+fn unknown_keys(user: &toml::Value, schema: &toml::Value, path: &str, out: &mut Vec<String>) {
+    // Client names under [prompt_gate.clients] are checked by `validate`, with a better message.
+    if path == "prompt_gate.clients" {
+        return;
+    }
+    let (Some(user), Some(schema)) = (user.as_table(), schema.as_table()) else {
+        return;
+    };
+    for (key, value) in user {
+        let full = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        match schema.get(key) {
+            Some(known) => unknown_keys(value, known, &full, out),
+            None => {
+                let hint = closest(key, schema.keys().map(String::as_str))
+                    .map(|k| format!(" (did you mean `{k}`?)"))
+                    .unwrap_or_default();
+                out.push(format!("unknown setting `{full}` is ignored{hint}"));
+            }
+        }
+    }
+}
+
+/// The known key within two edits of `key`, if exactly that close.
+fn closest<'a>(key: &str, known: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    known
+        .map(|k| (edit_distance(key, k), k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut row = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != cb);
+            row.push(substitute.min(prev[j + 1] + 1).min(row[j] + 1));
+        }
+        prev = row;
+    }
+    prev[b.len()]
+}
+
+const PRESSURE_CUTOFFS: &[&str] = &["never", "strained", "critical"];
+const PROMPT_MODES: &[&str] = &["adaptive", "advisory", "strict"];
+const CLIENTS: &[&str] = &["cursor", "claude", "codex"];
+
 impl GuardianConfig {
+    /// A config with every optional key present, so its serialized form lists every key
+    /// `config.toml` may contain. **When adding an `Option` field, set it here.**
+    fn schema_example() -> Self {
+        let mut c = Self::default();
+        c.thresholds.strained_memory_available_ratio = Some(0.15);
+        c.thresholds.critical_memory_available_ratio = Some(0.08);
+        c.session_budget.max_active_sessions = Some(0);
+        c.session_budget.warn_active_sessions = Some(0);
+        c
+    }
+
     /// The sampling interval the daemon actually uses: 0 would spin the CPU, and a huge
     /// value would leave the daemon asleep, deaf to the edit that fixes it.
     pub fn sample_interval(&self) -> u64 {
         self.sample_interval_secs.clamp(1, MAX_SAMPLE_INTERVAL_SECS)
+    }
+
+    /// Values that parse but cannot mean what was intended. Each is one plain sentence.
+    pub fn validate(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        let t = &self.thresholds;
+
+        if self.sample_interval_secs == 0 {
+            w.push("sample_interval_secs is 0; 1 second is used".to_string());
+        }
+        if self.sample_interval_secs > MAX_SAMPLE_INTERVAL_SECS {
+            w.push(format!(
+                "sample_interval_secs = {} is too long (hooks ignore state older than 30 seconds); {} is used",
+                self.sample_interval_secs, MAX_SAMPLE_INTERVAL_SECS
+            ));
+        }
+
+        for (name, v) in [
+            ("thresholds.strained_cpu_percent", t.strained_cpu_percent),
+            ("thresholds.critical_cpu_percent", t.critical_cpu_percent),
+            ("thresholds.strained_swap_percent", t.strained_swap_percent),
+            ("thresholds.critical_swap_percent", t.critical_swap_percent),
+            ("disk.warn_used_percent", self.disk.warn_used_percent),
+            ("disk.critical_used_percent", self.disk.critical_used_percent),
+        ] {
+            if !(0.0..=100.0).contains(&v) {
+                w.push(format!("{name} = {v} is not a percentage between 0 and 100"));
+            }
+        }
+        for (low_name, low, high_name, high) in [
+            ("thresholds.strained_cpu_percent", t.strained_cpu_percent, "critical_cpu_percent", t.critical_cpu_percent),
+            ("thresholds.strained_swap_percent", t.strained_swap_percent, "critical_swap_percent", t.critical_swap_percent),
+            ("disk.warn_used_percent", self.disk.warn_used_percent, "critical_used_percent", self.disk.critical_used_percent),
+            ("fork_guard.warn_ratio", self.fork_guard.warn_ratio, "kill_ratio", self.fork_guard.kill_ratio),
+        ] {
+            if low >= high {
+                w.push(format!("{low_name} ({low}) should be below {high_name} ({high})"));
+            }
+        }
+
+        // Available-memory floors run the other way: strained is the larger number.
+        if t.strained_memory_gb < 0.0 || t.critical_memory_gb < 0.0 {
+            w.push("thresholds: available-memory values cannot be negative".to_string());
+        }
+        if t.strained_memory_gb <= t.critical_memory_gb {
+            w.push(format!(
+                "thresholds.strained_memory_gb ({}) should be above critical_memory_gb ({}): \
+                 these are GB still available",
+                t.strained_memory_gb, t.critical_memory_gb
+            ));
+        }
+        for (name, r) in [
+            ("strained_memory_available_ratio", t.strained_memory_available_ratio),
+            ("critical_memory_available_ratio", t.critical_memory_available_ratio),
+        ] {
+            if let Some(r) = r {
+                if !(0.0..=1.0).contains(&r) {
+                    w.push(format!("thresholds.{name} = {r} is not a fraction between 0 and 1"));
+                }
+            }
+        }
+        if let (Some(s), Some(c)) = (
+            t.strained_memory_available_ratio,
+            t.critical_memory_available_ratio,
+        ) {
+            if s <= c {
+                w.push(format!(
+                    "thresholds.strained_memory_available_ratio ({s}) should be above \
+                     critical_memory_available_ratio ({c})"
+                ));
+            }
+        }
+        for (name, r) in [
+            ("fork_guard.warn_ratio", self.fork_guard.warn_ratio),
+            ("fork_guard.kill_ratio", self.fork_guard.kill_ratio),
+        ] {
+            if !(0.0..=1.0).contains(&r) {
+                w.push(format!("{name} = {r} is not a fraction between 0 and 1"));
+            }
+        }
+
+        let h = &self.hysteresis;
+        if h.exit_band.is_nan() || !(0.0..=0.5).contains(&h.exit_band) {
+            w.push(format!(
+                "hysteresis.exit_band = {} is outside 0 to 0.5; {} is used",
+                h.exit_band,
+                h.band()
+            ));
+        }
+        if h.escalate_samples == 0 {
+            w.push("hysteresis.escalate_samples is 0; 1 is used".to_string());
+        }
+        if h.escalate_samples > MAX_ESCALATE_SAMPLES {
+            w.push(format!(
+                "hysteresis.escalate_samples = {} would keep the level from ever rising; {} is used",
+                h.escalate_samples, MAX_ESCALATE_SAMPLES
+            ));
+        }
+        if h.deescalate_secs > MAX_DEESCALATE_SECS {
+            w.push(format!(
+                "hysteresis.deescalate_secs = {} would hold a level for hours; {} (one hour) is used",
+                h.deescalate_secs, MAX_DEESCALATE_SECS
+            ));
+        }
+
+        // A misspelled word here does not fail: the gate just never fires.
+        one_of(&mut w, "prompt_gate.mode", &self.prompt_gate.mode, PROMPT_MODES);
+        one_of(&mut w, "prompt_gate.block_on", &self.prompt_gate.block_on, PRESSURE_CUTOFFS);
+        one_of(
+            &mut w,
+            "tool_gate.deny_subagents_on",
+            &self.tool_gate.deny_subagents_on,
+            PRESSURE_CUTOFFS,
+        );
+        for (client, mode) in &self.prompt_gate.clients {
+            if !CLIENTS.contains(&client.as_str()) {
+                w.push(format!(
+                    "prompt_gate.clients.{client} is not a known client ({}) and is ignored",
+                    CLIENTS.join(", ")
+                ));
+            }
+            one_of(&mut w, &format!("prompt_gate.clients.{client}"), mode, PROMPT_MODES);
+        }
+
+        let b = &self.session_budget;
+        if b.max_cursor_rss_megabytes > 0 && b.warn_cursor_rss_megabytes > b.max_cursor_rss_megabytes {
+            w.push(format!(
+                "session_budget.warn_cursor_rss_megabytes ({}) is above max_cursor_rss_megabytes ({})",
+                b.warn_cursor_rss_megabytes, b.max_cursor_rss_megabytes
+            ));
+        }
+        w
+    }
+}
+
+fn one_of(out: &mut Vec<String>, name: &str, value: &str, allowed: &[&str]) {
+    if !allowed.contains(&value) {
+        out.push(format!(
+            "{name} = \"{value}\" is not one of {}; the setting has no effect",
+            allowed.join(", ")
+        ));
     }
 }
 
@@ -516,5 +837,121 @@ mod tests {
         assert!((t.strained_cpu_percent - 63.0).abs() < 1e-9);
         assert!((t.critical_memory_gb - 1.1).abs() < 1e-9);
         assert!((t.strained_memory_gb - 2.2).abs() < 1e-9);
+    }
+
+    // --- parse_config: problems the user must hear about ---
+
+    /// The default config written by scripts/install.sh.
+    fn installer_default_config() -> String {
+        let script = include_str!("../scripts/install.sh");
+        let start = script.find("<< 'TOML'\n").expect("heredoc start") + "<< 'TOML'\n".len();
+        let end = script[start..].find("\nTOML\n").expect("heredoc end") + start;
+        script[start..end].to_string()
+    }
+
+    #[test]
+    fn installer_default_config_is_clean() {
+        let (cfg, warnings) = parse_config(&installer_default_config()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.hysteresis.deescalate_secs, 30);
+    }
+
+    #[test]
+    fn empty_config_is_clean_defaults() {
+        let (cfg, warnings) = parse_config("").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.sample_interval_secs, 2);
+    }
+
+    #[test]
+    fn every_optional_key_is_known() {
+        let text = "[thresholds]\nstrained_memory_available_ratio = 0.15\n\
+                    critical_memory_available_ratio = 0.08\n\
+                    [session_budget]\nmax_active_sessions = 4\nwarn_active_sessions = 2\n\
+                    [prompt_gate.clients]\nclaude = \"advisory\"\n";
+        let (_, warnings) = parse_config(text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn misspelled_key_is_reported_with_a_suggestion() {
+        let (cfg, warnings) = parse_config("[hysteresis]\nexit_bnad = 0.3\n").unwrap();
+        assert_eq!(
+            warnings,
+            vec!["unknown setting `hysteresis.exit_bnad` is ignored (did you mean `exit_band`?)"]
+        );
+        // ...and the real setting keeps its default.
+        assert_eq!(cfg.hysteresis.exit_band, 0.10);
+    }
+
+    #[test]
+    fn unknown_section_is_reported() {
+        let (_, warnings) = parse_config("[treshholds]\ncritical_cpu_percent = 99\n").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`treshholds`"), "{warnings:?}");
+        assert!(warnings[0].contains("did you mean `thresholds`"), "{warnings:?}");
+    }
+
+    #[test]
+    fn syntax_error_is_an_error_on_one_line() {
+        let err = parse_config("[thresholds\ncritical_cpu_percent = 99\n").unwrap_err();
+        assert!(!err.contains('\n'), "{err}");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn wrong_type_is_an_error() {
+        assert!(parse_config("[thresholds]\ncritical_cpu_percent = \"high\"\n").is_err());
+    }
+
+    #[test]
+    fn misspelled_gate_word_is_reported() {
+        let (_, warnings) =
+            parse_config("[tool_gate]\ndeny_subagents_on = \"critcal\"\n").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("tool_gate.deny_subagents_on = \"critcal\""), "{warnings:?}");
+    }
+
+    #[test]
+    fn unknown_client_and_mode_are_reported() {
+        let (_, warnings) =
+            parse_config("[prompt_gate.clients]\nclade = \"strct\"\n").unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn inverted_thresholds_are_reported() {
+        let text = "[thresholds]\nstrained_cpu_percent = 95\ncritical_cpu_percent = 90\n\
+                    strained_memory_gb = 0.5\ncritical_memory_gb = 1.0\n";
+        let (_, warnings) = parse_config(text).unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("strained_cpu_percent (95) should be below"), "{warnings:?}");
+        assert!(warnings[1].contains("should be above critical_memory_gb"), "{warnings:?}");
+    }
+
+    #[test]
+    fn out_of_range_values_are_reported() {
+        let text = "sample_interval_secs = 0\n[thresholds]\ncritical_swap_percent = 900\n\
+                    [hysteresis]\nexit_band = 3\n";
+        let (cfg, warnings) = parse_config(text).unwrap();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert_eq!(cfg.sample_interval(), 1);
+    }
+
+    #[test]
+    fn runaway_timing_values_are_reported() {
+        let text = "sample_interval_secs = 999999999\n[hysteresis]\nescalate_samples = 5000\ndeescalate_secs = 300000\n";
+        let (_, warnings) = parse_config(text).unwrap();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("30 is used"), "{warnings:?}");
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("exit_band", "exit_band"), 0);
+        assert_eq!(edit_distance("exit_bnad", "exit_band"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(closest("dokcer", ["docker", "disk"].into_iter()), Some("docker"));
+        assert_eq!(closest("zzzzzz", ["docker", "disk"].into_iter()), None);
     }
 }
