@@ -43,9 +43,11 @@ def spawns_agent: . == "Agent" or . == "Task" or . == "spawn_agent";
           ($in.tool_name | text | if . == "" then "unknown" else . end) as $tool
           | [
               "INSERT INTO tool_calls (conversation_id, tool_name, duration_ms, model) VALUES (\($id), \($tool | q), \($in.duration_ms // $in.duration | int), \((if $model == "" then "unknown" else $model end) | q));",
-              # A session that has ended stays ended: this hook runs in the background in
-              # Claude Code and Codex, and can finish after the one that ended the session.
-              "UPDATE sessions SET state = CASE WHEN state = 'ended' THEN 'ended' ELSE 'working' END, tool_call_count = COALESCE(tool_call_count, 0) + 1"
+              # A session that has just ended stays ended: this hook runs in the background
+              # in Claude Code and can finish after the one that ended the session. A tool
+              # call minutes after an end is a session that is in fact going (one the
+              # upgrade took for over, or one whose end was reported and then carried on).
+              "UPDATE sessions SET state = CASE WHEN state = 'ended' AND ended_at > datetime('now', '-2 minutes') THEN 'ended' ELSE 'working' END, tool_call_count = COALESCE(tool_call_count, 0) + 1"
                 + (if ($tool | spawns_agent) then ", subagent_count = COALESCE(subagent_count, 0) + 1" else "" end)
                 + " WHERE conversation_id = \($id);"
             ]

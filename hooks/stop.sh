@@ -41,7 +41,7 @@ UPDATE sessions SET
     ended_at = datetime('now'),
     last_activity_at = datetime('now'),
     client = COALESCE(client, '$client'),
-    state = CASE WHEN state = 'ended' THEN 'ended' ELSE 'idle' END,
+    state = CASE WHEN state = 'ended' AND ended_at > datetime('now', '-2 minutes') THEN 'ended' ELSE 'idle' END,
     turn_count = COALESCE(turn_count, 0) + 1,
     status = '$status',
     loop_count = $loop_count,

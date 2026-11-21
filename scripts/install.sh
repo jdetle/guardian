@@ -257,8 +257,11 @@ if [ "$healthy" = "true" ]; then
     # Hooks installed by an earlier Guardian are brought up to date with this one; agents
     # that have none are left alone until asked for.
     echo "Agent hooks:"
-    "$GUARDIAN_DIR/guardian" hooks install --upgrade 2>&1 | sed 's/^/  /' || true
+    if ! "$GUARDIAN_DIR/guardian" hooks install --upgrade > /dev/null 2>&1; then
+        echo "  Some hooks could not be brought up to date; see: $GUARDIAN_DIR/guardian hooks install --upgrade"
+    fi
     "$GUARDIAN_DIR/guardian" hooks status 2>&1 | sed 's/^/  /' || true
+    echo "  Sessions that are already running keep the hooks they started with; new ones pick these up."
     echo ""
     echo "Guardian only warns. To let it pause prompts and deny subagents: $GUARDIAN_DIR/guardian blocking on"
     echo "Install hooks for every agent on this machine:  $GUARDIAN_DIR/guardian hooks install"

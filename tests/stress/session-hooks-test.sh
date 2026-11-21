@@ -232,15 +232,20 @@ check "earlier sessions that ended or used tools were Cursor's; they keep everyt
 check "an earlier session that only ever started is left unlabelled" "|ended" "$(q "select coalesce(client, ''), state from sessions where conversation_id='old-unknown'")"
 check "one whose last turn ended minutes ago may still be open: idle, not ended" "cursor|idle|9" "$(q "select client, state, tool_call_count from sessions where conversation_id='live-cursor'")"
 check "one that started just before the upgrade is idle, not ended" "idle" "$(q "select state from sessions where conversation_id='just-started'")"
+# A session open for days when the hooks were upgraded was taken for over. It is not.
+hook claude/post-tool-use.sh '{"session_id":"old-unknown","tool_name":"Read"}' >/dev/null
+check "a session the upgrade took for over is working again at its next tool call" "claude|working|1" "$(q "select client, state, tool_call_count from sessions where conversation_id='old-unknown'")"
+hook claude/stop.sh '{"session_id":"old-cursor"}' >/dev/null
+check "and idle at the end of its next turn" "idle" "$(q "select state from sessions where conversation_id='old-cursor'")"
 hook claude/session-start.sh '{"session_id":"new","source":"resume"}' >/dev/null
-check "tool calls older than sixty days are cleared out at a session start" "0|2" "$(q "select (select count(*) from tool_calls where recorded_at < datetime('now', '-60 days')), (select count(*) from tool_calls)")"
+check "tool calls older than sixty days are cleared out at a session start" "0|3" "$(q "select (select count(*) from tool_calls where recorded_at < datetime('now', '-60 days')), (select count(*) from tool_calls)")"
 # Run the upgrade again for real (it is skipped while its marker file is there), twice at once,
 # as two hooks finishing together would.
 rm -f "$G"/.sessions_schema_v*
 printf '%s' '{"session_id":"new","tool_name":"Read"}' | bash "$HOOKS_DIR/claude/post-tool-use.sh" >/dev/null 2>&1 &
 printf '%s' '{"session_id":"new","tool_name":"Grep"}' | bash "$HOOKS_DIR/claude/post-tool-use.sh" >/dev/null 2>&1 &
 wait
-check "upgrading again, from two hooks at once, loses nothing and relabels nothing" "3|5|cursor|" "$(q "select tool_call_count, (select count(*) from sessions), (select client from sessions where conversation_id='old-cursor'), (select coalesce(client, '') from sessions where conversation_id='old-unknown') from sessions where conversation_id='new'")"
+check "upgrading again, from two hooks at once, loses nothing and relabels nothing" "3|5|cursor|claude" "$(q "select tool_call_count, (select count(*) from sessions), (select client from sessions where conversation_id='old-cursor'), (select coalesce(client, '') from sessions where conversation_id='old-unknown') from sessions where conversation_id='new'")"
 
 echo ""
 echo "session-hooks-test: $PASSED passed, $FAILED failed"
