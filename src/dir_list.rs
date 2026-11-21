@@ -155,8 +155,9 @@ fn parse_entry(data: &[u8]) -> Option<Entry> {
     })
 }
 
-/// List `dir` with `getattrlistbulk`. `None` when the directory cannot be opened or the
-/// volume does not support the call; `out` may then hold a partial listing.
+/// List `dir` with `getattrlistbulk`. `None` when the directory cannot be opened, the
+/// volume does not support the call, or it failed before the end; `out` may then hold a
+/// partial listing.
 fn list_bulk(dir: &Path, buf: &mut Vec<u8>, out: &mut Vec<Entry>) -> Option<()> {
     let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
     let fd = unsafe {
@@ -200,9 +201,10 @@ fn list_bulk(dir: &Path, buf: &mut Vec<u8>, out: &mut Vec<Entry>) -> Option<()> 
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            // Refused outright: let the caller list it the portable way. Failing part-way
-            // through leaves what was read so far.
-            return if first { None } else { Some(()) };
+            // Refused, at once or part-way through: the caller lists it the portable way
+            // from the start, rather than take a part for the whole.
+            let _ = first;
+            return None;
         }
         if count == 0 {
             return Some(());

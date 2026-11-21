@@ -277,14 +277,18 @@ final class GuardianClient: ObservableObject {
 
     /// Commit and push a worktree's unsaved work, then remove the worktree
     /// (`guardian disk save --delete`). The worktree is kept if the push does not go
-    /// through. Call only after the person has confirmed.
-    func saveAndDelete(_ target: DiskTarget) {
+    /// through, or if it no longer matches `plan`, the one the person was shown. Call only
+    /// after they have confirmed.
+    func saveAndDelete(_ target: DiskTarget, plan: SavePlan) {
         guard deletingPaths.isEmpty else { return }
         deletingPaths = [target.path]
         deleteMessage = nil
         let executable = guardianDir.appendingPathComponent("guardian")
         deleteQueue.async {
-            let data = Self.run(executable, ["disk", "save", "--delete", "--yes", "--json", target.path])
+            let data = Self.run(
+                executable,
+                ["disk", "save", "--delete", "--yes", "--json", "--plan-id", plan.id, target.path]
+            )
             let result = data.flatMap { try? JSONDecoder().decode([SaveResult].self, from: $0) }?.first
             DispatchQueue.main.async {
                 self.deletingPaths = []

@@ -62,6 +62,11 @@ struct MenuBarView: View {
             client.loadPromptControls()
             client.loadStats()
         }
+        // A new scan can change what a row is (safe then, needing a look now), so ticks
+        // made against the old one are dropped rather than carried over.
+        .onChange(of: client.diskReport?.scannedAt) { _, _ in
+            selected = []
+        }
     }
 
     // MARK: - Header
@@ -574,9 +579,15 @@ struct MenuBarView: View {
         } else {
             branch = plan.files.isEmpty ? " on branch \(plan.branch);" : " to branch \(plan.branch)"
         }
-        lines.append("\(commit)\(branch) and pushes it to \(plan.remote)/\(plan.remoteBranch)"
-            + (plan.hasUpstream ? "." : ", which is not on the remote yet.")
-            + " Then removes the worktree, freeing about \(target.sizeText).")
+        let push: String
+        if plan.upToDate {
+            push = " \(plan.remote)/\(plan.remoteBranch) already has it, so nothing is pushed."
+        } else if plan.beside {
+            push = " and pushes it to \(plan.remote) as a new branch, \(plan.remoteBranch). \(plan.remote)/\(plan.branch) is left as it is."
+        } else {
+            push = " and pushes it to \(plan.remote)/\(plan.remoteBranch), which is not on the remote yet."
+        }
+        lines.append("\(commit)\(branch)\(push) Then removes the worktree, freeing about \(target.sizeText).")
         if !plan.files.isEmpty {
             var files = plan.files.prefix(8).joined(separator: "\n")
             if plan.files.count > 8 { files += "\n…and \(plan.files.count - 8) more" }
@@ -587,14 +598,14 @@ struct MenuBarView: View {
                 + plan.ignored.prefix(6).joined(separator: ", ")
                 + (plan.ignored.count > 6 ? " and \(plan.ignored.count - 6) more" : ""))
         }
-        lines.append("Commit hooks are skipped; the push runs as usual and is never forced. If the push does not go through, the worktree is kept.")
+        lines.append("Your commit and push hooks run as usual, and nothing is force-pushed. If a hook refuses, the push does not go through, or anything here changes first, the worktree is kept.")
         alert.informativeText = lines.joined(separator: "\n\n")
         alert.addButton(withTitle: "Cancel")
         let save = alert.addButton(withTitle: "Save and delete")
         save.hasDestructiveAction = true
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn {
-            client.saveAndDelete(target)
+            client.saveAndDelete(target, plan: plan)
         }
     }
 
@@ -653,6 +664,8 @@ struct MenuBarView: View {
     /// destructive, so Return never deletes.
     private func confirmDelete(_ targets: [DiskTarget]) {
         guard !targets.isEmpty else { return }
+        // What needs a look is listed first, so it is never among the ones left unnamed.
+        let targets = targets.filter { !$0.regenerates } + targets.filter(\.regenerates)
         let total = DiskTarget.sizeText(targets.map(\.freedBytes).reduce(0, +))
         let alert = NSAlert()
         alert.alertStyle = targets.allSatisfy(\.regenerates) ? .informational : .warning

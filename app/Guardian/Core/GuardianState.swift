@@ -445,18 +445,23 @@ struct SavePlan: Codable, Sendable {
     /// Files that will be committed.
     let files: [String]
     let remote: String
+    /// The name it is pushed under: the branch's own, or `guardian-save/…` beside it.
     let remoteBranch: String
-    /// False when the branch is not on the remote yet.
-    let hasUpstream: Bool
+    /// True when the branch is already on the remote and the save is pushed beside it.
+    let beside: Bool
+    /// True when nothing is uncommitted and the remote already has the branch.
+    let upToDate: Bool
     /// Ignored files kept nowhere else: not saved, and deleted with the worktree.
     let ignored: [String]
+    /// Passed back with the save, which refuses if the worktree has changed since.
+    let id: String
 
     enum CodingKeys: String, CodingKey {
-        case branch, files, remote, ignored
+        case branch, files, remote, ignored, beside, id
         case newBranch = "new_branch"
         case fromBranch = "from_branch"
         case remoteBranch = "remote_branch"
-        case hasUpstream = "has_upstream"
+        case upToDate = "up_to_date"
     }
 }
 

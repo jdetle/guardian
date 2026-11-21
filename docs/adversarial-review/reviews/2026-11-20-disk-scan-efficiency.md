@@ -44,8 +44,8 @@ A small C benchmark (not in the repository) compared two ways to total one 1022 
 
 | Folder | Size Guardian reports | Freed at once if deleted (`ATTR_CMNEXT_PRIVATESIZE`) |
 |---|---|---|
-| `rust-blog-wt/household-demo/node_modules` | 1022 MB | 0 MB |
-| `rust-blog/node_modules` | 1047 MB | 0 MB |
+| a worktree's `node_modules` (installed by bun) | 1022 MB | 0 MB |
+| the main checkout's `node_modules` of the same project | 1047 MB | 0 MB |
 | `~/.bun/install/cache` | 2362 MB | 387 MB |
 | `guardian/target` | 1448 MB | 1385 MB |
 
