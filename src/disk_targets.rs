@@ -1428,9 +1428,16 @@ fn bundle_stale(rows: Vec<Row>, home: &Path, min_bytes: u64) -> (Vec<Bundle>, Ve
         bundle.detail = bundle.detail_text();
         bundles.push(bundle);
     }
-    // The longest untouched first; among those, what frees the most.
+    // The longest untouched first; among those, what frees the most right now, then what
+    // would free the most once its held-back folders have been looked at.
     bundles.sort_by(|a, b| {
-        (a.staleness, b.freed_bytes, b.bytes, &a.name).cmp(&(b.staleness, a.freed_bytes, a.bytes, &b.name))
+        (a.staleness, b.deletable_freed_bytes, b.freed_bytes, b.bytes, &a.name).cmp(&(
+            b.staleness,
+            a.deletable_freed_bytes,
+            a.freed_bytes,
+            a.bytes,
+            &b.name,
+        ))
     });
     (bundles, alone)
 }
