@@ -36,10 +36,10 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | Piece | Location | Role |
 |---|---|---|
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, per-agent RSS for Cursor / Claude / Codex (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
-| `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
-| Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … (`~/.cursor/hooks.json`) |
-| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI + app — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (`~/.codex/hooks.json`; hooks must be **trusted** in Codex once). See [docs/codex.md](docs/codex.md). |
-| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
+| `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage), **`disk`**, and **`hooks`** (install the agent hooks it carries, and say where each agent stands) |
+| Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, `postToolUse`, `stop`, `sessionEnd` (`~/.cursor/hooks.json`) |
+| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI + app — `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and session tracking: `PostToolUse`, `Stop`, `SessionEnd` (`~/.codex/hooks.json`; hooks must be **trusted** in Codex once). See [docs/codex.md](docs/codex.md). |
+| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and session tracking: `PostToolUse`, `Stop`, `SessionEnd` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[tool_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/`, `scripts/install-app.sh` | SwiftUI **menu bar app** (optional, no Dock icon) — level and why, snooze / allow once, memory, swap, disk, per-agent RAM, today's time at each level, config problems, and **Find space to free**. See [Menu bar app](#menu-bar-app). |
@@ -72,12 +72,19 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 
 ```bash
 bash scripts/install.sh              # daemon + CLI (required)
-bash hooks/install-hooks.sh          # Cursor
-bash scripts/install-claude-hooks.sh # Claude Code
-bash scripts/install-codex-hooks.sh  # OpenAI Codex
+~/.guardian/guardian hooks install   # hooks for every agent set up on this machine
+~/.guardian/guardian hooks status    # where each agent stands
 ```
 
-Run the hook installers for the agents you use; all three read the same **`~/.guardian/`** state and policy. Each one merges into the agent's existing config: re-running is safe, hooks you added yourself are kept (including on the same events), and a config it cannot parse is left untouched.
+**The hooks ship inside the `guardian` binary**, so installing or updating them needs no copy of this repository. `guardian hooks install` sets up Cursor, Claude Code and Codex, whichever are on the machine (`--cursor`, `--claude`, `--codex` to name them; `--upgrade` to only bring existing installs up to date, which `install.sh` does for you). `guardian hooks status` says, per agent, whether Guardian's hooks are installed, whether any event is missing, and whether they are this version's; it exits non-zero when an agent on the machine is behind. The menu bar app shows the same and has an **Update hooks** button.
+
+All three read the same **`~/.guardian/`** state and policy. Installing merges into the agent's existing config: re-running is safe, hooks you added yourself are kept (including on the same events), and a config it cannot parse is left untouched. The per-agent scripts (`hooks/install-hooks.sh`, `scripts/install-claude-hooks.sh`, `scripts/install-codex-hooks.sh`) do the same from a checkout.
+
+### Following agent sessions
+
+Every agent's hooks record its sessions in **`~/.guardian/sessions.db`**: which agent, which folder, whether it is **working** (a prompt is being worked on), **idle** (waiting for the next one) or **ended**, when it last did anything, and its prompts, turns, tool calls and subagents. The menu bar panel has one line per agent with open sessions ("Claude Code: 1 working in guardian · 2 idle"); the dashboard's **Sessions** tab lists them with a filter per agent. A turn that has been quiet for half an hour is shown as idle whatever was recorded, since an agent that is closed mid-turn never reports that it stopped.
+
+The recording hooks (`PostToolUse`, `Stop`, `SessionEnd`; Cursor's `postToolUse`, `stop`, `sessionEnd`) only record: they print nothing and never block, and in Claude Code and Codex the first two run in the background. Each costs one `jq` and one `sqlite3`. Tool calls and pressure samples older than sixty days are cleared when a session starts.
 
 `install.sh` copies **`guardiand`** to **`~/.guardian/guardiand`** and points the LaunchAgent there, so `cargo clean` or a disk-space sweep of `target/` no longer kills the daemon. It exits non-zero unless the new daemon is actually writing fresh `state.json`.
 
@@ -89,7 +96,7 @@ Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates
 bash scripts/install-claude-hooks.sh
 ```
 
-Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), and **`PreToolUse`** (`Bash|Agent|Task` advisory) into **`~/.claude/settings.json`**. Idempotent; other hooks and settings are preserved, and entries from earlier Guardian versions are replaced. Start a new session afterwards. Details: [docs/claude-code.md](docs/claude-code.md).
+Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), **`PreToolUse`** (`Bash|Agent|Task` advisory) and the session-tracking **`PostToolUse`**, **`Stop`** and **`SessionEnd`** into **`~/.claude/settings.json`**. Idempotent; other hooks and settings are preserved, and entries from earlier Guardian versions are replaced. Start a new session afterwards. Details: [docs/claude-code.md](docs/claude-code.md).
 
 ### OpenAI Codex
 
@@ -97,7 +104,7 @@ Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), and **`PreToolU
 bash scripts/install-codex-hooks.sh
 ```
 
-Merges the same three events into **`~/.codex/hooks.json`**. Hooks are on by default in current Codex, but **Codex skips new or changed hooks until you trust them** — run **`/hooks`** in the CLI or open **Settings > Hooks** in the app. Details: [docs/codex.md](docs/codex.md).
+Merges the same six events into **`~/.codex/hooks.json`**. Hooks are on by default in current Codex, but **Codex skips new or changed hooks until you trust them** — run **`/hooks`** in the CLI or open **Settings > Hooks** in the app. Details: [docs/codex.md](docs/codex.md).
 
 ### Menu bar app
 
@@ -115,6 +122,7 @@ A shield appears at the right of the menu bar; its shape follows the level (outl
 - **Today**: share of time at each level and how often it changed
 - any **config problem** the daemon reported
 - **Find space to free**: the `guardian disk` scan of all your git repositories, with each item's age and worktree status, sized by what deleting it would free. The scan `guardiand` keeps fresh in the background is shown as soon as the panel opens; **Scan again** brings it up to date. Stale bundles come first, the longest untouched at the top; ticking one ticks everything in it that can go without a look. Tick the items to remove and press **Delete selected**: it lists them with what they free and asks before deleting (through the same checks as `guardian disk delete`). **Tick old and safe** ticks every project bundle untouched for two weeks or more. Items that need their own tool or a decision are listed after those, each with a button that copies its removal command. Every row can be shown in Finder.
+- **Agent sessions**: one line per agent (Claude Code, Codex, Cursor) with sessions open, how many are working and where, and how many are idle; and an **Update hooks** button when an agent's Guardian hooks are missing or from an older version
 - **Open dashboard** for the larger System / Sessions / Docker / Settings window
 
 It notifies you only when load becomes critical or the disk becomes critical. The app needs macOS 14 and the Swift toolchain to build; it reads `~/.guardian/` and calls `~/.guardian/guardian`, so install the daemon first.

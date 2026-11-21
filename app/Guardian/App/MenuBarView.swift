@@ -42,6 +42,9 @@ struct MenuBarView: View {
             }
 
             Divider()
+            sessionsSection
+
+            Divider()
             diskSection
 
             if !client.queueEntries.isEmpty {
@@ -248,6 +251,78 @@ struct MenuBarView: View {
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
         }
+    }
+
+    // MARK: - Agent sessions
+
+    /// Which agents have sessions open and what they are doing, from the sessions.db that
+    /// the hooks for Cursor, Claude Code and Codex write to; and a way to put those hooks
+    /// right when an agent's are missing or from an older Guardian.
+    private var sessionsSection: some View {
+        let live = AgentSessions.live(client.sessions)
+        let behind = client.hookStatus.filter { $0.present && !$0.current }
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Agent sessions")
+                .font(.caption.weight(.semibold))
+            if live.isEmpty {
+                Text("None open in the last 12 hours.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(live) { agent in
+                HStack(alignment: .firstTextBaseline) {
+                    Text(agent.label)
+                        .font(.caption)
+                        .frame(width: 84, alignment: .leading)
+                    Text(sessionsText(agent))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            if !behind.isEmpty {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Hooks missing or out of date for \(behind.map(\.label).joined(separator: ", ")), so their sessions are not followed fully.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if client.installingHooks {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button("Update hooks") {
+                            client.installHooks()
+                        }
+                        .controlSize(.small)
+                        .help("Installs this Guardian's hooks for every agent set up on this machine. Other hooks in their settings are left alone.")
+                    }
+                }
+            }
+            if let message = client.hookMessage {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// "1 working in guardian · 2 idle"
+    private func sessionsText(_ agent: AgentSessions) -> String {
+        var parts: [String] = []
+        if agent.working > 0 {
+            var text = "\(agent.working) working"
+            if !agent.workingOn.isEmpty {
+                text += " in \(agent.workingOn.prefix(2).joined(separator: ", "))"
+            }
+            parts.append(text)
+        }
+        if agent.idle > 0 {
+            parts.append("\(agent.idle) idle")
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: - Disk

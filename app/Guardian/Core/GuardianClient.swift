@@ -27,6 +27,12 @@ final class GuardianClient: ObservableObject {
     @Published private(set) var deleteMessage: String?
     @Published var history: [GuardianStateData] = []
     @Published var sessions: [SessionRecord] = []
+    /// How Guardian's hooks stand for each agent (`guardian hooks status --json`); empty
+    /// until first read, or with a guardian too old to say.
+    @Published private(set) var hookStatus: [HookClientStatus] = []
+    @Published private(set) var installingHooks = false
+    /// What the last hook install said, in a sentence.
+    @Published private(set) var hookMessage: String?
     @Published var queueEntries: [AgentQueueEntry] = []
 
     @Published private(set) var snoozeUntil: Date?
@@ -42,6 +48,7 @@ final class GuardianClient: ObservableObject {
     private let scanQueue = DispatchQueue(label: "guardian.disk-scan", qos: .utility)
     private let savedScanQueue = DispatchQueue(label: "guardian.disk-saved-scan", qos: .utility)
     private let deleteQueue = DispatchQueue(label: "guardian.disk-delete", qos: .userInitiated)
+    private let sessionsQueue = DispatchQueue(label: "guardian.sessions", qos: .utility)
     private var timer: Timer?
 
     static let maxHistoryCount = 150
@@ -64,6 +71,8 @@ final class GuardianClient: ObservableObject {
         loadQueue()
         loadStats()
         loadSavedDiskScan()
+        loadSessions()
+        loadHookStatus()
         // guardiand samples every 2 s; the menu bar icon does not need to be that fresh.
         var ticks = 0
         let t = Timer(timeInterval: 4.0, repeats: true) { [weak self] _ in
@@ -74,6 +83,9 @@ final class GuardianClient: ObservableObject {
             // including across midnight.
             ticks += 1
             if ticks % 15 == 0 { self?.loadStats() }
+            // Sessions change with every prompt and tool call; hooks only when installed.
+            if ticks % 4 == 0 { self?.loadSessions() }
+            if ticks % 150 == 0 { self?.loadHookStatus() }
         }
         t.tolerance = 1.0
         RunLoop.main.add(t, forMode: .common)
@@ -398,15 +410,75 @@ final class GuardianClient: ObservableObject {
         }
     }
 
+    /// Read the most recently active sessions of every agent from sessions.db, which the
+    /// hooks for Cursor, Claude Code and Codex all write to.
     func loadSessions() {
-        DispatchQueue.global().async { [self] in
-            let output = shellSync("sqlite3 -json '\(dbPath)' 'SELECT * FROM sessions ORDER BY started_at DESC LIMIT 50;'")
-            guard let data = output.data(using: .utf8),
-                  let decoded = try? JSONDecoder().decode([SessionRecord].self, from: data) else {
-                return
+        let db = dbPath
+        sessionsQueue.async {
+            // By last activity where the database records it (schema 2); an older database
+            // has no such column, and is read the old way.
+            let queries = [
+                "SELECT * FROM sessions ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 100;",
+                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 100;",
+            ]
+            var decoded: [SessionRecord]?
+            for query in queries {
+                guard let data = Self.run(URL(fileURLWithPath: "/usr/bin/sqlite3"), ["-json", "-readonly", db, query]) else { break }
+                if data.isEmpty || String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // No rows, or the query did not fit this database: try the next.
+                    decoded = decoded ?? []
+                    continue
+                }
+                if let rows = try? JSONDecoder().decode([SessionRecord].self, from: data) {
+                    decoded = rows
+                    break
+                }
             }
+            guard let decoded else { return }
             DispatchQueue.main.async {
                 self.sessions = decoded
+            }
+        }
+    }
+
+    /// Ask the CLI how each agent's hooks stand.
+    func loadHookStatus() {
+        let executable = guardianDir.appendingPathComponent("guardian")
+        sessionsQueue.async {
+            let data = Self.run(executable, ["hooks", "status", "--json"])
+            let status = data.flatMap { try? JSONDecoder().decode([HookClientStatus].self, from: $0) } ?? []
+            DispatchQueue.main.async {
+                if self.hookStatus != status { self.hookStatus = status }
+            }
+        }
+    }
+
+    /// Install or update Guardian's hooks for every agent set up on this machine
+    /// (`guardian hooks install`). Other hooks in the agents' files are left alone.
+    func installHooks() {
+        guard !installingHooks else { return }
+        installingHooks = true
+        hookMessage = nil
+        let executable = guardianDir.appendingPathComponent("guardian")
+        sessionsQueue.async {
+            let ran = Self.run(executable, ["hooks", "install"]) != nil
+            let data = Self.run(executable, ["hooks", "status", "--json"])
+            let status = data.flatMap { try? JSONDecoder().decode([HookClientStatus].self, from: $0) } ?? []
+            DispatchQueue.main.async {
+                self.installingHooks = false
+                self.hookStatus = status
+                let behind = status.filter { $0.present && !$0.current }.map(\.label)
+                if !ran {
+                    self.hookMessage = "The hooks could not be installed: the guardian command did not run."
+                } else if behind.isEmpty {
+                    var text = "Hooks are up to date. Sessions already running keep the hooks they started with."
+                    if status.contains(where: { $0.client == "codex" && $0.installed }) {
+                        text += " Codex runs changed hooks only once you approve them: /hooks, or Settings > Hooks."
+                    }
+                    self.hookMessage = text
+                } else {
+                    self.hookMessage = "Still not up to date: \(behind.joined(separator: ", ")). Run ~/.guardian/guardian hooks install in a terminal to see why."
+                }
             }
         }
     }
@@ -444,6 +516,17 @@ struct SessionRecord: Codable, Identifiable {
     let linesChanged: Int?
     let estimatedCostUsd: Double?
     let roiScore: Double?
+    /// cursor | claude | codex; nil for a session recorded before Guardian told them apart.
+    let client: String?
+    /// Where the session is working.
+    let cwd: String?
+    /// working | idle | ended, as the hooks last recorded it.
+    let state: String?
+    /// UTC, "yyyy-MM-dd HH:mm:ss".
+    let lastActivityAt: String?
+    let promptCount: Int?
+    let turnCount: Int?
+    let subagentCount: Int?
 
     enum CodingKeys: String, CodingKey {
         case conversationId = "conversation_id"
@@ -460,6 +543,74 @@ struct SessionRecord: Codable, Identifiable {
         case linesChanged = "lines_changed"
         case estimatedCostUsd = "estimated_cost_usd"
         case roiScore = "roi_score"
+        case client, cwd, state
+        case lastActivityAt = "last_activity_at"
+        case promptCount = "prompt_count"
+        case turnCount = "turn_count"
+        case subagentCount = "subagent_count"
+    }
+
+    /// What a session is doing now, which is not always what was last recorded: an agent
+    /// that is closed or crashes mid-turn never reports that the turn ended.
+    enum Activity: String {
+        /// A prompt is being worked on.
+        case working
+        /// Waiting for its next prompt.
+        case idle
+        /// Open, but nothing has happened for half a day.
+        case dormant
+        case ended
+    }
+
+    /// After this long with no tool call, a turn is taken to be over whatever was recorded.
+    static let quietAfter: TimeInterval = 30 * 60
+    /// After this long with nothing at all, an open session is no longer shown as live.
+    static let dormantAfter: TimeInterval = 12 * 3600
+
+    private static let timestamps: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
+    /// When it last did anything (or started, if nothing since).
+    var lastActive: Date? {
+        Self.timestamps.date(from: lastActivityAt ?? startedAt)
+    }
+
+    func activity(now: Date = Date()) -> Activity {
+        guard let state, state != "ended" else { return .ended }
+        guard let lastActive else { return .dormant }
+        let quiet = now.timeIntervalSince(lastActive)
+        if quiet >= Self.dormantAfter { return .dormant }
+        if state == "working" && quiet < Self.quietAfter { return .working }
+        return .idle
+    }
+
+    /// "Claude Code", "Codex", "Cursor"; "Unknown" for sessions from before they were told apart.
+    var clientLabel: String {
+        switch client {
+        case "claude": return "Claude Code"
+        case "codex": return "Codex"
+        case "cursor": return "Cursor"
+        default: return "Unknown"
+        }
+    }
+
+    /// The folder it is working in, by name.
+    var project: String {
+        guard let cwd, !cwd.isEmpty else { return "--" }
+        return URL(fileURLWithPath: cwd).lastPathComponent
+    }
+
+    /// "3 min ago", from when it last did anything.
+    func lastActiveText(now: Date = Date()) -> String {
+        guard let lastActive else { return "--" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: lastActive, relativeTo: now)
     }
 
     var durationFormatted: String {
@@ -469,5 +620,44 @@ struct SessionRecord: Codable, Identifiable {
         let minutes = seconds / 60
         let secs = seconds % 60
         return "\(minutes)m \(secs)s"
+    }
+}
+
+/// One agent's line of `guardian hooks status --json`.
+struct HookClientStatus: Codable, Sendable, Equatable {
+    /// cursor | claude | codex
+    let client: String
+    let label: String
+    /// The agent is set up on this machine.
+    let present: Bool
+    let installed: Bool
+    /// Installed, complete, and from the running version of Guardian.
+    let current: Bool
+    let summary: String
+}
+
+/// Live sessions of one agent, for the menu bar panel.
+struct AgentSessions: Identifiable {
+    var id: String { label }
+    let label: String
+    let working: Int
+    let idle: Int
+    /// The projects being worked in right now, most recent first.
+    let workingOn: [String]
+
+    /// Sessions that are open and have done something in the last half day, by agent, in a
+    /// fixed order; agents with none are left out.
+    static func live(_ sessions: [SessionRecord], now: Date = Date()) -> [AgentSessions] {
+        ["claude", "codex", "cursor"].compactMap { client in
+            let theirs = sessions.filter { $0.client == client }
+            let working = theirs.filter { $0.activity(now: now) == .working }
+            let idle = theirs.filter { $0.activity(now: now) == .idle }
+            guard !working.isEmpty || !idle.isEmpty, let label = theirs.first?.clientLabel else { return nil }
+            var projects: [String] = []
+            for session in working where session.project != "--" && !projects.contains(session.project) {
+                projects.append(session.project)
+            }
+            return AgentSessions(label: label, working: working.count, idle: idle.count, workingOn: projects)
+        }
     }
 }
