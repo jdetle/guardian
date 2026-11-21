@@ -56,6 +56,13 @@ The last three let the menu bar app **follow Codex sessions** next to Cursor's a
 (see [Following agent sessions](../README.md#following-agent-sessions)). They need a Codex recent
 enough to have these events, and, like every changed hook, **approving again** after an upgrade.
 
+## Warnings only until you opt in
+
+Out of the box none of these hooks stops anything: a prompt the gate would have paused is sent
+with a warning, and a `spawn_agent` that would have been denied is allowed with one. Run
+`~/.guardian/guardian blocking on` to let Guardian pause and deny; `guardian blocking off` goes
+back. See [Prompt gates and resume](../README.md#prompt-gates-and-resume).
+
 ## Differences vs Cursor
 
 | | Cursor | Codex |

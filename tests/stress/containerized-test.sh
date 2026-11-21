@@ -36,6 +36,11 @@ if [ ! -f "$GUARDIAN_DIR/guardian-queue.sh" ] && [ -f "/opt/guardian/scripts/gua
     chmod +x "$GUARDIAN_DIR/guardian-queue.sh"
 fi
 
+# Guardian only warns until the opt-in exists (`guardian blocking on`). The groups below test
+# what the gates do once it does; blocking-opt-in-test.sh covers the default, and both states
+# side by side.
+: > "$GUARDIAN_DIR/blocking_on"
+
 # jq's // treats JSON false as missing; Cursor hooks use boolean "continue".
 guardian_json_continue() {
     echo "$1" | jq -r 'if (.["continue"] | type) == "boolean" then (if .["continue"] then "true" else "false" end) else "missing" end' 2>/dev/null
@@ -1062,6 +1067,17 @@ if session_out=$(bash "$(dirname "$0")/session-hooks-test.sh" 2>&1); then
 else
     fail "session tracking hooks: $(echo "$session_out" | tail -1)"
     echo "$session_out" | grep -v '^  PASS' || true
+fi
+
+# ─── Warn-only by default; blocking is an opt-in ────────────────────────
+
+echo -e "\n${BOLD}${CYAN}=== Warn-only default and the blocking opt-in ===${NC}"
+
+if optin_out=$(bash "$(dirname "$0")/blocking-opt-in-test.sh" 2>&1); then
+    pass "blocking opt-in: $(echo "$optin_out" | tail -1)"
+else
+    fail "blocking opt-in: $(echo "$optin_out" | tail -1)"
+    echo "$optin_out" | grep -v '^  PASS' || true
 fi
 
 # ─── Summary ────────────────────────────────────────────────────────────

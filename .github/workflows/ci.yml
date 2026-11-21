@@ -42,6 +42,7 @@ jobs:
           /bin/bash tests/claude-hook-smoke.sh
           # Makes a scratch HOME of its own; covers session tracking for all three agents.
           /bin/bash tests/stress/session-hooks-test.sh
+          /bin/bash tests/stress/blocking-opt-in-test.sh
           /bin/bash demos/guardian-barriers-mock/run-demo.sh
 
   hooks:

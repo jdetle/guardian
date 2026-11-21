@@ -13,7 +13,9 @@ Short checklist (also surfaced by hooks when load is high):
 
 **When a subagent is denied** (only if `[tool_gate] deny_subagents_on` is set): the agent is told to continue serially. Snooze (`~/.guardian/guardian snooze 15`) lifts it; set `deny_subagents_on = "never"` and restart `guardiand` to turn it off.
 
-**When a send is blocked:**
+**Guardian only warns unless you opt in** (`~/.guardian/guardian blocking on`; `blocking off` to go back). Until then no send is blocked and no subagent denied; you and the agent are told about the load instead.
+
+**When a send is blocked** (with blocking on):
 
 - **Never blocked by the gate:** `/guardian-snooze`, `/guardian-once`, and prompts that reference **guardian-install** / **guardian-upgrade** (e.g. `.cursor/skills/guardian-install`, `skills/guardian-upgrade`, `…/SKILL.md`) — install and snooze always get through.
 

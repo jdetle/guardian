@@ -48,6 +48,14 @@ the agent up; on a Claude Code too old to know the key they simply run in the fo
 The `PreToolUse` hook **never returns `permissionDecision: "allow"`** — that would skip Claude Code's
 own permission prompt. It either says nothing, adds context, or (opt-in) denies a subagent.
 
+## Warnings only until you opt in
+
+Out of the box none of these hooks stops anything. A prompt that the gate would have paused is
+sent with a warning added as context; a subagent that would have been denied is allowed with one.
+To let Guardian pause prompts and deny subagents, run `~/.guardian/guardian blocking on` (or
+**Allow pausing…** in the menu bar); `guardian blocking off` goes back. See
+[Prompt gates and resume](../README.md#prompt-gates-and-resume).
+
 ## Stopping subagent fan-out under pressure (opt-in)
 
 The prompt gate only sees *new prompts*. A long agentic turn can keep spawning subagents — each one
@@ -59,13 +67,14 @@ a separate process — after pressure has already gone critical. To stop that, s
 deny_subagents_on = "critical"   # "never" (default) | "strained" | "critical"
 ```
 
-The `Agent` / `Task` tool call is then denied with a reason telling the agent to do the work
-serially in the current session. `Bash` is never denied. A snooze lifts the deny. The same setting
+With `guardian blocking on` as well, the `Agent` / `Task` tool call is then denied with a reason
+telling the agent to do the work serially in the current session; without it, the call is allowed
+and the agent is asked to work serially. `Bash` is never denied. A snooze lifts the deny. The same setting
 applies to Cursor (`Task`) and Codex (`spawn_agent`).
 
 ## When a prompt is blocked
 
-Claude Code shows the block reason and your original prompt. From any terminal:
+(Only with `guardian blocking on`.) Claude Code shows the block reason and your original prompt. From any terminal:
 
 ```bash
 ~/.guardian/guardian snooze 15   # gates off for 15 minutes

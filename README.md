@@ -140,6 +140,16 @@ Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_ag
 
 ### Prompt gates and resume
 
+**Guardian only warns until you opt in.** Out of the box no hook pauses a prompt or denies a tool call: when a gate would have, the prompt or tool call goes through and the agent (and, in Cursor, you) gets a warning saying why. To let Guardian actually stop things:
+
+```bash
+~/.guardian/guardian blocking on       # the gates below may now pause prompts and deny subagents
+~/.guardian/guardian blocking status   # which it is, and what would be stopped with your settings
+~/.guardian/guardian blocking off      # back to warnings only
+```
+
+The menu bar panel shows **Warnings only** with an **Allow pausing…** button until you do, and a way back afterwards. The opt-in is one file, `~/.guardian/blocking_on`; it takes effect on the next hook call and applies to Cursor, Claude Code and Codex alike. Everything below (`mode`, `block_on`, `deny_subagents_on`) says *when* Guardian would stop something; this switch says *whether* it may. An upgrade from a Guardian that blocked by default goes back to warning until you run the command.
+
 The default `adaptive` mode pauses a prompt only when a fresh sample shows critical pressure with critical macOS memory pressure or serious thermal pressure, and the prompt explicitly requests heavy local work. Examples include “Run the full test suite” and “Rebuild all Docker containers.” Questions, ordinary edits, ambiguous requests, and low available RAM alone pass through. The estimate uses local text rules and can miss heavy work implied by prior context.
 
 Set a default or override individual clients in `~/.guardian/config.toml`.
@@ -160,7 +170,7 @@ codex = "adaptive"
 - **Strict** pauses prompts at the configured `block_on` pressure (`critical` or `strained`) and supports the optional Cursor RSS cap.
 - Set `enabled = false` under `[prompt_gate]` to switch off prompt gating across clients. `block_on = "never"` disables pressure-based gating.
 
-Existing configurations without a mode pick up the adaptive default when the hooks are updated. Set `mode = "strict"` to keep pressure-only blocking.
+Existing configurations without a mode pick up the adaptive default when the hooks are updated. Set `mode = "strict"` for pressure-only blocking. Either way nothing is paused without `guardian blocking on`.
 
 Use the **Guardian menu bar** to snooze for 5, 15, 30, or 60 minutes, see when snooze ends, or resume early. **Allow once** stays armed for 10 minutes or until a prompt would otherwise be paused, whichever comes first. A new session is told when a snooze or allow-once is in force. Snooze and Allow once are shared across Cursor, Claude Code, and Codex.
 

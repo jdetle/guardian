@@ -4,6 +4,10 @@
 # Guardian slash commands (/guardian-snooze, /guardian-once) and guardian-install / guardian-upgrade
 # skill paths never block — users must always reach snooze/install flows under load.
 # Sets PG_OUTCOME (pass, pass_msg, block) and PG_MESSAGE.
+#
+# Blocking is opt-in (`guardian blocking on`, see guardian_blocking_enabled in lib.sh). Without
+# it the outcome is never "block": a prompt that would have been paused goes through with a
+# warning saying so.
 
 # Match explicit requests for broad local work. Anchoring at the start keeps
 # questions, quoted commands and incidental mentions out of the blocking path.
@@ -121,6 +125,14 @@ guardian_prompt_gate_eval() {
             ;;
     esac
 
+    # Warn only, unless the person has opted in to pausing. Decided before allow-once is
+    # looked at, so that a prompt which was never going to be paused does not use it up.
+    local would_block=""
+    if [ -n "$block_reason" ] && ! guardian_blocking_enabled; then
+        would_block="$block_reason"
+        block_reason=""
+    fi
+
     if [ -n "$block_reason" ] && guardian_consume_proceed_once; then
         return 0
     fi
@@ -172,6 +184,22 @@ guardian_prompt_gate_eval() {
         fi
         PG_OUTCOME="block"
         PG_MESSAGE="$msg"
+    elif [ -n "$would_block" ]; then
+        local warning
+        if [ "$would_block" = "session_budget" ]; then
+            warning="Guardian warning: Cursor uses ${cursor_mb} MB of RAM (cap ${max_rss} MB) under ${pressure} system pressure."
+        else
+            warning="Guardian warning: ${pressure} system pressure.$(read_state_reasons_suffix "$sample")"
+            if [ -n "$workload" ]; then
+                warning="$warning This request appears to start $workload."
+            fi
+        fi
+        warning="$warning The prompt was sent anyway. $(guardian_blocking_hint_text)"
+        PG_OUTCOME="pass_msg"
+        PG_MESSAGE="$warning"
+        if [ -n "$attach_notes" ]; then
+            PG_MESSAGE="$warning"$'\n\n'"$attach_notes"
+        fi
     elif [ -n "$attach_notes$advisory" ]; then
         PG_OUTCOME="pass_msg"
         PG_MESSAGE="$attach_notes$advisory"

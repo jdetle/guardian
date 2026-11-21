@@ -100,11 +100,15 @@ why=$(read_state_reasons_suffix)
 context=""
 case "$pressure" in
     critical)
-        context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up; sends may block. Work serially — no subagents, no heavy containers. Snooze: ${snooze_hint}."
+        if guardian_blocking_enabled; then
+            context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up; sends may block. Work serially — no subagents, no heavy containers. Snooze: ${snooze_hint}."
+        else
+            context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up. Work serially — no subagents, no heavy containers. Guardian only warns; it will not pause anything."
+        fi
         ;;
     strained)
         context="${banner} Load strained: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Prefer serial work; at most one subagent at a time."
-        if [ "$block_on_hint" = "critical" ]; then
+        if [ "$block_on_hint" = "critical" ] && guardian_blocking_enabled; then
             context="${context} Gates block at critical — snooze early: ${snooze_hint}."
         fi
         ;;
@@ -115,7 +119,11 @@ esac
 
 case "$deny_subagents_on" in
     strained|critical)
-        context="${context} Subagent spawns are denied at ${deny_subagents_on} load."
+        if guardian_blocking_enabled; then
+            context="${context} Subagent spawns are denied at ${deny_subagents_on} load."
+        else
+            context="${context} Avoid subagents at ${deny_subagents_on} load (Guardian will warn, not stop them)."
+        fi
         ;;
 esac
 

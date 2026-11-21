@@ -426,6 +426,22 @@ guardian_consume_proceed_once() {
     [ "$fresh" = 1 ]
 }
 
+# Guardian warns; it stops nothing until the person has said it may. `guardian blocking on`
+# makes this file, and until it exists no hook pauses a prompt or denies a tool call, whatever
+# config.toml says about when it would. The gates still work out when they would have, and
+# say so as a warning.
+guardian_blocking_enabled() {
+    local f="$GUARDIAN_DIR/blocking_on"
+    [ -f "$f" ] && [ ! -L "$f" ]
+}
+
+# How to opt in, for the warnings that stand in for a pause.
+guardian_blocking_hint_text() {
+    local cli
+    printf -v cli '%q' "${GUARDIAN_DIR}/guardian"
+    printf 'Guardian only warns unless you let it pause things: %s blocking on' "$cli"
+}
+
 guardian_resume_hint_text() {
     local cli
     printf -v cli '%q' "${GUARDIAN_DIR}/guardian"

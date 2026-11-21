@@ -61,6 +61,13 @@ enum Commands {
         #[command(subcommand)]
         action: Option<DiskAction>,
     },
+    /// Whether Guardian may stop things, or only warn. It only warns until you opt in:
+    /// `blocking on` lets the hooks pause prompts and deny subagents when your config says
+    /// to; `blocking off` goes back to warnings; `blocking status` says which it is.
+    Blocking {
+        #[command(subcommand)]
+        action: BlockingAction,
+    },
     /// Guardian's hooks for Cursor, Claude Code and Codex: see whether each agent has
     /// them and whether they are this version's, and install or update them. The hooks are
     /// carried in this binary; no copy of the repository is needed.
@@ -166,6 +173,16 @@ enum DiskAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum BlockingAction {
+    /// Let Guardian pause prompts and deny subagents, as config.toml says when.
+    On,
+    /// Warnings only (the default): nothing is paused or denied.
+    Off,
+    /// Say whether blocking is on, and what would be stopped if it is.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -775,6 +792,68 @@ fn disk_delete(paths: &[PathBuf], yes: bool, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The file whose presence is the opt-in. The hooks test for it directly
+/// (guardian_blocking_enabled in hooks/lib.sh), so it takes effect on the next hook call.
+fn blocking_marker() -> PathBuf {
+    guardian_dir().join("blocking_on")
+}
+
+/// When the gates would stop something, in words, from the settings in force.
+fn blocking_rules() -> String {
+    let cfg = load_config();
+    let gate = &cfg.prompt_gate;
+    let prompts = if !gate.enabled || gate.block_on == "never" {
+        "prompts are never paused (the prompt gate is off in config.toml)".to_string()
+    } else {
+        match gate.mode.as_str() {
+            "strict" => format!("prompts are paused at {} load", gate.block_on),
+            "advisory" => "prompts are never paused (prompt_gate.mode is advisory)".to_string(),
+            _ => "a prompt is paused when it asks for heavy local work (a full build, a full test run, container builds, several subagents) at critical load and macOS agrees memory or heat is critical".to_string(),
+        }
+    };
+    let subagents = match cfg.tool_gate.deny_subagents_on.as_str() {
+        "strained" | "critical" => format!("new subagents are denied at {} load", cfg.tool_gate.deny_subagents_on),
+        _ => "subagents are never denied (tool_gate.deny_subagents_on is never)".to_string(),
+    };
+    format!("{prompts}; {subagents}")
+}
+
+fn blocking(action: BlockingAction) -> Result<(), String> {
+    let marker = blocking_marker();
+    // A symlink is not an opt-in (the hooks ignore one too) and is not written through.
+    let on = || std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file());
+    match action {
+        BlockingAction::On => {
+            std::fs::create_dir_all(guardian_dir()).map_err(|e| e.to_string())?;
+            if std::fs::symlink_metadata(&marker).is_ok_and(|m| !m.is_file()) {
+                std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+            }
+            let stamp = format!("{}\n", Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+            std::fs::write(&marker, stamp).map_err(|e| e.to_string())?;
+            println!("Blocking is on. With your settings: {}.", blocking_rules());
+            println!("Back to warnings only: guardian blocking off");
+        }
+        BlockingAction::Off => {
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            println!("Blocking is off. Guardian only warns: no prompt is paused and no subagent is denied.");
+        }
+        BlockingAction::Status => {
+            if on() {
+                println!("Blocking is on. With your settings: {}.", blocking_rules());
+                println!("Back to warnings only: guardian blocking off");
+            } else {
+                println!("Blocking is off. Guardian only warns: no prompt is paused and no subagent is denied.");
+                println!("If you turn it on (guardian blocking on): {}.", blocking_rules());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn hooks_status(json: bool) -> Result<(), String> {
     use guardian_daemon::agent_hooks;
     let places = agent_hooks::Places::from_process().ok_or("could not find the home directory")?;
@@ -921,6 +1000,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 disk_save(&paths, delete, plan, no_verify, plan_id, yes, json)
             }
         },
+        Commands::Blocking { action } => blocking(action),
         Commands::Hooks { action } => match action {
             HooksAction::Status { json } => hooks_status(json),
             HooksAction::Install { cursor, claude, codex, upgrade } => hooks_install(cursor, claude, codex, upgrade),
@@ -1049,6 +1129,10 @@ mod tests {
         assert!(parses(&["guardian", "disk", "--fresh"]));
         assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
         assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
+        assert!(parses(&["guardian", "blocking", "on"]));
+        assert!(parses(&["guardian", "blocking", "off"]));
+        assert!(parses(&["guardian", "blocking", "status"]));
+        assert!(!parses(&["guardian", "blocking"]));
         assert!(parses(&["guardian", "hooks", "status"]));
         assert!(parses(&["guardian", "hooks", "status", "--json"]));
         assert!(parses(&["guardian", "hooks", "install"]));

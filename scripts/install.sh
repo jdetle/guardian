@@ -115,7 +115,9 @@ kill_ratio = 0.8
 # Set to true to allow guardian to kill runaway processes
 kill_enabled = false
 
-# Prompt / session gates (also written to ~/.guardian/hook_policy.json by guardiand)
+# Prompt / session gates (also written to ~/.guardian/hook_policy.json by guardiand).
+# These say WHEN Guardian would pause a prompt. Whether it may pause anything at all is a
+# separate opt-in: until you run `~/.guardian/guardian blocking on`, it only warns.
 [prompt_gate]
 enabled = true
 # adaptive | advisory | strict
@@ -132,6 +134,7 @@ block_on_session_budget = false
 # Tool-call gate (Cursor preToolUse, Claude Code / Codex PreToolUse). Advisory by default.
 [tool_gate]
 # Deny NEW subagent spawns at this pressure: "never" | "strained" | "critical".
+# Also needs `guardian blocking on`; without it Guardian warns instead of denying.
 # Subagent fan-out is the main way one agent turn multiplies memory use.
 deny_subagents_on = "never"
 
@@ -257,6 +260,7 @@ if [ "$healthy" = "true" ]; then
     "$GUARDIAN_DIR/guardian" hooks install --upgrade 2>&1 | sed 's/^/  /' || true
     "$GUARDIAN_DIR/guardian" hooks status 2>&1 | sed 's/^/  /' || true
     echo ""
+    echo "Guardian only warns. To let it pause prompts and deny subagents: $GUARDIAN_DIR/guardian blocking on"
     echo "Install hooks for every agent on this machine:  $GUARDIAN_DIR/guardian hooks install"
     echo "  (one agent: --cursor, --claude or --codex; see where each stands: guardian hooks status)"
 else

@@ -133,6 +133,7 @@ echo "=== What is not recorded ==="
 fresh_home
 write_state critical
 jq '.prompt_gate.mode = "strict"' "$HOOKS_DIR/hook_policy.default.json" > "$G/hook_policy.json"
+: > "$G/blocking_on"   # pausing is opt-in; this case is about a prompt that is paused
 hook claude/user-prompt-submit.sh '{"session_id":"b1","prompt":"cargo build --release and run the whole test suite","cwd":"/w"}'; out=$HOOK_OUT
 if [ "$(printf '%s' "$out" | jq -r '.decision // ""' 2>/dev/null)" = "block" ]; then
     check "a prompt Guardian paused does not mark its session working" "" "$(q "select state from sessions where conversation_id='b1'")"

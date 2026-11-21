@@ -37,6 +37,9 @@ final class GuardianClient: ObservableObject {
 
     @Published private(set) var snoozeUntil: Date?
     @Published private(set) var allowOncePending = false
+    /// Whether Guardian may pause prompts and deny subagents (`guardian blocking on`), or
+    /// only warns, which is how it starts out.
+    @Published private(set) var blockingOn = false
     @Published private(set) var promptControlError: String?
 
     private let guardianDir: URL
@@ -112,6 +115,12 @@ final class GuardianClient: ObservableObject {
         let armedAt = (try? FileManager.default.attributesOfItem(atPath: oncePath))?[.modificationDate] as? Date
         let pending = armedAt.map { now.timeIntervalSince($0) < Self.allowOnceSeconds } ?? false
         if allowOncePending != pending { allowOncePending = pending }
+
+        // The opt-in is a plain file the hooks test for; a symlink there is not one.
+        let optIn = guardianDir.appendingPathComponent("blocking_on").path
+        let kind = (try? FileManager.default.attributesOfItem(atPath: optIn))?[.type] as? FileAttributeType
+        let blocking = kind == .typeRegular
+        if blockingOn != blocking { blockingOn = blocking }
     }
 
     /// Today's share of time at each level, from guardiand's per-day accounting.

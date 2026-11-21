@@ -127,7 +127,23 @@ struct MenuBarView: View {
 
     private var promptControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let expiry = client.snoozeUntil {
+            if !client.blockingOn {
+                // Guardian starts out only warning. Snooze and allow-once lift pauses, so
+                // there is nothing for them to do until pausing has been allowed.
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Warnings only")
+                            .font(.caption)
+                        Text("Guardian tells agents about load. It does not pause prompts or stop subagents.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Allow pausing…") { confirmBlocking() }
+                        .help("Lets Guardian pause prompts and deny subagents when your settings say to. You can turn it off again here.")
+                }
+            } else if let expiry = client.snoozeUntil {
                 HStack {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Snoozed until \(expiry.formatted(date: .omitted, time: .shortened))")
@@ -147,9 +163,11 @@ struct MenuBarView: View {
                         Button("30 minutes") { client.runPromptControl(["snooze", "30"]) }
                         Button("60 minutes") { client.runPromptControl(["snooze", "60"]) }
                         Button("2 hours (the most allowed)") { client.runPromptControl(["snooze", "120"]) }
+                        Divider()
+                        Button("Go back to warnings only") { client.runPromptControl(["blocking", "off"]) }
                     } label: {
                         Image(systemName: "ellipsis.circle")
-                            .accessibilityLabel("More snooze durations")
+                            .accessibilityLabel("More snooze durations, and turning pausing off")
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
@@ -250,6 +268,20 @@ struct MenuBarView: View {
             )
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Pausing is an opt-in: say what it means before turning it on. Cancel is the default.
+    private func confirmBlocking() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Let Guardian pause prompts?"
+        alert.informativeText = "Until now Guardian has only warned. With this on, its hooks in Cursor, Claude Code and Codex may pause a prompt, or deny a new subagent, when your settings in ~/.guardian/config.toml say to. With the defaults that is a prompt asking for heavy local work (a full build, a full test run) while the machine is under critical pressure; subagents are never denied unless you set that too.\n\nA paused prompt can be let through with Allow once or Snooze. You can go back to warnings only from the menu next to Snooze, or with: guardian blocking off"
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Allow pausing")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            client.runPromptControl(["blocking", "on"])
         }
     }
 
