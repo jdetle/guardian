@@ -118,6 +118,26 @@ enum DiskAction {
     /// Scan, then choose what to delete. Asks before deleting anything. Takes the same
     /// scan options as `guardian disk`, before or after the word `clean`.
     Clean,
+    /// Commit and push the unsaved work in git worktrees, so that they can be removed
+    /// without losing it. Commits what is uncommitted to the worktree's branch (a new
+    /// branch for a detached HEAD) and pushes that branch; never forces a push, and refuses
+    /// new files that look like credentials.
+    Save {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Remove each worktree once its work is on the remote.
+        #[arg(long)]
+        delete: bool,
+        /// Say what would be committed and pushed, and change nothing.
+        #[arg(long, conflicts_with_all = ["delete", "yes"])]
+        plan: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Print JSON results.
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete specific targets from a scan. Each is re-checked first: a build folder must
     /// hold nothing git tracks, a worktree no uncommitted work.
     Delete {
@@ -276,6 +296,9 @@ struct Offer {
     look_first: bool,
     /// Picked by `old`: comes back on its own and has gone untouched for two weeks or more.
     old: bool,
+    /// A worktree with unsaved work: it is committed and pushed before it is removed, and
+    /// kept if that does not go through.
+    save_first: bool,
 }
 
 /// What `guardian disk clean` can offer from a report: stale bundles first, then single
@@ -295,8 +318,9 @@ fn offers(report: &disk_targets::Report, top: usize) -> Vec<Offer> {
             title: format!("{} ({})", t.what, t.display_path),
             detail: details.join("; "),
             paths: vec![t.path.clone()],
-            look_first: t.safety == disk_targets::Safety::Review,
+            look_first: t.safety == disk_targets::Safety::Review && !t.saveable,
             old: false,
+            save_first: t.saveable,
         }
     };
     let mut all = Vec::new();
@@ -310,16 +334,18 @@ fn offers(report: &disk_targets::Report, top: usize) -> Vec<Offer> {
                 look_first: false,
                 // Tool caches are shared by every project: chosen by number, never by `old`.
                 old: b.is_project && b.staleness.is_old(),
+                save_first: false,
             });
         }
     }
-    // Stale folders Guardian can delete but that need a look first are offered one by one.
+    // Stale folders that need a look first, or whose work must be saved first, are offered
+    // one by one.
     for t in report.bundles.iter().flat_map(|b| &b.members) {
-        if t.deletable && t.safety == disk_targets::Safety::Review {
+        if t.saveable || (t.deletable && t.safety == disk_targets::Safety::Review) {
             all.push(single(t));
         }
     }
-    for t in report.targets.iter().filter(|t| t.deletable) {
+    for t in report.targets.iter().filter(|t| t.deletable || t.saveable) {
         all.push(single(t));
     }
     all.truncate(top);
@@ -344,7 +370,11 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
         report.used_percent, report.available_gb, report.repos_scanned
     );
     for (i, offer) in offered.iter().enumerate() {
-        let flag = if offer.look_first { "  LOOK FIRST" } else { "" };
+        let flag = match (offer.save_first, offer.look_first) {
+            (true, _) => "  SAVED FIRST: committed and pushed, then removed",
+            (_, true) => "  LOOK FIRST",
+            _ => "",
+        };
         println!(
             "{:>3}. {:>9}  {}{flag}\n                {}",
             i + 1,
@@ -380,6 +410,33 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
         .cloned()
         .collect();
 
+    // Worktrees with unsaved work: say exactly what will be committed and pushed, and drop
+    // the ones that cannot be saved, before asking.
+    let mut to_save: Vec<PathBuf> = Vec::new();
+    let mut unsaveable: Vec<PathBuf> = Vec::new();
+    for offer in chosen.iter().filter(|o| o.save_first) {
+        for p in &offer.paths {
+            match disk_targets::plan_save(p, &home) {
+                Ok(plan) => {
+                    println!("{}", describe_save(&plan, &home, true));
+                    to_save.push(p.clone());
+                }
+                Err(why) => {
+                    println!("  will keep {}: {why}", disk_targets::display_path(p, &home));
+                    unsaveable.push(p.clone());
+                }
+            }
+        }
+    }
+    let paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| !unsaveable.contains(p))
+        .collect();
+    if paths.is_empty() {
+        println!("Nothing to delete.");
+        return Ok(());
+    }
+
     println!();
     for offer in &chosen {
         let warn = if offer.look_first {
@@ -390,8 +447,12 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
         println!("  {:>9}  {}{warn}", disk_targets::human_size(offer.freed), offer.title);
     }
     let total: u64 = chosen.iter().map(|o| o.freed).sum();
+    let saving = match to_save.iter().filter(|p| paths.contains(p)).count() {
+        0 => String::new(),
+        n => format!(" {n} of them are committed and pushed first, and kept if that fails."),
+    };
     let confirm = ask(&format!(
-        "Delete these {} folder(s), about {}? This cannot be undone. [y/N] ",
+        "Delete these {} folder(s), about {}?{saving} This cannot be undone. [y/N] ",
         paths.len(),
         disk_targets::human_size(total)
     ))?;
@@ -400,11 +461,188 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
         return Ok(());
     }
 
+    // Save first. A worktree whose work did not reach the remote is not deleted.
+    let mut not_saved = 0usize;
+    let mut paths = paths;
+    for p in to_save.iter().filter(|p| paths.contains(p)).cloned().collect::<Vec<_>>() {
+        let shown = disk_targets::display_path(&p, &home);
+        match disk_targets::save_worktree(&p, &home) {
+            Ok(saved) => println!(
+                "  saved   {shown}: {} file(s) committed to {}, pushed to {}",
+                saved.committed_files, saved.branch, saved.pushed_to
+            ),
+            Err(why) => {
+                not_saved += 1;
+                println!("  kept    {shown}: {why}");
+                paths.retain(|other| other != &p);
+            }
+        }
+    }
+
     let (freed, failed) = delete_all(&paths, &home);
+    let failed = failed + not_saved;
     println!("Freed about {}.", disk_targets::human_size(freed));
     print_free_space(&home);
     if failed > 0 {
         return Err(format!("{failed} item(s) were kept; see above."));
+    }
+    Ok(())
+}
+
+/// What saving a worktree will do, in a few indented lines.
+fn describe_save(plan: &disk_targets::SavePlan, home: &std::path::Path, delete: bool) -> String {
+    let mut lines = vec![format!("  {}", disk_targets::display_path(&plan.path, home))];
+    let files = match plan.files.len() {
+        0 => "nothing is uncommitted".to_string(),
+        1 => "commit 1 file".to_string(),
+        n => format!("commit {n} files"),
+    };
+    lines.push(if plan.new_branch {
+        format!("      {files}; put its detached HEAD on a new branch, {}", plan.branch)
+    } else if plan.files.is_empty() {
+        format!("      {files} on branch {}", plan.branch)
+    } else {
+        format!("      {files} to branch {}", plan.branch)
+    });
+    lines.push(format!(
+        "      push to {}/{}{}",
+        plan.remote,
+        plan.remote_branch,
+        if plan.has_upstream { "" } else { " (not on the remote yet)" }
+    ));
+    for file in plan.files.iter().take(8) {
+        lines.push(format!("        {file}"));
+    }
+    if plan.files.len() > 8 {
+        lines.push(format!("        and {} more", plan.files.len() - 8));
+    }
+    if !plan.ignored.is_empty() {
+        lines.push(format!(
+            "      NOT saved, git ignores {}: {}{}",
+            if plan.ignored.len() == 1 { "it" } else { "them" },
+            plan.ignored.join(", "),
+            if delete { " (deleted with the worktree)" } else { "" }
+        ));
+    }
+    if delete {
+        lines.push("      then remove the worktree".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Save one worktree and, if asked, remove it. The JSON says how far it got.
+fn save_one(path: &std::path::Path, home: &std::path::Path, delete: bool) -> serde_json::Value {
+    let shown = path.to_string_lossy();
+    let saved = match disk_targets::save_worktree(path, home) {
+        Ok(saved) => saved,
+        Err(why) => return serde_json::json!({"path": shown, "ok": false, "saved": false, "deleted": false, "error": why}),
+    };
+    let mut result = serde_json::json!({
+        "path": shown,
+        "ok": true,
+        "saved": true,
+        "deleted": false,
+        "branch": saved.branch,
+        "committed_files": saved.committed_files,
+        "pushed_to": saved.pushed_to,
+    });
+    if delete {
+        match disk_targets::delete_target(path, home) {
+            Ok(done) => {
+                result["deleted"] = true.into();
+                result["freed_bytes"] = done.freed_bytes.into();
+            }
+            Err(why) => {
+                result["ok"] = false.into();
+                result["error"] = format!("its work is saved, but it was not removed: {why}").into();
+            }
+        }
+    }
+    result
+}
+
+fn disk_save(paths: &[PathBuf], delete: bool, plan_only: bool, yes: bool, json: bool) -> Result<(), String> {
+    let home = home()?;
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+
+    if plan_only && json {
+        let plans: Vec<serde_json::Value> = paths
+            .iter()
+            .map(|p| match disk_targets::plan_save(p, &home) {
+                Ok(plan) => serde_json::json!({"path": p.to_string_lossy(), "ok": true, "plan": plan}),
+                Err(why) => serde_json::json!({"path": p.to_string_lossy(), "ok": false, "error": why}),
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(plans));
+        return Ok(());
+    }
+    if json && !yes {
+        return Err("--json needs --yes or --plan: confirmation is the caller's job".to_string());
+    }
+    if json {
+        let results: Vec<serde_json::Value> = paths.iter().map(|p| save_one(p, &home, delete)).collect();
+        println!("{}", serde_json::Value::Array(results));
+        return Ok(());
+    }
+
+    // Say what will happen, and what cannot be saved, before asking.
+    let mut ready = Vec::new();
+    for p in &paths {
+        match disk_targets::plan_save(p, &home) {
+            Ok(plan) => {
+                println!("{}", describe_save(&plan, &home, delete));
+                ready.push(p.clone());
+            }
+            Err(why) => println!("  will not touch {}: {why}", disk_targets::display_path(p, &home)),
+        }
+    }
+    if plan_only {
+        return if ready.len() == paths.len() { Ok(()) } else { Err("Some cannot be saved; see above.".to_string()) };
+    }
+    if ready.is_empty() {
+        return Err("Nothing to save.".to_string());
+    }
+    if !yes {
+        let confirm = ask(&format!(
+            "Commit and push {} worktree(s){}? Commit hooks are skipped; nothing is force-pushed. [y/N] ",
+            ready.len(),
+            if delete { ", then remove them" } else { "" }
+        ))?;
+        if !said_yes(&confirm) {
+            println!("Nothing changed.");
+            return Ok(());
+        }
+    }
+    let mut failed = paths.len() - ready.len();
+    for p in &ready {
+        let shown = disk_targets::display_path(p, &home);
+        let result = save_one(p, &home, delete);
+        let text = |key: &str| result[key].as_str().unwrap_or_default().to_string();
+        if result["saved"] == true {
+            println!(
+                "  saved   {shown}: {} file(s) committed to {}, pushed to {}",
+                result["committed_files"], text("branch"), text("pushed_to")
+            );
+        }
+        if result["deleted"] == true {
+            println!(
+                "  deleted {shown} ({})",
+                disk_targets::human_size(result["freed_bytes"].as_u64().unwrap_or(0))
+            );
+        }
+        if result["ok"] != true {
+            failed += 1;
+            println!("  kept    {shown}: {}", text("error"));
+        }
+    }
+    if delete {
+        print_free_space(&home);
+    }
+    if failed > 0 {
+        return Err(format!("{failed} worktree(s) were not fully handled; see above."));
     }
     Ok(())
 }
@@ -533,6 +771,9 @@ fn run(cli: Cli) -> Result<(), String> {
             Some(DiskAction::Refresh) => disk_refresh(&scan),
             Some(DiskAction::Clean) => disk_clean(&scan),
             Some(DiskAction::Delete { paths, yes, json }) => disk_delete(&paths, yes, json),
+            Some(DiskAction::Save { paths, delete, plan, yes, json }) => {
+                disk_save(&paths, delete, plan, yes, json)
+            }
         },
         Commands::Stats { days } => {
             print!("{}", PressureStats::load().render(days as usize));
@@ -658,6 +899,11 @@ mod tests {
         assert!(parses(&["guardian", "disk", "--fresh"]));
         assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
         assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
+        assert!(parses(&["guardian", "disk", "save", "/tmp/wt"]));
+        assert!(parses(&["guardian", "disk", "save", "/tmp/a", "/tmp/b", "--delete", "--yes", "--json"]));
+        assert!(parses(&["guardian", "disk", "save", "--plan", "--json", "/tmp/wt"]));
+        assert!(!parses(&["guardian", "disk", "save", "--plan", "--delete", "/tmp/wt"]));
+        assert!(!parses(&["guardian", "disk", "save"]));
         assert!(!parses(&["guardian", "disk", "delete"]));
     }
 

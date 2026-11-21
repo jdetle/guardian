@@ -263,6 +263,73 @@ final class GuardianClient: ObservableObject {
         }
     }
 
+    /// Ask what saving a worktree's unsaved work would do (`guardian disk save --plan`):
+    /// which files would be committed, to which branch, pushed where. Changes nothing.
+    /// `completion` runs on the main queue; nil when the command could not be run.
+    func planSave(_ target: DiskTarget, completion: @escaping (SavePlanResult?) -> Void) {
+        let executable = guardianDir.appendingPathComponent("guardian")
+        deleteQueue.async {
+            let data = Self.run(executable, ["disk", "save", "--plan", "--json", target.path])
+            let result = data.flatMap { try? JSONDecoder().decode([SavePlanResult].self, from: $0) }?.first
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    /// Commit and push a worktree's unsaved work, then remove the worktree
+    /// (`guardian disk save --delete`). The worktree is kept if the push does not go
+    /// through. Call only after the person has confirmed.
+    func saveAndDelete(_ target: DiskTarget) {
+        guard deletingPaths.isEmpty else { return }
+        deletingPaths = [target.path]
+        deleteMessage = nil
+        let executable = guardianDir.appendingPathComponent("guardian")
+        deleteQueue.async {
+            let data = Self.run(executable, ["disk", "save", "--delete", "--yes", "--json", target.path])
+            let result = data.flatMap { try? JSONDecoder().decode([SaveResult].self, from: $0) }?.first
+            DispatchQueue.main.async {
+                self.deletingPaths = []
+                guard let result else {
+                    self.deleteMessage = "Kept \(target.displayPath): the save command did not run. It needs guardian 0.12 or newer."
+                    return
+                }
+                var parts: [String] = []
+                if result.saved == true {
+                    let files = result.committedFiles ?? 0
+                    parts.append("Saved \(target.displayPath): "
+                        + (files == 0 ? "nothing was uncommitted" : "\(files) file\(files == 1 ? "" : "s") committed")
+                        + ", branch pushed to \(result.pushedTo ?? "its remote").")
+                }
+                if result.deleted == true {
+                    parts.append("Removed it, freeing about \(DiskTarget.sizeText(result.freedBytes ?? 0)).")
+                } else {
+                    parts.append("Kept it: \(result.error ?? "it was not removed").")
+                }
+                self.deleteMessage = parts.joined(separator: " ")
+                self.loadState()
+                // What git says about it has changed either way: look again.
+                self.scanDisk()
+            }
+        }
+    }
+
+    /// Run the guardian CLI and return what it printed; nil if it could not be started.
+    private static func run(_ executable: URL, _ arguments: [String]) -> Data? {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return data
+        } catch {
+            return nil
+        }
+    }
+
     /// One or two sentences on what a delete did.
     static func deleteSummary(chosen: [DiskTarget], deleted: [DeleteResult], kept: [DeleteResult]) -> String {
         let shown = { (path: String) in chosen.first { $0.path == path }?.displayPath ?? path }

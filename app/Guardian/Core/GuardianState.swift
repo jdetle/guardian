@@ -224,6 +224,9 @@ struct DiskTarget: Codable, Sendable, Identifiable {
     var note: String?
     /// True when `guardian disk delete` will remove it (it re-checks first).
     var deletable: Bool = false
+    /// True for a worktree kept from deletion only by unsaved work that
+    /// `guardian disk save --delete` can commit and push first.
+    var saveable: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case path
@@ -231,7 +234,7 @@ struct DiskTarget: Codable, Sendable, Identifiable {
         case kind, what, cost, remove, safety, bytes, complete
         case freedBytes = "freed_bytes"
         case ageDays = "age_days"
-        case repo, branch, note, deletable
+        case repo, branch, note, deletable, saveable
     }
 
     init(from decoder: Decoder) throws {
@@ -251,6 +254,7 @@ struct DiskTarget: Codable, Sendable, Identifiable {
         branch = try? c.decodeIfPresent(String.self, forKey: .branch)
         note = try? c.decodeIfPresent(String.self, forKey: .note)
         deletable = (try? c.decodeIfPresent(Bool.self, forKey: .deletable)) ?? false
+        saveable = (try? c.decodeIfPresent(Bool.self, forKey: .saveable)) ?? false
     }
 
     var regenerates: Bool { safety == "regenerates" }
@@ -428,6 +432,56 @@ struct DiskReport: Codable, Sendable {
         scannedAt = (try? c.decodeIfPresent(UInt64.self, forKey: .scannedAt))
             .map { Date(timeIntervalSince1970: TimeInterval($0)) }
         fromCache = (try? c.decodeIfPresent(Bool.self, forKey: .fromCache)) ?? false
+    }
+}
+
+/// What `guardian disk save` would do to a worktree (`--plan --json`).
+struct SavePlan: Codable, Sendable {
+    let branch: String
+    /// True when HEAD is detached and `branch` is created for it.
+    let newBranch: Bool
+    /// Files that will be committed.
+    let files: [String]
+    let remote: String
+    let remoteBranch: String
+    /// False when the branch is not on the remote yet.
+    let hasUpstream: Bool
+    /// Ignored files kept nowhere else: not saved, and deleted with the worktree.
+    let ignored: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case branch, files, remote, ignored
+        case newBranch = "new_branch"
+        case remoteBranch = "remote_branch"
+        case hasUpstream = "has_upstream"
+    }
+}
+
+/// One element of `guardian disk save --plan --json`.
+struct SavePlanResult: Codable, Sendable {
+    let path: String
+    let ok: Bool
+    let plan: SavePlan?
+    let error: String?
+}
+
+/// One element of `guardian disk save --delete --yes --json`.
+struct SaveResult: Codable, Sendable {
+    let path: String
+    let ok: Bool
+    let saved: Bool?
+    let deleted: Bool?
+    let branch: String?
+    let committedFiles: Int?
+    let pushedTo: String?
+    let freedBytes: UInt64?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case path, ok, saved, deleted, branch, error
+        case committedFiles = "committed_files"
+        case pushedTo = "pushed_to"
+        case freedBytes = "freed_bytes"
     }
 }
 

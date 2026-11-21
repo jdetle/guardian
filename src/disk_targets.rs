@@ -20,6 +20,10 @@
 //! Sizes are reported twice: what a folder occupies, and what deleting it would free. The
 //! two differ when its files are clones of files elsewhere, as a bun or pnpm install's are.
 
+mod save;
+
+pub use save::{plan_save, save_worktree, SavePlan, Saved};
+
 use crate::dir_list;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -81,6 +85,9 @@ pub struct Target {
     pub note: Option<String>,
     /// True when `guardian disk delete` will remove it (after re-checking).
     pub deletable: bool,
+    /// True for a worktree kept from deletion only by unsaved work that
+    /// `guardian disk save --delete` can commit and push first.
+    pub saveable: bool,
 }
 
 /// How long something has gone untouched, in the bands a listing is grouped by. Declared
@@ -161,6 +168,9 @@ pub struct Bundle {
     /// How many of its folders are left out of `delete_paths`: they need a look first, or
     /// their own command.
     pub held_back: usize,
+    /// The held-back worktrees whose unsaved work `guardian disk save --delete` can commit
+    /// and push, after which they can go too.
+    pub save_paths: Vec<PathBuf>,
     /// Its folders, the ones that free the most first.
     pub members: Vec<Target>,
 }
@@ -274,6 +284,9 @@ struct Candidate {
     /// each scan decides it anew.
     #[serde(skip)]
     needs_check: bool,
+    /// A worktree kept from deletion by work that `guardian disk save` can commit and push.
+    #[serde(default)]
+    saveable: bool,
 }
 
 /// Well-known locations under the home directory:
@@ -421,6 +434,7 @@ fn walk(root: &Path, skip_top: &[&str], deadline: Instant, out: &mut Found) -> b
                     size: None,
                     measured_at: None,
                     needs_check: false,
+                    saveable: false,
                 });
                 continue;
             }
@@ -604,6 +618,8 @@ struct WorktreeState {
     safety: Safety,
     deletable: bool,
     note: String,
+    /// What keeps it from being deleted is work `guardian disk save` can commit and push.
+    saveable: bool,
 }
 
 fn worktree_state(wt: &Linked) -> WorktreeState {
@@ -611,6 +627,12 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
         safety: Safety::Review,
         deletable: false,
         note,
+        saveable: false,
+    };
+    // Uncommitted files, or commits on no branch: work that a commit and a push would keep.
+    let unsaved = |note: String| WorktreeState {
+        saveable: true,
+        ..blocked(note)
     };
     if wt.locked {
         return blocked("locked with git worktree lock".to_string());
@@ -633,7 +655,7 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     let entries = || status.lines().filter(|l| !l.trim().is_empty());
     let dirty = entries().filter(|l| !l.starts_with("!!")).count();
     if dirty > 0 {
-        return blocked(format!(
+        return unsaved(format!(
             "{dirty} uncommitted or untracked file{}",
             if dirty == 1 { "" } else { "s" }
         ));
@@ -661,7 +683,7 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
         match unique {
             Some(0) => {}
             Some(n) => {
-                return blocked(format!(
+                return unsaved(format!(
                     "{n} commit{} only here (detached HEAD)",
                     if n == 1 { " exists" } else { "s exist" }
                 ))
@@ -681,6 +703,7 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
         return WorktreeState {
             safety: Safety::Review,
             deletable: true,
+            saveable: false,
             note: match n {
                 1 => format!("no uncommitted work, but {first} is ignored by git and would be lost"),
                 2 => format!("no uncommitted work, but {first} and 1 other ignored item would be lost"),
@@ -694,6 +717,7 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     WorktreeState {
         safety: Safety::Regenerates,
         deletable: true,
+        saveable: false,
         note: match &wt.branch {
             Some(b) => format!("no uncommitted work; branch {b} stays in the repository"),
             None => "no uncommitted work; its commits are on other branches".to_string(),
@@ -721,11 +745,13 @@ fn worktree_candidates(main: &Path, home: &Path, deadline: Instant, out: &mut Ve
         let state = WorktreeState {
             safety: Safety::Review,
             deletable: false,
+            saveable: false,
             note: if wt.locked { LOCKED } else { UNCHECKED }.to_string(),
         };
         let deletable = false;
         out.push(Candidate {
             needs_check: !wt.locked,
+            saveable: false,
             remove: Some(format!(
                 "git -C {} worktree remove {}",
                 shell_path(main, home),
@@ -760,6 +786,7 @@ fn check_worktree(c: &mut Candidate, home: &Path) {
     c.deletable = state.deletable && guard_path(&c.path, home).is_ok();
     c.safety = state.safety;
     c.note = Some(state.note);
+    c.saveable = state.saveable;
     c.needs_check = false;
 }
 
@@ -950,6 +977,7 @@ fn candidates(home: &Path, opts: &Options, deadline: Instant) -> Discovery {
             size: None,
             measured_at: None,
             needs_check: false,
+            saveable: false,
         });
     }
 
@@ -1134,6 +1162,7 @@ fn survey_with(
                     // What git said last time stands until the worktree is measured again.
                     c.safety = before.safety;
                     c.deletable = before.deletable;
+                    c.saveable = before.saveable;
                     if before.note.as_deref() == Some(LOCKED) {
                         // Locked then, not now: ask git this time.
                         c.measured_at = None;
@@ -1422,6 +1451,11 @@ fn bundle_stale(rows: Vec<Row>, home: &Path, min_bytes: u64) -> (Vec<Bundle>, Ve
                 .iter()
                 .filter(|r| !delete_paths.contains(&r.target.path))
                 .count(),
+            save_paths: top_level
+                .iter()
+                .filter(|r| r.target.saveable)
+                .map(|r| r.target.path.clone())
+                .collect(),
             delete_paths,
             members,
         };
@@ -1458,10 +1492,15 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
             unmeasured += 1;
             continue;
         };
-        let remove = c
-            .remove
-            .clone()
-            .unwrap_or_else(|| format!("rm -rf {}", shell_path(&c.path, home)));
+        let saveable = c.saveable && !c.deletable;
+        let remove = if saveable {
+            // `git worktree remove` would refuse it; this saves its work first.
+            format!("guardian disk save --delete {}", shell_path(&c.path, home))
+        } else {
+            c.remove
+                .clone()
+                .unwrap_or_else(|| format!("rm -rf {}", shell_path(&c.path, home)))
+        };
         // The worktree a build folder is inside, if that worktree has been measured.
         let inside = match (&c.kind, &c.repo) {
             (Kind::Build, Some(repo)) => worktrees
@@ -1504,6 +1543,7 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
                 branch: c.branch.clone(),
                 note: c.note.clone(),
                 deletable: c.deletable,
+                saveable,
                 path: c.path.clone(),
             },
             project,
@@ -1747,7 +1787,12 @@ impl Bundle {
             1 => format!("; 1 more ({held_freed}) needs a look or its own command"),
             n => format!("; {n} more ({held_freed}) need a look or their own command"),
         };
-        format!("{}; {now}{held}", self.ages_text())
+        let saveable = match self.save_paths.len() {
+            0 => String::new(),
+            1 => "; 1 of those holds unsaved work that can be committed and pushed first".to_string(),
+            n => format!("; {n} of those hold unsaved work that can be committed and pushed first"),
+        };
+        format!("{}; {now}{held}{saveable}", self.ages_text())
     }
 }
 
@@ -2110,6 +2155,40 @@ mod tests {
             self.age(rel, days);
         }
 
+        /// A repository at `rel` with one commit, pushed to a bare repository beside it that
+        /// stands in for its remote (`origin`). Its identity, signing and hooks are set in
+        /// the repository itself, so saving there does not depend on this machine's git
+        /// configuration, and nothing ever leaves the scratch folder.
+        fn repo_with_remote(&self, rel: &str) -> PathBuf {
+            self.repo(rel);
+            let remote = format!("{rel}-remote.git");
+            self.git(&remote, &["init", "-q", "--bare"]);
+            let no_hooks = self.path(".no-hooks");
+            for (key, value) in [
+                ("user.name", "t"),
+                ("user.email", "t@example.invalid"),
+                ("commit.gpgsign", "false"),
+                ("core.hooksPath", no_hooks.to_str().unwrap()),
+            ] {
+                self.git(rel, &["config", key, value]);
+            }
+            let remote = self.path(&remote);
+            self.git(rel, &["remote", "add", "origin", remote.to_str().unwrap()]);
+            self.git(rel, &["push", "-q", "-u", "origin", "main"]);
+            remote
+        }
+
+        /// What `rev` names in the repository or worktree at `dir`; empty if nothing.
+        fn rev(&self, dir: &Path, rev: &str) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["rev-parse", "-q", "--verify", rev])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
         /// A repository at `rel` with one commit.
         fn repo(&self, rel: &str) {
             self.git(rel, &["init", "-q"]);
@@ -2348,6 +2427,8 @@ mod tests {
         let dirty = find(&report, "~/code/app-wt-dirty");
         assert_eq!(dirty.safety, Safety::Review);
         assert!(!dirty.deletable);
+        assert!(dirty.saveable, "its unsaved work can be committed and pushed");
+        assert!(!clean.saveable, "nothing to save in a clean one");
         assert_eq!(dirty.note.as_deref(), Some("1 uncommitted or untracked file"));
 
         // The node_modules inside the listed worktree is not counted a second time.
@@ -2567,6 +2648,7 @@ mod tests {
             branch: None,
             note: None,
             deletable,
+            saveable: false,
         }
     }
 
@@ -2643,6 +2725,168 @@ mod tests {
         assert!(text.contains("$ npm cache clean --force"), "{text}");
         assert!(text.contains("to empty trash"), "{text}");
         assert!(text.contains("used today"), "{text}");
+    }
+
+    // --- saving unsaved work before a worktree goes ---
+
+    #[test]
+    fn saving_commits_and_pushes_and_then_the_worktree_can_go() {
+        let s = Scratch::new("save");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/src/new.rs", 100);
+        fs::write(wt.join("README.md"), "changed\n").unwrap();
+        assert!(why_not_deletable(&wt, &s.0).unwrap().contains("2 uncommitted or untracked files"));
+
+        // Planning says what would happen and changes nothing.
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.new_branch), ("feature", false));
+        assert_eq!((plan.remote.as_str(), plan.remote_branch.as_str(), plan.has_upstream), ("origin", "feature", false));
+        let mut files = plan.files.clone();
+        files.sort();
+        assert_eq!(files, vec!["README.md", "src/new.rs"]);
+        assert!(why_not_deletable(&wt, &s.0).is_some());
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), "", "nothing pushed yet");
+
+        let saved = save_worktree(&wt, &s.0).unwrap();
+        assert_eq!((saved.branch.as_str(), saved.committed_files, saved.pushed_to.as_str()), ("feature", 2, "origin/feature"));
+        let head = s.rev(&wt, "HEAD");
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), head, "the remote has the commit");
+        assert!(!head.is_empty());
+        let subject = git(&wt, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject.trim(), save::COMMIT_MESSAGE);
+
+        // Saved, so it may be deleted, and the work outlives it.
+        assert_eq!(why_not_deletable(&wt, &s.0), None);
+        delete_target(&wt, &s.0).unwrap();
+        assert!(!wt.exists());
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), head);
+
+        // Saving again where nothing is uncommitted just makes sure the branch is pushed.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "tidy", "../app-wt-tidy"]);
+        let saved = save_worktree(&s.path("code/app-wt-tidy"), &s.0).unwrap();
+        assert_eq!((saved.committed_files, saved.pushed_to.as_str()), (0, "origin/tidy"));
+        assert_eq!(s.rev(&remote, "refs/heads/tidy"), s.rev(&s.path("code/app-wt-tidy"), "HEAD"));
+    }
+
+    #[test]
+    fn saving_pushes_to_the_branch_it_already_follows() {
+        let s = Scratch::new("save-upstream");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "mine", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.git("code/app-wt", &["push", "-q", "-u", "origin", "mine:shared"]);
+        s.file("code/app-wt/notes.txt", 10);
+
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.remote_branch.as_str(), plan.has_upstream), ("shared", true));
+        let saved = save_worktree(&wt, &s.0).unwrap();
+        assert_eq!(saved.pushed_to, "origin/shared");
+        assert_eq!(s.rev(&remote, "refs/heads/shared"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&remote, "refs/heads/mine"), "", "not pushed under a second name");
+    }
+
+    #[test]
+    fn saving_a_detached_head_gives_its_commits_a_branch() {
+        let s = Scratch::new("save-detached");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "--detach", "../app wt"]);
+        let wt = s.path("code/app wt");
+        s.file("code/app wt/idea.txt", 10);
+        s.git("code/app wt", &["add", "idea.txt"]);
+        s.git("code/app wt", &["commit", "-q", "-m", "an idea"]);
+        let report = survey_home(&s.0, &small_floor());
+        let listed = find(&report, "~/code/app wt");
+        assert!(listed.note.as_deref().unwrap().contains("only here (detached HEAD)"), "{:?}", listed.note);
+        assert!(listed.saveable && !listed.deletable);
+
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.new_branch), ("guardian-save/app-wt", true));
+        assert!(plan.files.is_empty());
+        let saved = save_worktree(&wt, &s.0).unwrap();
+        assert_eq!(saved.pushed_to, "origin/guardian-save/app-wt");
+        assert_eq!(s.rev(&remote, "refs/heads/guardian-save/app-wt"), s.rev(&wt, "HEAD"));
+        assert_eq!(why_not_deletable(&wt, &s.0), None);
+    }
+
+    #[test]
+    fn saving_refuses_what_a_plain_commit_would_get_wrong() {
+        let s = Scratch::new("save-refuse");
+        s.repo_with_remote("code/app");
+        let refused = |rel: &str| plan_save(&s.path(rel), &s.0).expect_err(rel);
+
+        assert!(refused("code/app").contains("not a linked git worktree"));
+
+        // A new file that looks like credentials would be published by a push.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "a", "../wt-secret"]);
+        s.file("code/wt-secret/.env.example", 10);
+        assert!(plan_save(&s.path("code/wt-secret"), &s.0).is_ok(), "a template is fine");
+        s.file("code/wt-secret/.env", 10);
+        s.file("code/wt-secret/deploy/server.pem", 10);
+        let why = refused("code/wt-secret");
+        assert!(why.contains(".env") && why.contains("deploy/server.pem") && why.contains("credentials"), "{why}");
+        let before = s.rev(&s.path("code/wt-secret"), "HEAD");
+        assert!(save_worktree(&s.path("code/wt-secret"), &s.0).is_err());
+        assert_eq!(s.rev(&s.path("code/wt-secret"), "HEAD"), before, "nothing was committed");
+        assert!(why_not_deletable(&s.path("code/wt-secret"), &s.0).is_some(), "and it is still kept");
+
+        // A merge under way: committing would conclude it.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "b", "../wt-merging"]);
+        s.file("code/app/.git/worktrees/wt-merging/MERGE_HEAD", 41);
+        assert!(refused("code/wt-merging").contains("under way"));
+
+        // A repository inside it would be committed as a pointer, without its contents.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "c", "../wt-nested"]);
+        s.repo("code/wt-nested/vendor/lib");
+        assert!(refused("code/wt-nested").contains("git repository of its own"));
+
+        // Files hidden from status would be left out of the commit.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "d", "../wt-hidden"]);
+        s.git("code/wt-hidden", &["update-index", "--skip-worktree", "README.md"]);
+        assert!(refused("code/wt-hidden").contains("hidden from git status"));
+
+        // Nowhere to push to.
+        s.repo("code/lonely");
+        s.git("code/lonely", &["worktree", "add", "-q", "-b", "e", "../wt-lonely"]);
+        s.file("code/wt-lonely/x.txt", 10);
+        assert!(refused("code/wt-lonely").contains("no remote"));
+
+        // Outside the home folder.
+        assert!(plan_save(Path::new("/tmp"), &s.0).is_err());
+    }
+
+    #[test]
+    fn a_push_that_fails_keeps_the_commit_and_says_so() {
+        let s = Scratch::new("save-nopush");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/work.txt", 10);
+        fs::remove_dir_all(&remote).unwrap();
+
+        let why = save_worktree(&wt, &s.0).unwrap_err();
+        assert!(why.contains("is committed to branch feature, which stays in the repository"), "{why}");
+        assert!(why.contains("the push to origin did not go through"), "{why}");
+        let subject = git(&wt, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject.trim(), save::COMMIT_MESSAGE, "the work is in a commit, on its branch");
+        assert!(wt.join("work.txt").exists());
+    }
+
+    #[test]
+    fn ignored_files_that_a_commit_cannot_save_are_named_in_the_plan() {
+        let s = Scratch::new("save-ignored");
+        s.repo_with_remote("code/app");
+        fs::write(s.path("code/app/.gitignore"), "node_modules\nlocal.db\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        s.file("code/app-wt/local.db", 10);
+        s.file("code/app-wt/node_modules/dep/x.js", 10);
+        s.file("code/app-wt/work.txt", 10);
+        let plan = plan_save(&s.path("code/app-wt"), &s.0).unwrap();
+        assert_eq!(plan.files, vec!["work.txt"]);
+        assert_eq!(plan.ignored, vec!["local.db"], "dependencies come back; the database does not");
     }
 
     // --- stale things, bundled ---
@@ -2794,6 +3038,10 @@ mod tests {
             vec![s.path("code/app-wt-wip/node_modules"), s.path("code/app-wt-done")]
         );
         assert_eq!(b.held_back, 1);
+        assert_eq!(b.save_paths, vec![s.path("code/app-wt-wip")]);
+        assert!(b.detail.contains("1 of those holds unsaved work that can be committed and pushed first"), "{}", b.detail);
+        let wip = b.members.iter().find(|m| m.display_path == "~/code/app-wt-wip").unwrap();
+        assert_eq!(wip.remove, "guardian disk save --delete ~/code/app-wt-wip");
         let shown: Vec<&str> = b.members.iter().map(|m| m.display_path.as_str()).collect();
         assert_eq!(shown, vec!["~/code/app-wt-wip", "~/code/app-wt-wip/node_modules", "~/code/app-wt-done"]);
         assert!(b.freed_bytes >= 900_000, "both worktrees, each counted once: {}", b.freed_bytes);
@@ -3008,6 +3256,7 @@ mod tests {
             size: measured.map(|_| Size { bytes: 1, freed: 1, complete: true }),
             measured_at: measured,
             needs_check: false,
+            saveable: false,
         };
         let mut entries = vec![
             c("/h/.cache/recent", Kind::Cache, None, Some(now - 10), None),
@@ -3211,6 +3460,7 @@ mod tests {
             size: Some(Size { bytes: 1, freed: 1, complete: true }),
             measured_at: Some(1),
             needs_check: false,
+            saveable: false,
         };
         let not_utf8 = PathBuf::from(std::ffi::OsString::from_vec(b"/h/caf\xe9/target".to_vec()));
         let index = Index {

@@ -8,6 +8,8 @@ struct MenuBarView: View {
     @State private var copiedPath: String?
     /// Paths ticked for deletion in the disk list.
     @State private var selected: Set<String> = []
+    /// The worktree whose save is being worked out before asking about it.
+    @State private var planningPath: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -333,7 +335,10 @@ struct MenuBarView: View {
         let members = bundles.flatMap(\.members)
         // Stale folders that can be deleted but need a look are offered one at a time.
         let singles = members.filter { $0.deletable && !$0.regenerates } + report.targets.filter(\.deletable)
-        let manual = report.targets.filter { !$0.deletable }
+        // Worktrees held back only by unsaved work: one button commits it, pushes its
+        // branch and then removes the worktree.
+        let unsaved = (members + report.targets).filter(\.saveable)
+        let manual = (members + report.targets).filter { !$0.deletable && !$0.saveable }
         let chosen = picked(from: members + report.targets)
         let old = Set(bundles.filter { $0.isOld && $0.isProject }.flatMap(\.deletePaths))
         let canDelete = !singles.isEmpty || bundles.contains { !$0.deletePaths.isEmpty }
@@ -344,7 +349,7 @@ struct MenuBarView: View {
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        Text(counts(bundles: bundles.count, singles: singles.count, manual: manual.count))
+        Text(counts(bundles: bundles.count, unsaved: unsaved.count, singles: singles.count, manual: manual.count))
             .font(.caption2)
             .foregroundStyle(.secondary)
         ScrollView {
@@ -355,8 +360,17 @@ struct MenuBarView: View {
                     }
                     bundleRow(bundle)
                 }
+                if !unsaved.isEmpty {
+                    listLabel(
+                        "Unsaved work: Save & delete commits it, pushes its branch, then removes the worktree. It asks first.",
+                        first: bundles.isEmpty
+                    )
+                    ForEach(unsaved) { target in
+                        unsavedRow(target)
+                    }
+                }
                 if !singles.isEmpty {
-                    if !bundles.isEmpty {
+                    if !bundles.isEmpty || !unsaved.isEmpty {
                         listLabel("Single folders", first: false)
                     }
                     ForEach(singles) { target in
@@ -366,7 +380,7 @@ struct MenuBarView: View {
                 if !manual.isEmpty {
                     listLabel(
                         "Needs a command: Guardian does not delete these itself. Copy the command and run it in a terminal.",
-                        first: bundles.isEmpty && singles.isEmpty
+                        first: bundles.isEmpty && singles.isEmpty && unsaved.isEmpty
                     )
                     ForEach(manual) { target in
                         commandRow(target)
@@ -404,10 +418,11 @@ struct MenuBarView: View {
             .padding(.top, first ? 0 : 6)
     }
 
-    private func counts(bundles: Int, singles: Int, manual: Int) -> String {
+    private func counts(bundles: Int, unsaved: Int, singles: Int, manual: Int) -> String {
         let plural = { (n: Int, one: String, many: String) in n == 1 ? "1 \(one)" : "\(n) \(many)" }
         var parts: [String] = []
         if bundles > 0 { parts.append(plural(bundles, "stale bundle", "stale bundles")) }
+        if unsaved > 0 { parts.append("\(unsaved) with unsaved work") }
         if singles > 0 { parts.append(plural(singles, "single folder", "single folders")) }
         if manual > 0 { parts.append("\(manual) that need a command") }
         return parts.joined(separator: ", ") + ". Scroll for more."
@@ -493,6 +508,88 @@ struct MenuBarView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             if client.deletingPaths.isEmpty { isOn.wrappedValue.toggle() }
+        }
+    }
+
+    /// A worktree kept only by unsaved work, with the button that saves it and removes it.
+    private func unsavedRow(_ target: DiskTarget) -> some View {
+        let busy = client.deletingPaths.contains(target.path) || planningPath == target.path
+        return HStack(alignment: .top, spacing: 8) {
+            targetText(target)
+            Spacer(minLength: 0)
+            finderButton(target)
+            if busy {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Button("Save & delete…") {
+                    beginSave(target)
+                }
+                .controlSize(.small)
+                .disabled(!client.deletingPaths.isEmpty || planningPath != nil)
+                .help("Commits its uncommitted files, pushes its branch, checks the remote has it, then removes the worktree")
+            }
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+    }
+
+    /// Work out what a save would do, then ask. Nothing is changed before the answer.
+    private func beginSave(_ target: DiskTarget) {
+        planningPath = target.path
+        client.planSave(target) { result in
+            planningPath = nil
+            guard let result, result.ok, let plan = result.plan else {
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "Guardian will not save this one"
+                alert.informativeText = "\(target.displayPath)\n\n"
+                    + (result?.error ?? "The save command did not run. It needs guardian 0.12 or newer: bash scripts/install.sh")
+                    + "\n\nNothing was changed."
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+                return
+            }
+            confirmSave(target, plan)
+        }
+    }
+
+    /// Say exactly what will be committed and pushed, and ask. Cancel is the default.
+    private func confirmSave(_ target: DiskTarget, _ plan: SavePlan) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Commit, push, then remove this worktree?"
+        var lines = [target.displayPath]
+        let commit: String
+        switch plan.files.count {
+        case 0: commit = "Nothing is uncommitted"
+        case 1: commit = "Commits 1 file"
+        default: commit = "Commits \(plan.files.count) files"
+        }
+        let branch = plan.newBranch
+            ? "; its detached HEAD goes on a new branch, \(plan.branch),"
+            : (plan.files.isEmpty ? " on branch \(plan.branch);" : " to branch \(plan.branch)")
+        lines.append("\(commit)\(branch) and pushes it to \(plan.remote)/\(plan.remoteBranch)"
+            + (plan.hasUpstream ? "." : ", which is not on the remote yet.")
+            + " Then removes the worktree, freeing about \(target.sizeText).")
+        if !plan.files.isEmpty {
+            var files = plan.files.prefix(8).joined(separator: "\n")
+            if plan.files.count > 8 { files += "\n…and \(plan.files.count - 8) more" }
+            lines.append(files)
+        }
+        if !plan.ignored.isEmpty {
+            lines.append("NOT saved, because git ignores \(plan.ignored.count == 1 ? "it" : "them"), and deleted with the worktree: "
+                + plan.ignored.prefix(6).joined(separator: ", ")
+                + (plan.ignored.count > 6 ? " and \(plan.ignored.count - 6) more" : ""))
+        }
+        lines.append("Commit hooks are skipped; the push runs as usual and is never forced. If the push does not go through, the worktree is kept.")
+        alert.informativeText = lines.joined(separator: "\n\n")
+        alert.addButton(withTitle: "Cancel")
+        let save = alert.addButton(withTitle: "Save and delete")
+        save.hasDestructiveAction = true
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            client.saveAndDelete(target)
         }
     }
 

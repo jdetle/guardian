@@ -186,6 +186,7 @@ If you still see messages about **“Parallel workspace load”** and **`~/.curs
 ~/.guardian/guardian disk --older-than 14  # only projects and worktrees untouched for 2+ weeks
 ~/.guardian/guardian disk clean            # list, then choose what to delete
 ~/.guardian/guardian disk delete ~/code/app/target   # delete specific targets
+~/.guardian/guardian disk save --delete ~/code/app-wt   # commit and push a worktree's unsaved work, then remove it
 ```
 
 The scan walks your home folder for **every git repository** (skipping `Library`, media folders, and `Desktop` / `Documents` / `Downloads`, which macOS guards with a permission prompt; add one with `--root`) and reports:
@@ -210,6 +211,7 @@ What git said about a worktree is saved the same way, because asking takes a sec
 
 - a build or dependency folder is deleted only if git tracks nothing inside it;
 - a worktree is removed with `git worktree remove`, never `--force`, and only if it has no uncommitted work — its branch stays in the repository;
+- a worktree with uncommitted work is never deleted as it is, but there is a fast way through: **`guardian disk save --delete <worktree>`** (in the menu bar, **Save & delete…**; in `disk clean`, the choices marked SAVED FIRST). It commits what is uncommitted to the worktree's branch, pushes that branch, checks that the remote has the commit, and only then removes the worktree. `--plan` shows what it would commit and push without changing anything. It refuses rather than guesses: it never forces a push, never commits a new file that looks like credentials (`.env`, keys, `credentials.json`) or is larger than 50 MB, never commits into a merge or rebase under way, and stops if a commit would miss something (files hidden from git status, a nested repository). A detached HEAD gets a branch named `guardian-save/<folder>`. Commit hooks are skipped, since this is work being put somewhere safe; push hooks run as usual. Files git ignores, such as a `.env`, are not saved by a commit and are named before you confirm. If the push fails, the commit stays on its branch and the worktree is kept;
 - caches that have their own cleaner (`npm cache clean`, `brew cleanup`, `docker system prune`, …) are listed with that command and left for you to run;
 - nothing outside your home folder, nothing at its top level, and no symlink is ever deleted.
 
