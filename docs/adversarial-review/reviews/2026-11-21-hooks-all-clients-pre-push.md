@@ -86,6 +86,18 @@ its attempts to make a recording hook print anything or exit non-zero. What it d
   - The app looks in `~/.claude` and `~/.codex` only. Documented; the command honours the
     environment.
 
+## Found by installing
+
+Installing the branch on the author's machine found two faults neither review had:
+
+- A Claude Code session open since before the upgrade was marked ended by the database
+  upgrade (it had started more than half a day earlier), and no tool call brought an ended
+  session back, so it read as ended while it worked. A tool call, or the end of a turn, now
+  leaves a session ended only when the end was in the last two minutes.
+- The app read the session database with `sqlite3 -readonly`. The database is in WAL mode,
+  and a read-only connection cannot open it unless another connection is holding it open, so
+  the panel said "None open" most of the time. It is now opened normally and only read.
+
 ## Synthesis
 
 **Decision:** Proceed. No veto. The finding that mattered most was the warning text: the

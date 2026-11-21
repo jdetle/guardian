@@ -397,6 +397,7 @@ final class GuardianClient: ObservableObject {
         loadPromptControls()
         loadState()
         loadStats()
+        loadSessions()
     }
 
     private func loadQueue() {
@@ -432,7 +433,10 @@ final class GuardianClient: ObservableObject {
             ]
             var decoded: [SessionRecord]?
             for query in queries {
-                guard let data = Self.run(URL(fileURLWithPath: "/usr/bin/sqlite3"), ["-json", "-readonly", db, query]) else { break }
+                // Not opened read-only: the database is in WAL mode, and a read-only
+                // connection cannot open it unless another connection happens to be holding
+                // it open at that moment. These queries only read.
+                guard let data = Self.run(URL(fileURLWithPath: "/usr/bin/sqlite3"), ["-json", "-cmd", ".timeout 1000", db, query]) else { break }
                 if data.isEmpty || String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     // No rows, or the query did not fit this database: try the next.
                     decoded = decoded ?? []
