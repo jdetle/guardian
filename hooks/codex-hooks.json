@@ -41,8 +41,7 @@
           {
             "type": "command",
             "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/post-tool-use.sh",
-            "timeout": 10,
-            "async": true
+            "timeout": 5
           }
         ]
       }
@@ -53,8 +52,7 @@
           {
             "type": "command",
             "command": "__GUARDIAN_CODEX_HOOK_ROOT__/codex/stop.sh",
-            "timeout": 15,
-            "async": true
+            "timeout": 10
           }
         ]
       }

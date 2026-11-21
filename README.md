@@ -4,7 +4,7 @@
 
 **Keep agents useful—and keep your Mac from melting down.**
 
-Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and per-agent memory (Cursor, Claude, Codex), writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
+Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and per-agent memory (Cursor, Claude, Codex), writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** warn by default and, once you opt in (`guardian blocking on`), can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
 
 ---
 
@@ -25,7 +25,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | **Docker and dev services eating the box** | Optional **Docker CPU throttling** for non-essential containers under strain. |
 | **Runaway process trees** (builds, test runners) | **Fork guard** with optional kill for pathological spawns. |
 | **Indexing and huge contexts on a full disk** | **Disk** sampling on the home volume + **cursorignore**-style warnings for paths that blow up context and disk. |
-| **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** can block (with **resume** / snooze) so you don’t add load at the worst moment. |
+| **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** warns, and once you opt in (`guardian blocking on`) can block (with **resume** / snooze), so you don’t add load at the worst moment. |
 
 **Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor, Codex, and Claude Code stay usable on hardware that isn’t a dev workstation.*
 
@@ -52,7 +52,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 
 1. **`guardiand`** classifies pressure as `clear`, `strained`, or `critical` (optional **memory headroom ratios** in config).
 2. State is written atomically to `~/.guardian/state.json` (including **`disk`** usage on the home volume); **`hook_policy.json`** mirrors gate settings for shell hooks.
-3. **`beforeSubmitPrompt`** may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure and/or **Cursor RSS** above cap). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
+3. **`beforeSubmitPrompt`** warns by default; after `guardian blocking on` it may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure and/or **Cursor RSS** above cap). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
 4. **`beforeReadFile`** always **`allow`**s; it may add **advisory** text when a path matches the shipped **cursorignore checklist** and isn’t covered by `.cursorignore` or **`.guardian/cursorignore-allow`**.
 5. **`preToolUse` / `subagentStart`** remain **allow** + advisory (by default). Opt in to **`[tool_gate] deny_subagents_on = "critical"`** to deny *new subagent spawns* under pressure — the one thing a prompt gate cannot stop mid-turn.
 6. Under load, the **daemon** enforces Docker throttling, fork guard, etc.
@@ -76,7 +76,7 @@ bash scripts/install.sh              # daemon + CLI (required)
 ~/.guardian/guardian hooks status    # where each agent stands
 ```
 
-**The hooks ship inside the `guardian` binary**, so installing or updating them needs no copy of this repository. `guardian hooks install` sets up Cursor, Claude Code and Codex, whichever are on the machine (`--cursor`, `--claude`, `--codex` to name them; `--upgrade` to only bring existing installs up to date, which `install.sh` does for you). `guardian hooks status` says, per agent, whether Guardian's hooks are installed, whether any event is missing, and whether they are this version's; it exits non-zero when an agent has an older Guardian's hooks (an agent with none is listed, not failed on: you may have left it out on purpose). The menu bar app shows the same, with **Update hooks** for the first case and **Add hooks…**, which asks first, for the second.
+**The hooks ship inside the `guardian` binary**, so installing or updating them needs no copy of this repository. `guardian hooks install` sets up Cursor, Claude Code and Codex, whichever are on the machine (`--cursor`, `--claude`, `--codex` to name them; `--upgrade` to only bring existing installs up to date, which `install.sh` does for you). `guardian hooks status` says, per agent, whether Guardian's hooks are installed, whether any event is missing, and whether they are this version's; it exits non-zero when an agent has an older Guardian's hooks (an agent with none is listed, not failed on: you may have left it out on purpose). The menu bar app shows the same, with **Update hooks** for the first case and **Add hooks…**, which asks first, for the second. (The app is not started from your shell, so it looks in `~/.claude` and `~/.codex`; if you set `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, use the command.) Cursor's installer also puts the `/guardian-*` slash commands in `~/.cursor/commands`, and the `Guardian-*.command` clickables, the queue script and a default `hook_policy.json` (if there is none) in `~/.guardian`.
 
 All three read the same **`~/.guardian/`** state and policy. Installing merges into the agent's existing config: re-running is safe, hooks you added yourself are kept (including on the same events), and a config it cannot parse is left untouched. The per-agent scripts (`hooks/install-hooks.sh`, `scripts/install-claude-hooks.sh`, `scripts/install-codex-hooks.sh`) do the same from a checkout.
 
@@ -84,7 +84,7 @@ All three read the same **`~/.guardian/`** state and policy. Installing merges i
 
 Every agent's hooks record its sessions in **`~/.guardian/sessions.db`**: which agent, which folder, whether it is **working** (a prompt is being worked on), **idle** (waiting for the next one) or **ended**, when it last did anything, and its prompts, turns, tool calls and subagents. The menu bar panel has one line per agent with open sessions ("Claude Code: 1 working in guardian · 2 idle"); the dashboard's **Sessions** tab lists them with a filter per agent. A turn that has been quiet for half an hour is shown as idle whatever was recorded, since an agent that is closed mid-turn never reports that it stopped.
 
-The recording hooks (`PostToolUse`, `Stop`, `SessionEnd`; Cursor's `postToolUse`, `stop`, `sessionEnd`) only record: they print nothing and never block, and in Claude Code and Codex the first two run in the background. Recording a prompt, a tool call or a session's end costs one `jq` and one `sqlite3`; the end of a turn also scores the session and costs about a tenth of a second. What is shown is what the hooks last heard: a turn you interrupt never reports that it stopped, so its session reads as working until it has been quiet for half an hour. Tool calls and pressure samples older than sixty days are cleared when a session starts.
+The recording hooks (`PostToolUse`, `Stop`, `SessionEnd`; Cursor's `postToolUse`, `stop`, `sessionEnd`) only record: they print nothing and never block, and in Claude Code the first two run in the background. Recording a prompt, a tool call or a session's end costs one `jq` and one `sqlite3`; the end of a turn also scores the session and costs about a tenth of a second. What is shown is what the hooks last heard: a turn you interrupt never reports that it stopped, so its session reads as working until it has been quiet for half an hour. Tool calls and pressure samples older than sixty days are cleared when a session starts.
 
 `install.sh` copies **`guardiand`** to **`~/.guardian/guardiand`** and points the LaunchAgent there, so `cargo clean` or a disk-space sweep of `target/` no longer kills the daemon. It exits non-zero unless the new daemon is actually writing fresh `state.json`.
 
@@ -143,7 +143,7 @@ Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_ag
 **Guardian only warns until you opt in.** Out of the box no hook pauses a prompt or denies a tool call: when a gate would have, the prompt or tool call goes through and the agent (and, in Cursor, you) gets a warning saying why. To let Guardian actually stop things:
 
 ```bash
-~/.guardian/guardian blocking on       # the gates below may now pause prompts and deny subagents
+~/.guardian/guardian blocking on       # asks first; then the gates below may pause prompts and deny subagents
 ~/.guardian/guardian blocking status   # which it is, and what would be stopped with your settings
 ~/.guardian/guardian blocking off      # back to warnings only
 ```
@@ -405,7 +405,7 @@ cat ~/.guardian/state.json | jq '{
 
 - **`clear`** — Headroom for parallel agents, Docker, and heavier terminal work.
 - **`strained`** — Workable, but prefer **sequential** work, fewer parallel chats/subagents, and lighter Docker/indexing until numbers improve.
-- **`critical`** — Strong signal to **avoid adding load**; optional prompt gates may block until you use **`proceed_once`**, **snooze**, or the machine recovers.
+- **`critical`** — Strong signal to **avoid adding load**; prompt gates warn, and after `guardian blocking on` may block until you use **`proceed_once`**, **snooze**, or the machine recovers.
 
 **Illustrative snapshot** (shape only; your machine will differ):
 

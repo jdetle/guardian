@@ -10,7 +10,10 @@
 
 def text: if . == null then "" elif type == "string" then . else tostring end;
 def q: text | gsub("\u0000"; "") | gsub("'"; "''") | "'" + . + "'";
-def int: (if type == "number" then . elif type == "string" then (tonumber? // 0) else 0 end) | floor;
+# A whole, finite, positive number no larger than a month of milliseconds; anything else is 0.
+def int:
+  (if type == "number" then . elif type == "string" then (tonumber? // 0) else 0 end)
+  | if isnormal and . > 0 and . < 2600000000 then floor else 0 end;
 def num: if type == "number" then . else 0 end;
 
 # Tools that start another agent: the fan-out Guardian is here to keep an eye on.

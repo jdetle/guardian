@@ -178,7 +178,12 @@ enum DiskAction {
 #[derive(Subcommand)]
 enum BlockingAction {
     /// Let Guardian pause prompts and deny subagents, as config.toml says when.
-    On,
+    /// Asks first; without a terminal to ask in, it needs --yes.
+    On {
+        /// Do not ask.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Warnings only (the default): nothing is paused or denied.
     Off,
     /// Say whether blocking is on, and what would be stopped if it is.
@@ -802,14 +807,26 @@ fn blocking_marker() -> PathBuf {
 fn blocking_rules() -> String {
     let cfg = load_config();
     let gate = &cfg.prompt_gate;
+    let rule = |mode: &str| match mode {
+        "strict" if gate.block_on_session_budget => format!(
+            "prompts are paused at {} load, and when Cursor's memory is over its cap while load is strained or worse",
+            gate.block_on
+        ),
+        "strict" => format!("prompts are paused at {} load", gate.block_on),
+        "advisory" => "prompts are never paused (the mode is advisory)".to_string(),
+        _ => "a prompt is paused when it asks for heavy local work (a full build, a full test run, container builds, several subagents) at critical load and macOS agrees memory or heat is critical".to_string(),
+    };
     let prompts = if !gate.enabled || gate.block_on == "never" {
         "prompts are never paused (the prompt gate is off in config.toml)".to_string()
     } else {
-        match gate.mode.as_str() {
-            "strict" => format!("prompts are paused at {} load", gate.block_on),
-            "advisory" => "prompts are never paused (prompt_gate.mode is advisory)".to_string(),
-            _ => "a prompt is paused when it asks for heavy local work (a full build, a full test run, container builds, several subagents) at critical load and macOS agrees memory or heat is critical".to_string(),
+        let mut text = rule(&gate.mode);
+        // [prompt_gate.clients] can give one agent a mode of its own.
+        for (client, mode) in &gate.clients {
+            if mode != &gate.mode {
+                text.push_str(&format!("; in {client}, {}", rule(mode)));
+            }
         }
+        text
     };
     let subagents = match cfg.tool_gate.deny_subagents_on.as_str() {
         "strained" | "critical" => format!("new subagents are denied at {} load", cfg.tool_gate.deny_subagents_on),
@@ -823,7 +840,20 @@ fn blocking(action: BlockingAction) -> Result<(), String> {
     // A symlink is not an opt-in (the hooks ignore one too) and is not written through.
     let on = || std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file());
     match action {
-        BlockingAction::On => {
+        BlockingAction::On { yes } => {
+            // Turning this on is a person's choice. An agent that reads a Guardian warning
+            // and runs this without a terminal is refused; a person is shown what it means.
+            if !yes && !on() {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    return Err("turning blocking on is for a person to decide: run this in a terminal, or pass --yes".to_string());
+                }
+                println!("With your settings: {}.", blocking_rules());
+                if !said_yes(&ask("Let Guardian pause prompts and deny subagents? [y/N] ")?) {
+                    println!("Left off. Guardian only warns.");
+                    return Ok(());
+                }
+            }
             std::fs::create_dir_all(guardian_dir()).map_err(|e| e.to_string())?;
             if std::fs::symlink_metadata(&marker).is_ok_and(|m| !m.is_file()) {
                 std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
@@ -1132,6 +1162,8 @@ mod tests {
         assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
         assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
         assert!(parses(&["guardian", "blocking", "on"]));
+        assert!(parses(&["guardian", "blocking", "on", "--yes"]));
+        assert!(!parses(&["guardian", "blocking", "off", "--yes"]));
         assert!(parses(&["guardian", "blocking", "off"]));
         assert!(parses(&["guardian", "blocking", "status"]));
         assert!(!parses(&["guardian", "blocking"]));

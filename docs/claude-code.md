@@ -34,7 +34,6 @@ Sessions snapshot their hooks at startup — **start a new session** (or open `/
 | `SessionStart` | `claude/session-start.sh` | Adds one line of context: pressure, free RAM, per-agent RAM (Claude / Codex / Cursor), disk. Says so loudly when the daemon is not running. |
 | `UserPromptSubmit` | `claude/user-prompt-submit.sh` | Applies the shared [prompt policy](../README.md#prompt-gates-and-resume). Adaptive mode pauses explicit heavy local work during severe system pressure. |
 | `PreToolUse` (`Bash\|Agent\|Task`) | `claude/pre-tool-use.sh` | Silent when load is clear. At `strained` / `critical` adds an advisory as `additionalContext`, at most once per 2 minutes per session. Optionally **denies subagent spawns** (see below). |
-
 | `PostToolUse` (every tool, `async`) | `claude/post-tool-use.sh` | Records the tool call and the load it ran under in `~/.guardian/sessions.db`. Prints nothing. |
 | `Stop` (`async`) | `claude/stop.sh` | The turn is over: the session goes from *working* to *idle* and is scored. Prints nothing, so it can never keep Claude going. Claude Code does not run it for a turn you interrupt; that session reads as working until it has been quiet for half an hour. |
 | `SessionEnd` | `claude/session-end.sh` | Marks the session *ended*. Prints nothing; quick, because Claude Code gives session-end hooks about a second and a half. |
@@ -43,6 +42,7 @@ The last three exist so the menu bar app can **follow Claude Code sessions** nex
 Codex's (see [Following agent sessions](../README.md#following-agent-sessions)). They only record:
 no output and exit 0, which Claude Code reads as "nothing to report". `async` hooks do not hold
 the agent up; on a Claude Code too old to know the key they simply run in the foreground.
+(Codex gets the same recorders without `async`; see [codex.md](codex.md).)
 `UserPromptSubmit` also marks the session *working*, once the prompt is known to be going through.
 
 The `PreToolUse` hook **never returns `permissionDecision: "allow"`** — that would skip Claude Code's

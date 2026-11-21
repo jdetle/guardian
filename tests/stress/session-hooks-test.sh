@@ -25,6 +25,10 @@ for tool in jq sqlite3; do
 done
 
 SCRATCH="$(mktemp -d)"
+if [ -z "$SCRATCH" ] || [ ! -d "$SCRATCH" ]; then
+    echo "could not make a scratch directory" >&2
+    exit 2
+fi
 trap 'rm -rf "$SCRATCH"' EXIT
 export HOME="$SCRATCH"
 unset GUARDIAN_HOOK_FORMAT CLAUDE_CONFIG_DIR CODEX_HOME
@@ -105,6 +109,16 @@ check "a tool call recorded after the session ended does not bring it back" "end
 
 hook claude/session-start.sh '{"session_id":"c1","source":"resume"}' >/dev/null
 check "resumed: an ended session is idle again, still one row" "idle|1" "$(q "select state, (select count(*) from sessions) from sessions where conversation_id='c1'")"
+
+hook claude/user-prompt-submit.sh '{"session_id":"c1","prompt":"go on"}' >/dev/null
+hook claude/session-start.sh '{"session_id":"c1","source":"resume"}' >/dev/null
+check "killed in the middle of a turn and resumed: idle, not still working" "idle" "$(q "select state from sessions where conversation_id='c1'")"
+
+for bad in '-5' '1e999' '"abc"' '99999999999999'; do
+    hook claude/post-tool-use.sh "{\"session_id\":\"dur\",\"tool_name\":\"Bash\",\"duration_ms\":$bad}" >/dev/null
+done
+hook claude/post-tool-use.sh '{"session_id":"dur","tool_name":"Bash","duration_ms":1234.7}' >/dev/null
+check "a duration that is negative, endless, not a number or absurd is stored as 0; a real one whole" "5|1234|1234" "$(q "select count(*), sum(duration_ms), max(duration_ms) from tool_calls where conversation_id='dur'")"
 
 # ─── Codex ──────────────────────────────────────────────────────────────
 echo "=== Codex ==="
@@ -205,8 +219,10 @@ sqlite3 "$DB" "
 CREATE TABLE sessions (conversation_id TEXT PRIMARY KEY, model TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT (datetime('now')), ended_at TEXT, status TEXT, loop_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0, pressure_at_start TEXT, pressure_avg TEXT, duration_ms INTEGER, files_modified INTEGER DEFAULT 0, lines_changed INTEGER DEFAULT 0, estimated_cost_usd REAL DEFAULT 0.0, roi_score REAL);
 CREATE TABLE tool_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, tool_name TEXT NOT NULL, duration_ms INTEGER, model TEXT, recorded_at TEXT NOT NULL DEFAULT (datetime('now')));
 CREATE TABLE pressure_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT, pressure TEXT NOT NULL, cpu_percent REAL, memory_available_gb REAL, docker_cpu_percent REAL, sampled_at TEXT NOT NULL DEFAULT (datetime('now')));
-INSERT INTO sessions (conversation_id, model, ended_at, tool_call_count, status) VALUES ('old-cursor', 'composer-2', datetime('now'), 4, 'completed');
-INSERT INTO sessions (conversation_id, model) VALUES ('old-unknown', 'unknown');
+INSERT INTO sessions (conversation_id, model, started_at, ended_at, tool_call_count, status) VALUES ('old-cursor', 'composer-2', datetime('now', '-3 days'), datetime('now', '-2 days'), 4, 'completed');
+INSERT INTO sessions (conversation_id, model, started_at) VALUES ('old-unknown', 'unknown', datetime('now', '-2 days'));
+INSERT INTO sessions (conversation_id, model, started_at, ended_at, tool_call_count, status) VALUES ('live-cursor', 'composer-2', datetime('now', '-5 hours'), datetime('now', '-10 minutes'), 9, 'completed');
+INSERT INTO sessions (conversation_id, model) VALUES ('just-started', 'unknown');
 INSERT INTO tool_calls (conversation_id, tool_name, recorded_at) VALUES ('old-cursor', 'Shell', datetime('now', '-90 days'));
 INSERT INTO tool_calls (conversation_id, tool_name) VALUES ('old-cursor', 'Read');
 "
@@ -214,6 +230,8 @@ hook claude/post-tool-use.sh '{"session_id":"new","tool_name":"Bash"}' >/dev/nul
 check "the first event brings the old database up to date and is recorded" "claude|working|1" "$(q "select client, state, tool_call_count from sessions where conversation_id='new'")"
 check "earlier sessions that ended or used tools were Cursor's; they keep everything they had" "cursor|ended|completed|4" "$(q "select client, state, status, tool_call_count from sessions where conversation_id='old-cursor'")"
 check "an earlier session that only ever started is left unlabelled" "|ended" "$(q "select coalesce(client, ''), state from sessions where conversation_id='old-unknown'")"
+check "one whose last turn ended minutes ago may still be open: idle, not ended" "cursor|idle|9" "$(q "select client, state, tool_call_count from sessions where conversation_id='live-cursor'")"
+check "one that started just before the upgrade is idle, not ended" "idle" "$(q "select state from sessions where conversation_id='just-started'")"
 hook claude/session-start.sh '{"session_id":"new","source":"resume"}' >/dev/null
 check "tool calls older than sixty days are cleared out at a session start" "0|2" "$(q "select (select count(*) from tool_calls where recorded_at < datetime('now', '-60 days')), (select count(*) from tool_calls)")"
 # Run the upgrade again for real (it is skipped while its marker file is there), twice at once,
@@ -222,7 +240,7 @@ rm -f "$G"/.sessions_schema_v*
 printf '%s' '{"session_id":"new","tool_name":"Read"}' | bash "$HOOKS_DIR/claude/post-tool-use.sh" >/dev/null 2>&1 &
 printf '%s' '{"session_id":"new","tool_name":"Grep"}' | bash "$HOOKS_DIR/claude/post-tool-use.sh" >/dev/null 2>&1 &
 wait
-check "upgrading again, from two hooks at once, loses nothing and relabels nothing" "3|3|cursor|" "$(q "select tool_call_count, (select count(*) from sessions), (select client from sessions where conversation_id='old-cursor'), (select coalesce(client, '') from sessions where conversation_id='old-unknown') from sessions where conversation_id='new'")"
+check "upgrading again, from two hooks at once, loses nothing and relabels nothing" "3|5|cursor|" "$(q "select tool_call_count, (select count(*) from sessions), (select client from sessions where conversation_id='old-cursor'), (select coalesce(client, '') from sessions where conversation_id='old-unknown') from sessions where conversation_id='new'")"
 
 echo ""
 echo "session-hooks-test: $PASSED passed, $FAILED failed"

@@ -55,9 +55,10 @@ if [ -n "$conversation_id" ]; then
         cwd_update=", cwd = '$session_cwd'"
     fi
     # A session can start more than once (resume, clear, compact): the row is made the
-    # first time and brought back to life after that.
+    # first time and brought back to life after that. Starting, it is idle whatever it was:
+    # a session killed in the middle of a turn and resumed is not still working.
     db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, pressure_at_start, client, state) VALUES ('$conversation_id', '$model', '$pressure', '$client', 'idle');
-UPDATE sessions SET client = COALESCE(client, '$client'), last_activity_at = datetime('now'), state = CASE WHEN state IS NULL OR state = 'ended' THEN 'idle' ELSE state END, model = CASE WHEN model IN ('', 'unknown') THEN '$model' ELSE model END$cwd_update WHERE conversation_id = '$conversation_id';
+UPDATE sessions SET client = COALESCE(client, '$client'), last_activity_at = datetime('now'), state = 'idle', model = CASE WHEN model IN ('', 'unknown') THEN '$model' ELSE model END$cwd_update WHERE conversation_id = '$conversation_id';
 DELETE FROM tool_calls WHERE recorded_at < datetime('now', '-60 days');
 DELETE FROM pressure_samples WHERE sampled_at < datetime('now', '-60 days');"
 fi
@@ -168,7 +169,7 @@ snooze_left=$(guardian_snooze_remaining_secs)
 if [ "${snooze_left:-0}" -gt 0 ] 2>/dev/null; then
     context="${context} Snoozed for about $(( (snooze_left + 59) / 60 )) more min: pressure gates and subagent limits are off until then (end it: ${G_home}/guardian clear-snooze)."
 fi
-if guardian_proceed_once_armed; then
+if guardian_proceed_once_armed && guardian_blocking_enabled; then
     context="${context} Allow-once is armed: the next prompt Guardian would pause goes through."
 fi
 

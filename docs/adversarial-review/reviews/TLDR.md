@@ -1,3 +1,7 @@
+- [2026-11-21 hooks-all-clients-pre-push](./2026-11-21-hooks-all-clients-pre-push.md)
+  - decision: proceed; two models found 27 issues, none a veto; the warn-only default held under a 540-run attempt to break it
+  - risk: not yet run against live Cursor and Codex sessions; container suite left to CI
+  - followup: [ ] author — one real session per agent, confirm it shows working → idle → ended in the app
 - [2026-11-20 disk-index-pre-push](./2026-11-20-disk-index-pre-push.md)
   - decision: proceed; two models found 34 issues, one a data-loss veto (nested checkout deleted with a worktree); all acted on
   - risk: `disk save` is untested against a hosted remote with real credentials and protections

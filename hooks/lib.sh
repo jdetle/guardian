@@ -2,8 +2,9 @@
 # Shared utilities for Guardian hooks.
 # Sourced by all hook scripts -- not executed directly.
 #
-# DESIGN: Tool hooks (preToolUse, etc.) default to allow with advisory text.
-# beforeSubmitPrompt may return continue:false when policy + load require it;
+# DESIGN: Guardian warns. No hook pauses a prompt or denies a tool call until the person has
+# opted in (`guardian blocking on`; see guardian_blocking_enabled below). Once they have,
+# beforeSubmitPrompt may return continue:false when policy + load require it, and
 # users can always resume via ~/.guardian/guardian CLI, .command clickables, or snooze (see resources.md). Codex uses hooks/codex/.
 # The daemon handles enforcement (Docker throttling, fork guard).
 
@@ -233,7 +234,7 @@ ensure_db() {
     # (`|| true`: one of those failures makes sqlite3 exit non-zero, and the hooks that call
     # this run under `set -e`.)
     sqlite3 "$SESSIONS_DB" > /dev/null 2>&1 << 'SQL' || true
-.timeout 5000
+.timeout 2000
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS sessions (
     conversation_id TEXT PRIMARY KEY,
@@ -289,7 +290,9 @@ CREATE INDEX IF NOT EXISTS pressure_samples_by_session ON pressure_samples(conve
 -- session with either is Cursor's. The rest (started and never heard from again) came from
 -- Claude Code or Codex and are left unlabelled: there is no telling which.
 UPDATE sessions SET client = 'cursor' WHERE client IS NULL AND (ended_at IS NOT NULL OR tool_call_count > 0);
-UPDATE sessions SET state = 'ended' WHERE state IS NULL;
+-- Sessions from before there was a state: one heard from in the last half day may still be
+-- going, and is idle until its next event says otherwise; the rest are over.
+UPDATE sessions SET state = CASE WHEN COALESCE(ended_at, started_at) > datetime('now', '-12 hours') THEN 'idle' ELSE 'ended' END WHERE state IS NULL;
 SQL
     # Marked only once the new columns are really there, so a failed upgrade is tried again.
     if sqlite3 "$SESSIONS_DB" ".timeout 5000" \
@@ -437,10 +440,18 @@ guardian_blocking_enabled() {
 }
 
 # How to opt in, for the warnings that stand in for a pause.
+#
+# Cursor shows the prompt hook's message to the person, so there it says how to opt in.
+# Claude Code and Codex hand the text to the agent, which is not given the command that
+# turns pausing on: that choice is the person's.
 guardian_blocking_hint_text() {
-    local cli
-    printf -v cli '%q' "${GUARDIAN_DIR}/guardian"
-    printf 'Guardian only warns unless you let it pause things: %s blocking on' "$cli"
+    if [ "$(guardian_hook_client)" = "cursor" ]; then
+        local cli
+        printf -v cli '%q' "${GUARDIAN_DIR}/guardian"
+        printf 'Guardian only warns unless you let it pause things: %s blocking on' "$cli"
+    else
+        printf 'Guardian is set to warn only. Whether it may pause prompts is the user'"'"'s choice, not something to change from here.'
+    fi
 }
 
 guardian_resume_hint_text() {

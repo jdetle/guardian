@@ -281,7 +281,7 @@ struct MenuBarView: View {
         alert.addButton(withTitle: "Allow pausing")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn {
-            client.runPromptControl(["blocking", "on"])
+            client.runPromptControl(["blocking", "on", "--yes"])
         }
     }
 
@@ -365,7 +365,7 @@ struct MenuBarView: View {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Add Guardian's hooks to \(names)?"
-        alert.informativeText = "This adds entries to the hook settings of \(names): a line of load context when a session starts, warnings about load on prompts and before heavy tool calls, and records of what each session does, so that it can be followed here. Hooks already in those settings are left alone, and the file as it was is kept beside it.\n\nGuardian only warns unless you have allowed pausing. Codex runs new hooks only once you approve them: /hooks, or Settings > Hooks."
+        alert.informativeText = "This adds entries to the hook settings of \(names): a line of load context when a session starts, warnings about load on prompts and before heavy tool calls, and records of what each session does, so that it can be followed here. Hooks already in those settings are left alone, and the file as it was is kept beside it. For Cursor it also adds the /guardian slash commands to ~/.cursor/commands, and the Guardian .command files and a default hook_policy.json (if there is none) to ~/.guardian.\n\nGuardian only warns unless you have allowed pausing. Codex runs new hooks only once you approve them: /hooks, or Settings > Hooks."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Add hooks")
         NSApp.activate(ignoringOtherApps: true)

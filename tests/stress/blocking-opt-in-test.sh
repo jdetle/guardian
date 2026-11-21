@@ -24,6 +24,10 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 SCRATCH="$(mktemp -d)"
+if [ -z "$SCRATCH" ] || [ ! -d "$SCRATCH" ]; then
+    echo "could not make a scratch directory" >&2
+    exit 2
+fi
 trap 'rm -rf "$SCRATCH"' EXIT
 export HOME="$SCRATCH"
 unset GUARDIAN_HOOK_FORMAT CLAUDE_CONFIG_DIR CODEX_HOME GUARDIAN_ADVISE_INTERVAL_SECS
@@ -113,7 +117,27 @@ setup critical "$STRICT"
 hook claude/user-prompt-submit.sh "{\"session_id\":\"w\",\"prompt\":\"$HEAVY\"}"
 contains "the warning says what is wrong" "critical system pressure" "$(prompt_text "$HOOK_OUT")"
 contains "the warning says the prompt went through" "sent anyway" "$(prompt_text "$HOOK_OUT")"
-contains "the warning says how to opt in" "guardian blocking on" "$(prompt_text "$HOOK_OUT")"
+for agent in claude codex; do
+    hook "$agent/user-prompt-submit.sh" "{\"session_id\":\"w-$agent\",\"prompt\":\"$HEAVY\"}"
+    case "$HOOK_OUT" in
+        *"blocking on"*) fail "$agent: the warning hands the agent the command that turns pausing on" ;;
+        *) pass "$agent: the warning does not tell the agent how to turn pausing on" ;;
+    esac
+    contains "$agent: the warning says pausing is the user's choice" "user's choice" "$(prompt_text "$HOOK_OUT")"
+done
+hook before-submit-prompt.sh "{\"conversation_id\":\"w-cursor\",\"prompt\":\"$HEAVY\"}"
+contains "Cursor, whose message the person reads: the warning says how to opt in" "guardian blocking on" "$(prompt_text "$HOOK_OUT")"
+: > "$G/proceed_once"
+hook claude/session-start.sh '{"session_id":"ws","source":"startup"}'
+case "$HOOK_OUT" in
+    *"Allow-once is armed"*) fail "session start mentions allow-once while nothing can be paused" ;;
+    *) pass "session start does not mention allow-once while nothing can be paused" ;;
+esac
+case "$HOOK_OUT" in
+    *"blocking on"*) fail "session start hands the agent the command that turns pausing on" ;;
+    *) pass "session start does not tell the agent how to turn pausing on" ;;
+esac
+rm -f "$G/proceed_once"
 hook claude/pre-tool-use.sh '{"session_id":"w","tool_name":"Agent"}'
 contains "the subagent warning asks for serial work" "serially" "$(printf '%s' "$HOOK_OUT" | jq -r '.hookSpecificOutput.additionalContext')"
 

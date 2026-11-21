@@ -42,13 +42,14 @@ sql=$(printf '%s' "$input" | jq -r \
     -f "$SCRIPT_DIR/session-event.jq" 2>/dev/null) || exit 0
 [ -n "$sql" ] || exit 0
 
-# How long to wait for a database another hook is writing. A tool call is recorded in the
-# background, so it can wait; a prompt and a session's end are recorded while the agent
-# waits (Claude Code gives a session-end hook about a second and a half in all), so they
-# give up quickly. Missing one of those costs a state that the next event puts right.
-case "$event" in
-    tool) busy_ms=3000 ;;
-    *) busy_ms=400 ;;
-esac
+# How long to wait for a database another hook is writing. Claude Code records a tool call
+# in the background, so there it can wait. Everything else is recorded while the agent
+# waits (Cursor's and Codex's tool hooks; every prompt and session end, for which Claude
+# Code allows about a second and a half in all), so it gives up quickly. Missing one costs
+# a count or a state that the next event puts right.
+busy_ms=400
+if [ "$event" = "tool" ] && [ "$client" = "claude" ]; then
+    busy_ms=3000
+fi
 sqlite3 "$SESSIONS_DB" ".timeout $busy_ms" "$sql" >/dev/null 2>&1 || true
 exit 0
