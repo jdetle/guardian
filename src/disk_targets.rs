@@ -1128,8 +1128,9 @@ fn is_real_dir(path: &Path) -> bool {
 
 /// Raised when what an entry records changes, so that a scan saved by an older Guardian is
 /// measured again rather than read with gaps. 2: worktrees record whether their unsaved
-/// work can be committed and pushed.
-const INDEX_VERSION: u32 = 2;
+/// work can be committed and pushed. 3: a worktree holding another checkout in an ignored
+/// folder is no longer recorded as deletable.
+const INDEX_VERSION: u32 = 3;
 
 /// While measuring, the index is written out this often, so a scan that is stopped part-way
 /// keeps most of what it measured.
