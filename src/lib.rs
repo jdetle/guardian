@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
+mod background_scan;
 mod classifier;
 pub mod config;
+mod dir_list;
 pub mod disk_targets;
 mod docker;
 mod hook_policy;
@@ -36,6 +38,8 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
 const PROTECTED_NAMES: &[&str] = &[
     // Guardian itself
     "guardiand",
+    // Its own CLI, which it starts for background disk scans
+    "guardian",
     // macOS system
     "Finder",
     "WindowServer",
@@ -344,6 +348,7 @@ fn run_loop(watcher: &mut ConfigWatcher, mut last_hook_steps: u32) {
     let mut samples: u64 = 0;
     let mut stats = stats::PressureStats::load();
     let mut last_tick = Instant::now();
+    let mut disk_scan = background_scan::BackgroundScan::new();
 
     loop {
         thread::sleep(Duration::from_secs(watcher.config.sample_interval()));
@@ -497,6 +502,9 @@ fn run_loop(watcher: &mut ConfigWatcher, mut last_hook_steps: u32) {
         };
 
         let disk_state = compute_disk_state(&merged.disk);
+        // `[disk] enabled = false` turns off everything Guardian does about the disk.
+        let scan_minutes = if config.disk.enabled { config.disk.background_scan_minutes } else { 0 };
+        disk_scan.tick(scan_minutes, pressure, &disk_state.level);
 
         let now = chrono::Utc::now().to_rfc3339();
         let guardian_state = GuardianState {

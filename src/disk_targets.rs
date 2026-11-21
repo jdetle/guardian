@@ -12,18 +12,29 @@
 //! checking it holds no uncommitted files and no commits that exist nowhere else.
 //!
 //! The scan runs at throttled I/O priority inside a time budget: it is meant to be run on a
-//! machine that is already short of disk and memory.
+//! machine that is already short of disk and memory. What it learns is kept in
+//! `~/.guardian/disk_index.json`, so the next scan measures only what is new, has changed or
+//! has not been measured for a while, and a scan that ran out of time is carried on by the
+//! next one. `guardiand` keeps that file fresh in the background (`guardian disk refresh`).
+//!
+//! Sizes are reported twice: what a folder occupies, and what deleting it would free. The
+//! two differ when its files are clones of files elsewhere, as a bun or pnpm install's are.
 
-use serde::Serialize;
+mod save;
+
+pub use save::{plan_save, save_worktree, SaveOptions, SavePlan, Saved};
+
+use crate::dir_list;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How much a removal costs the user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Safety {
     /// Rebuilt, re-downloaded or re-creatable from what git already holds.
@@ -32,7 +43,7 @@ pub enum Safety {
     Review,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// A tool's download or build cache outside any project.
@@ -55,9 +66,15 @@ pub struct Target {
     /// The command that removes it by hand.
     pub remove: String,
     pub safety: Safety,
+    /// What it occupies on disk.
     pub bytes: u64,
-    /// False when the time budget ran out mid-measurement: `bytes` is then a lower bound.
+    /// What deleting it would free at once: `bytes`, less whatever its files share with
+    /// copies elsewhere (clones) or have other names outside it (hard links).
+    pub freed_bytes: u64,
+    /// False when the time budget ran out mid-measurement: the sizes are then lower bounds.
     pub complete: bool,
+    /// When it was measured, in seconds since 1970.
+    pub measured_at: Option<u64>,
     /// Whole days since the project (or worktree) was last touched. `None` for tool caches.
     pub age_days: Option<u64>,
     /// The repository or worktree it belongs to, shown as `~/…`.
@@ -68,6 +85,94 @@ pub struct Target {
     pub note: Option<String>,
     /// True when `guardian disk delete` will remove it (after re-checking).
     pub deletable: bool,
+    /// True for a worktree kept from deletion only by unsaved work that
+    /// `guardian disk save --delete` can commit and push first.
+    pub saveable: bool,
+}
+
+/// How long something has gone untouched, in the bands a listing is grouped by. Declared
+/// from the longest untouched to the most recent, which is also the order they are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Staleness {
+    /// 90 days or more.
+    Quarter,
+    /// 30 to 89 days.
+    Month,
+    /// 14 to 29 days.
+    Fortnight,
+    /// 7 to 13 days.
+    Week,
+    /// Touched in the last week, or with no way to tell.
+    InUse,
+}
+
+impl Staleness {
+    pub fn of(age_days: Option<u64>) -> Self {
+        match age_days {
+            Some(d) if d >= 90 => Self::Quarter,
+            Some(d) if d >= 30 => Self::Month,
+            Some(d) if d >= OLD_DAYS => Self::Fortnight,
+            Some(d) if d >= 7 => Self::Week,
+            _ => Self::InUse,
+        }
+    }
+
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Quarter => "Untouched 90 days or more",
+            Self::Month => "Untouched 30 to 89 days",
+            Self::Fortnight => "Untouched 14 to 29 days",
+            Self::Week => "Untouched 7 to 13 days",
+            Self::InUse => "Used in the last week",
+        }
+    }
+
+    /// Untouched for [`OLD_DAYS`] or more: what deleting in bulk goes by.
+    pub fn is_old(self) -> bool {
+        self <= Self::Fortnight
+    }
+}
+
+/// Stale things that belong together: everything in one project (a repository with its
+/// worktrees and build folders), or among the tool caches, that has gone untouched for
+/// about as long. Small on their own, they are listed and deleted as one.
+#[derive(Clone, Debug, Serialize)]
+pub struct Bundle {
+    /// The project, as `~/…`, or "Tool caches".
+    pub name: String,
+    /// False for the bundle of tool caches.
+    pub is_project: bool,
+    pub staleness: Staleness,
+    /// The band in words: "Untouched 30 to 89 days".
+    pub heading: String,
+    /// How stale it is and how much of it can go without a look, in a sentence.
+    pub detail: String,
+    /// What it is made of: "3 worktrees, 4 build folders".
+    pub contents: String,
+    /// What it occupies, and what deleting all of it would free. Each folder is counted
+    /// once: a build folder inside a worktree of the bundle is part of the worktree.
+    pub bytes: u64,
+    pub freed_bytes: u64,
+    /// The part of those that comes back on its own.
+    pub regenerates_bytes: u64,
+    pub regenerates_freed_bytes: u64,
+    /// The longest and the shortest any of it has gone untouched, in days.
+    pub oldest_days: u64,
+    pub newest_days: u64,
+    /// What `guardian disk delete` can remove now without a look: Guardian can delete it
+    /// and it comes back on its own. Nothing here is inside anything else here.
+    pub delete_paths: Vec<PathBuf>,
+    /// What deleting `delete_paths` would free.
+    pub deletable_freed_bytes: u64,
+    /// How many of its folders are left out of `delete_paths`: they need a look first, or
+    /// their own command.
+    pub held_back: usize,
+    /// The held-back worktrees whose unsaved work `guardian disk save --delete` can commit
+    /// and push, after which they can go too.
+    pub save_paths: Vec<PathBuf>,
+    /// Its folders, the ones that free the most first.
+    pub members: Vec<Target>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,14 +180,35 @@ pub struct Report {
     pub volume: String,
     pub used_percent: f64,
     pub available_gb: f64,
-    /// Largest first; only targets at or above the size floor.
+    /// Stale things grouped by project and by how long they have gone untouched, the
+    /// longest untouched first. Only bundles at or above the size floor.
+    pub bundles: Vec<Bundle>,
+    /// Everything not in a bundle, largest first; only targets at or above the size floor.
     pub targets: Vec<Target>,
     /// Candidates found but not measured before the time budget ran out.
     pub unmeasured: usize,
     /// Git repositories found (main checkouts, not counting their worktrees).
     pub repos_scanned: usize,
+    /// What the targets of each kind occupy on disk.
     pub regenerates_bytes: u64,
     pub review_bytes: u64,
+    /// What deleting all the targets of each kind would free at once.
+    pub regenerates_freed_bytes: u64,
+    pub review_freed_bytes: u64,
+    /// False when the search for repositories ran out of time: there may be more to find.
+    pub discovery_complete: bool,
+    /// When the scan behind this report finished, in seconds since 1970.
+    pub scanned_at: u64,
+    /// True when this is a saved scan read back (`guardian disk --cached`), not a new one.
+    pub from_cache: bool,
+    /// Sizes taken from an earlier scan because nothing had changed since.
+    pub reused: usize,
+    /// Sizes shown from an earlier scan that were due for measuring again but not reached
+    /// in time.
+    pub outdated: usize,
+    /// Places another scan still has work to do on: never measured, measured only in part,
+    /// or due for measuring again and not reached.
+    pub pending: usize,
 }
 
 pub struct Options {
@@ -93,6 +219,9 @@ pub struct Options {
     pub budget: Duration,
     /// Leave out project build folders and worktrees touched more recently than this.
     pub older_than_days: u64,
+    /// A size from an earlier scan is measured again once it is this old, even if nothing
+    /// looks to have changed. Zero measures everything afresh.
+    pub max_age: Duration,
 }
 
 impl Default for Options {
@@ -103,6 +232,7 @@ impl Default for Options {
             top: 15,
             budget: Duration::from_secs(45),
             older_than_days: 0,
+            max_age: DEFAULT_MAX_AGE,
         }
     }
 }
@@ -110,7 +240,27 @@ impl Default for Options {
 /// Untouched for this long counts as "old" when choosing what to delete in bulk.
 pub const OLD_DAYS: u64 = 14;
 
-/// A place to look, before it has been measured.
+/// Exit status of `guardian disk refresh` when it saved what it could but ran out of time
+/// with places still to measure or to search: guardiand then runs it again soon.
+pub const REFRESH_EXIT_MORE: i32 = 3;
+
+/// How long a saved size stands in for measuring again when nothing looks to have changed.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
+
+/// What a folder occupies, and what deleting it would give back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    /// Allocated on disk. A file with several names is counted once.
+    pub bytes: u64,
+    /// Freed at once by deleting the folder: `bytes`, less what its files share with clones
+    /// or snapshots, and less files that have another name outside the folder.
+    pub freed: u64,
+    /// False when time ran out mid-measurement: both numbers are then lower bounds.
+    pub complete: bool,
+}
+
+/// A place to look. Also what the index file stores, with its size once measured.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Candidate {
     path: PathBuf,
     kind: Kind,
@@ -124,6 +274,19 @@ struct Candidate {
     branch: Option<String>,
     note: Option<String>,
     deletable: bool,
+    /// Its size when last measured; `None` until then.
+    #[serde(default)]
+    size: Option<Size>,
+    /// When that was, in seconds since 1970.
+    #[serde(default)]
+    measured_at: Option<u64>,
+    /// A worktree that git should be asked about when it is next measured. Never saved:
+    /// each scan decides it anew.
+    #[serde(skip)]
+    needs_check: bool,
+    /// A worktree kept from deletion by work that `guardian disk save` can commit and push.
+    #[serde(default)]
+    saveable: bool,
 }
 
 /// Well-known locations under the home directory:
@@ -218,12 +381,13 @@ struct Found {
 }
 
 /// Walk `root` for git repositories and for build / dependency folders, without entering
-/// the latter. `skip_top` names children of `root` that are not walked.
-fn walk(root: &Path, skip_top: &[&str], deadline: Instant, out: &mut Found) {
+/// the latter. `skip_top` names children of `root` that are not walked. False when
+/// `deadline` passed before the walk was done.
+fn walk(root: &Path, skip_top: &[&str], skip: &HashSet<PathBuf>, deadline: Instant, out: &mut Found) -> bool {
     let mut stack: Vec<(PathBuf, usize, Option<PathBuf>)> = vec![(root.to_path_buf(), 0, None)];
     while let Some((dir, depth, inherited)) = stack.pop() {
         if Instant::now() >= deadline {
-            return;
+            return false;
         }
         let repo = match fs::symlink_metadata(dir.join(".git")) {
             Ok(meta) => {
@@ -267,6 +431,10 @@ fn walk(root: &Path, skip_top: &[&str], deadline: Instant, out: &mut Found) {
                     branch: None,
                     note: None,
                     deletable: true,
+                    size: None,
+                    measured_at: None,
+                    needs_check: false,
+                    saveable: false,
                 });
                 continue;
             }
@@ -277,9 +445,13 @@ fn walk(root: &Path, skip_top: &[&str], deadline: Instant, out: &mut Found) {
             if depth == 0 && skip_top.contains(&name) {
                 continue;
             }
+            if skip.contains(&entry.path()) {
+                continue;
+            }
             stack.push((entry.path(), depth + 1, repo.clone()));
         }
     }
+    true
 }
 
 fn newest(times: &[Option<SystemTime>]) -> Option<SystemTime> {
@@ -444,11 +616,60 @@ fn ignored_path_regenerates(worktree: &Path, rel: &str) -> bool {
     )
 }
 
+/// What a look inside a folder for other git checkouts found.
+enum Nested {
+    None,
+    /// Another checkout: a repository, or a linked worktree, with its own `.git`.
+    Checkout(PathBuf),
+    /// Too much in there to be sure.
+    TooLarge,
+}
+
+/// Look in `dir` and down to `max_depth` below it for a git checkout. Used on folders git
+/// ignores: nothing git reports about the checkout around them says what such a folder
+/// holds, and removing the checkout around it deletes it. A worktree made from inside a
+/// worktree sits in exactly such a place, as does a dependency cloned for editing.
+/// `strict`: there being more below `max_depth` counts as too large to be sure, rather
+/// than as nothing found.
+fn nested_checkout(dir: &Path, max_depth: usize, strict: bool) -> Nested {
+    const MAX_DIRS: usize = 20_000;
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((at, depth)) = stack.pop() {
+        if fs::symlink_metadata(at.join(".git")).is_ok() {
+            return Nested::Checkout(at);
+        }
+        visited += 1;
+        if visited > MAX_DIRS {
+            return if strict { Nested::TooLarge } else { Nested::None };
+        }
+        let Ok(entries) = fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // Symlinks are not followed: what they point at is not deleted with this.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if depth + 1 > max_depth {
+                if strict {
+                    return Nested::TooLarge;
+                }
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+    Nested::None
+}
+
 /// What deleting a worktree would lose, beyond what git keeps.
 struct WorktreeState {
     safety: Safety,
     deletable: bool,
     note: String,
+    /// What keeps it from being deleted is work `guardian disk save` can commit and push.
+    saveable: bool,
 }
 
 fn worktree_state(wt: &Linked) -> WorktreeState {
@@ -456,6 +677,12 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
         safety: Safety::Review,
         deletable: false,
         note,
+        saveable: false,
+    };
+    // Uncommitted files, or commits on no branch: work that a commit and a push would keep.
+    let unsaved = |note: String| WorktreeState {
+        saveable: true,
+        ..blocked(note)
     };
     if wt.locked {
         return blocked("locked with git worktree lock".to_string());
@@ -463,11 +690,14 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     // Spelled out rather than left to the user's git config: with
     // `status.showUntrackedFiles=no`, a bare `git status` (and the check inside
     // `git worktree remove`) reports a worktree full of new files as clean.
+    // `-z`: without it git quotes and escapes any name that is not plain ASCII, and a path
+    // read that way names nothing on disk.
     let Some(status) = git(
         &wt.path,
         &[
             "status",
             "--porcelain",
+            "-z",
             "--untracked-files=normal",
             "--ignored=traditional",
             "--ignore-submodules=none",
@@ -475,10 +705,10 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     ) else {
         return blocked("could not be checked for unsaved work".to_string());
     };
-    let entries = || status.lines().filter(|l| !l.trim().is_empty());
-    let dirty = entries().filter(|l| !l.starts_with("!!")).count();
+    let changes = save::parse_status(&status);
+    let dirty = changes.iter().filter(|c| !c.ignored).count();
     if dirty > 0 {
-        return blocked(format!(
+        return unsaved(format!(
             "{dirty} uncommitted or untracked file{}",
             if dirty == 1 { "" } else { "s" }
         ));
@@ -506,7 +736,7 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
         match unique {
             Some(0) => {}
             Some(n) => {
-                return blocked(format!(
+                return unsaved(format!(
                     "{n} commit{} only here (detached HEAD)",
                     if n == 1 { " exists" } else { "s exist" }
                 ))
@@ -516,16 +746,48 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     }
     // Ignored files are deleted with the worktree and git keeps no copy: local settings
     // (.env), databases, notes. Build output and dependencies are the exception.
-    let kept_nowhere: Vec<String> = entries()
-        .filter_map(|l| l.strip_prefix("!! "))
-        .map(|p| p.trim_matches('"').trim_end_matches('/').to_string())
-        .filter(|p| !ignored_path_regenerates(&wt.path, p))
+    let ignored: Vec<String> = changes
+        .iter()
+        .filter(|c| c.ignored)
+        .map(|c| c.path.trim_end_matches('/').to_string())
         .collect();
+    let (regenerating, kept_nowhere): (Vec<String>, Vec<String>) = ignored
+        .into_iter()
+        .partition(|p| ignored_path_regenerates(&wt.path, p));
+    // Dependencies come back, but not a package cloned into them to be patched: its top
+    // levels are looked at (`node_modules/pkg`, `node_modules/@scope/pkg`).
+    for folder in &regenerating {
+        if let Nested::Checkout(inner) = nested_checkout(&wt.path.join(folder), 2, false) {
+            let shown = inner.strip_prefix(&wt.path).unwrap_or(&inner).to_string_lossy().to_string();
+            return blocked(format!(
+                "{shown} is a git checkout of its own inside it; removing this worktree would delete it and any unsaved work in it"
+            ));
+        }
+    }
+    // An ignored folder can hold a whole other checkout, unsaved work and all, and
+    // `git worktree remove` deletes it without a word.
+    for ignored in &kept_nowhere {
+        match nested_checkout(&wt.path.join(ignored), 6, true) {
+            Nested::None => {}
+            Nested::Checkout(inner) => {
+                let shown = inner.strip_prefix(&wt.path).unwrap_or(&inner).to_string_lossy().to_string();
+                return blocked(format!(
+                    "{shown} is another git checkout inside it, in a folder git ignores; removing this worktree would delete it and any unsaved work in it"
+                ));
+            }
+            Nested::TooLarge => {
+                return blocked(format!(
+                    "{ignored} is ignored by git and too large to check for other git checkouts inside it"
+                ));
+            }
+        }
+    }
     if let Some(first) = kept_nowhere.first() {
         let n = kept_nowhere.len();
         return WorktreeState {
             safety: Safety::Review,
             deletable: true,
+            saveable: false,
             note: match n {
                 1 => format!("no uncommitted work, but {first} is ignored by git and would be lost"),
                 2 => format!("no uncommitted work, but {first} and 1 other ignored item would be lost"),
@@ -539,6 +801,7 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     WorktreeState {
         safety: Safety::Regenerates,
         deletable: true,
+        saveable: false,
         note: match &wt.branch {
             Some(b) => format!("no uncommitted work; branch {b} stays in the repository"),
             None => "no uncommitted work; its commits are on other branches".to_string(),
@@ -546,19 +809,33 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     }
 }
 
-fn worktree_candidates(main: &Path, home: &Path, deadline: Instant, out: &mut Vec<Candidate>) {
+/// What a worktree says until git has been asked about it.
+const UNCHECKED: &str = "not yet checked for unsaved work";
+const LOCKED: &str = "locked with git worktree lock";
+
+/// List the linked worktrees of `main`. Whether each holds unsaved work is not asked here:
+/// that takes git a second or more per worktree, so it is done with the measuring
+/// (`check_worktree`), where it is budgeted, carried on by the next scan, and skipped for a
+/// worktree that has not changed. False when `deadline` passed before the listing was done.
+fn worktree_candidates(main: &Path, home: &Path, deadline: Instant, out: &mut Vec<Candidate>) -> bool {
     for wt in linked_worktrees(main) {
         if Instant::now() >= deadline {
-            return;
+            return false;
         }
         if !wt.path.is_dir() {
             continue;
         }
-        let state = worktree_state(&wt);
-        // A worktree outside the home folder is listed, with its command, but never deleted
-        // by Guardian (see `guard_path`).
-        let deletable = state.deletable && guard_path(&wt.path, home).is_ok();
+        // Until checked, a worktree is not offered for deletion.
+        let state = WorktreeState {
+            safety: Safety::Review,
+            deletable: false,
+            saveable: false,
+            note: if wt.locked { LOCKED } else { UNCHECKED }.to_string(),
+        };
+        let deletable = false;
         out.push(Candidate {
+            needs_check: !wt.locked,
+            saveable: false,
             remove: Some(format!(
                 "git -C {} worktree remove {}",
                 shell_path(main, home),
@@ -574,57 +851,91 @@ fn worktree_candidates(main: &Path, home: &Path, deadline: Instant, out: &mut Ve
             branch: wt.branch,
             note: Some(state.note),
             deletable,
+            size: None,
+            measured_at: None,
         });
     }
+    true
+}
+
+/// Ask git whether deleting this worktree would lose anything, and record the answer.
+fn check_worktree(c: &mut Candidate, home: &Path) {
+    let state = worktree_state(&Linked {
+        path: c.path.clone(),
+        branch: c.branch.clone(),
+        locked: false,
+    });
+    // A worktree outside the home folder is listed, with its command, but never deleted
+    // by Guardian (see `guard_path`).
+    c.deletable = state.deletable && guard_path(&c.path, home).is_ok();
+    c.safety = state.safety;
+    c.note = Some(state.note);
+    c.saveable = state.saveable;
+    c.needs_check = false;
 }
 
 /// Disk space used under `root` (allocated blocks, so sparse files such as Docker's disk
 /// image count for what they really occupy). Stays on one volume, never follows symlinks.
 /// Directories in `known` are not walked again: their recorded size is added instead.
-/// Returns `(bytes, complete)`; `complete` is false when `deadline` passed first.
-fn dir_size(root: &Path, deadline: Instant, known: &HashMap<PathBuf, (u64, bool)>) -> (u64, bool) {
+/// `complete` is false in the result when `deadline` passed first.
+fn dir_size(root: &Path, deadline: Instant, known: &HashMap<PathBuf, Size>) -> Size {
     let Ok(root_meta) = fs::symlink_metadata(root) else {
-        return (0, true);
+        return Size { bytes: 0, freed: 0, complete: true };
     };
     let device = root_meta.dev();
-    let mut total = root_meta.blocks().saturating_mul(512);
+    let own = root_meta.blocks().saturating_mul(512);
+    let mut size = Size { bytes: own, freed: own, complete: true };
     if !root_meta.file_type().is_dir() {
-        return (total, true);
+        return size;
     }
-    let mut complete = true;
+    // Files with more than one name (hard links), by inode: names seen under `root`, names
+    // in all, and the space the file would free. Cargo's build output is full of these.
+    let mut linked: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+    let (mut buf, mut entries) = (Vec::new(), Vec::new());
     let mut stack = vec![root.to_path_buf()];
     let mut seen: u32 = 0;
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
+    'walk: while let Some(dir) = stack.pop() {
+        if !dir_list::list(&dir, &mut buf, &mut entries) {
             continue;
-        };
-        for entry in entries.flatten() {
+        }
+        for entry in entries.drain(..) {
             seen = seen.wrapping_add(1);
             if seen % 512 == 0 && Instant::now() >= deadline {
-                return (total, false);
+                size.complete = false;
+                break 'walk;
             }
-            // DirEntry::metadata does not follow symlinks.
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.dev() != device {
+            if entry.device != device {
                 continue;
             }
-            if meta.file_type().is_dir() {
-                let path = entry.path();
-                if let Some((bytes, whole)) = known.get(&path) {
-                    total = total.saturating_add(*bytes);
-                    complete &= *whole;
+            if entry.is_dir {
+                let path = dir.join(&entry.name);
+                if let Some(inner) = known.get(&path) {
+                    size.bytes = size.bytes.saturating_add(inner.bytes);
+                    size.freed = size.freed.saturating_add(inner.freed);
+                    size.complete &= inner.complete;
                     continue;
                 }
-                total = total.saturating_add(meta.blocks().saturating_mul(512));
                 stack.push(path);
+            } else if entry.links > 1 {
+                let names = linked.entry(entry.inode).or_insert_with(|| {
+                    size.bytes = size.bytes.saturating_add(entry.allocated);
+                    (0, entry.links, entry.private)
+                });
+                names.0 += 1;
             } else {
-                total = total.saturating_add(meta.blocks().saturating_mul(512));
+                size.bytes = size.bytes.saturating_add(entry.allocated);
+                size.freed = size.freed.saturating_add(entry.private);
             }
         }
     }
-    (total, complete)
+    // A file with several names is freed only once every one of them is gone, so it counts
+    // only when all of them are inside this folder.
+    for (seen_here, in_all, private) in linked.values() {
+        if seen_here >= in_all {
+            size.freed = size.freed.saturating_add(*private);
+        }
+    }
+    size
 }
 
 /// `path` as the user would type it: `~/…` under the home directory.
@@ -653,11 +964,15 @@ pub fn shell_path(path: &Path, home: &Path) -> String {
         }
         out
     };
+    // Inside double quotes an interactive shell still expands `!`; single quotes do not.
+    let single = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     match path.strip_prefix(home) {
         Ok(rel) => {
             let rel = rel.to_string_lossy();
             if plain(&rel) {
                 format!("~/{rel}")
+            } else if rel.contains('!') {
+                format!("\"$HOME\"/{}", single(&rel))
             } else {
                 format!("\"$HOME/{}\"", escape(&rel))
             }
@@ -666,6 +981,8 @@ pub fn shell_path(path: &Path, home: &Path) -> String {
             let full = path.to_string_lossy();
             if plain(&full) {
                 full.to_string()
+            } else if full.contains('!') {
+                single(&full)
             } else {
                 format!("\"{}\"", escape(&full))
             }
@@ -684,6 +1001,17 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// "3 hours ago", for a length of time in seconds.
+pub fn ago_text(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..=89 => return "just now".to_string(),
+        90..=5_399 => ((secs + 30) / 60, "minute"),
+        5_400..=129_599 => ((secs + 1_800) / 3_600, "hour"),
+        _ => ((secs + 43_200) / 86_400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
 /// Ask the kernel to treat this process's disk I/O as background work.
 fn throttle_io() {
     extern "C" {
@@ -700,13 +1028,28 @@ fn throttle_io() {
     }
 }
 
-fn candidates(home: &Path, opts: &Options, deadline: Instant) -> (Vec<Candidate>, usize) {
+/// What a search for places to look turned up.
+struct Discovery {
+    candidates: Vec<Candidate>,
+    /// Main checkouts found.
+    repos: usize,
+    /// False when `deadline` passed before everywhere had been searched.
+    complete: bool,
+}
+
+fn candidates(home: &Path, opts: &Options, deadline: Instant) -> Discovery {
     let mut found = Found::default();
     for (rel, what, cost, remove, safety) in KNOWN {
         let path = home.join(rel);
         if !path.exists() {
             continue;
         }
+        // When something was last added or removed at its top level. Only for caches that
+        // refill themselves: a toolchain or a model is not stale for having been installed
+        // long ago, and nothing records when it was last used.
+        let last_touch = (*safety == Safety::Regenerates)
+            .then(|| newest_shallow(&path))
+            .flatten();
         found.candidates.push(Candidate {
             path,
             kind: Kind::Cache,
@@ -718,28 +1061,47 @@ fn candidates(home: &Path, opts: &Options, deadline: Instant) -> (Vec<Candidate>
             remove: (!remove.is_empty()).then(|| remove.to_string()),
             safety: *safety,
             repo: None,
-            last_touch: None,
+            last_touch,
             branch: None,
             note: None,
+            size: None,
+            measured_at: None,
+            needs_check: false,
+            saveable: false,
         });
     }
 
-    walk(home, HOME_SKIP, deadline, &mut found);
+    // Tool caches are listed whole; nothing inside one is a project's build folder.
+    let caches: HashSet<PathBuf> = KNOWN.iter().map(|(rel, ..)| home.join(rel)).collect();
+    let mut complete = walk(home, HOME_SKIP, &caches, deadline, &mut found);
     for root in &opts.roots {
-        walk(root, &[], deadline, &mut found);
+        complete &= walk(root, &[], &caches, deadline, &mut found);
     }
 
     let mut repos = std::mem::take(&mut found.repos);
     repos.sort();
     repos.dedup();
+    // Listing worktrees is quick and has time of its own: a walk that used up the search's
+    // share must not mean that no worktree is listed at all.
+    let listing_deadline = deadline.max(Instant::now()) + opts.budget / 6;
     for main in &repos {
-        worktree_candidates(main, home, deadline, &mut found.candidates);
+        // Checked here too: asking git for a repository's worktrees is the slow part, and
+        // is not worth starting once the time is up.
+        if Instant::now() >= listing_deadline {
+            complete = false;
+            break;
+        }
+        complete &= worktree_candidates(main, home, listing_deadline, &mut found.candidates);
     }
 
     // The same directory can be reached twice (an extra root inside the home directory).
     let mut seen = HashSet::new();
     found.candidates.retain(|c| seen.insert(c.path.clone()));
-    (found.candidates, repos.len())
+    Discovery {
+        candidates: found.candidates,
+        repos: repos.len(),
+        complete,
+    }
 }
 
 fn age_days(last_touch: Option<SystemTime>) -> Option<u64> {
@@ -747,85 +1109,581 @@ fn age_days(last_touch: Option<SystemTime>) -> Option<u64> {
     Some(elapsed.as_secs() / 86_400)
 }
 
-/// Find and measure targets under `home`. Read-only.
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn unix_now() -> u64 {
+    unix_secs(SystemTime::now())
+}
+
+/// A directory itself, not a symlink to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+// ---------------------------------------------------------------------------------------
+// The index: what earlier scans found and measured
+// ---------------------------------------------------------------------------------------
+
+/// Raised when what an entry records changes, so that a scan saved by an older Guardian is
+/// measured again rather than read with gaps. 2: worktrees record whether their unsaved
+/// work can be committed and pushed. 3: a worktree holding another checkout in an ignored
+/// folder is no longer recorded as deletable.
+const INDEX_VERSION: u32 = 3;
+
+/// While measuring, the index is written out this often, so a scan that is stopped part-way
+/// keeps most of what it measured.
+const SAVE_EVERY: Duration = Duration::from_secs(15);
+
+/// Everything the last scan knew: each place it found, with its size if it has been
+/// measured. Read only to save measuring again and to list without scanning; whether
+/// something may be deleted is always decided afresh from the disk (`plan_delete`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Index {
+    version: u32,
+    /// The home directory it describes; an index for another one is ignored.
+    home: PathBuf,
+    /// When it was written, in seconds since 1970.
+    scanned_at: u64,
+    discovery_complete: bool,
+    repos_scanned: usize,
+    entries: Vec<Candidate>,
+}
+
+/// Where the index is kept: `~/.guardian/disk_index.json`.
+pub fn index_path() -> PathBuf {
+    crate::config::guardian_dir().join("disk_index.json")
+}
+
+/// The index in `file`, if there is one this version wrote for `home`.
+fn load_index(file: &Path, home: &Path) -> Option<Index> {
+    let text = fs::read_to_string(file).ok()?;
+    let index: Index = serde_json::from_str(&text).ok()?;
+    (index.version == INDEX_VERSION && index.home == home).then_some(index)
+}
+
+/// Write the index whole or not at all: readers never see half a file.
+fn save_index(file: &Path, index: &Index) -> std::io::Result<()> {
+    let json = match serde_json::to_vec(index) {
+        Ok(json) => json,
+        Err(_) => {
+            // JSON cannot hold a path that is not valid UTF-8. Leave such places out rather
+            // than save nothing: they are found and measured again by each scan.
+            let utf8 = |p: &Path| p.to_str().is_some();
+            let mut plain = index.clone();
+            plain
+                .entries
+                .retain(|c| utf8(&c.path) && c.repo.as_deref().map_or(true, utf8));
+            serde_json::to_vec(&plain)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        }
+    };
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
+    let result = fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, file));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Held by the one scan allowed to write the index. Released when dropped, or when the
+/// process ends however it ends.
+struct IndexLock(fs::File);
+
+impl IndexLock {
+    /// `None` when another scan holds it, or the lock file cannot be made.
+    fn try_take(index_file: &Path) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        if let Some(dir) = index_file.parent() {
+            fs::create_dir_all(dir).ok()?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(index_file.with_extension("lock"))
+            .ok()?;
+        let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if !taken {
+            return None;
+        }
+        // A scan stopped in the middle of saving leaves its half-written file behind. With
+        // the lock held no scan is saving, so any such file is abandoned.
+        if let (Some(dir), Some(name)) = (index_file.parent(), index_file.file_name().and_then(|n| n.to_str())) {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let leftover = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|f| f.starts_with(&format!("{name}.")) && f.ends_with(".tmp"));
+                if leftover {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        Some(Self(file))
+    }
+}
+
+/// Find and measure targets under `home`. Read-only, and remembers nothing between calls.
 pub fn survey_home(home: &Path, opts: &Options) -> Report {
+    survey_with(home, opts, None, &mut |_| {}).0
+}
+
+/// Find targets under `home` and measure the ones `prior` has no current size for: those
+/// never measured, changed since, measured only in part, or measured longer ago than
+/// `opts.max_age`. Returns the report and the index to keep for next time; `save` is also
+/// handed the index every so often while measuring.
+fn survey_with(
+    home: &Path,
+    opts: &Options,
+    prior: Option<Index>,
+    save: &mut dyn FnMut(&Index),
+) -> (Report, Index) {
     let started = Instant::now();
     let deadline = started + opts.budget;
-    // Finding things may use at most a third of the budget; measuring gets the rest.
-    let discovery_deadline = started + opts.budget / 3;
+    // Finding things may use at most a third of the budget; measuring gets the rest. If the
+    // last search was cut short it gets two thirds: measuring is carried on by the next
+    // scan, a search is not, so a search that never finishes never finds what is past it.
+    let search_cut_short = prior.as_ref().is_some_and(|p| !p.discovery_complete);
+    let discovery_deadline = started + if search_cut_short { opts.budget * 2 / 3 } else { opts.budget / 3 };
 
-    let (mut found, repos_scanned) = candidates(home, opts, discovery_deadline);
-    let worktree_touch: HashMap<PathBuf, Option<SystemTime>> = found
+    let found = candidates(home, opts, discovery_deadline);
+    let discovery_complete = found.complete;
+    let mut repos_scanned = found.repos;
+    let mut entries = found.candidates;
+
+    if let Some(prior) = prior {
+        let mut earlier: HashMap<PathBuf, Candidate> = prior
+            .entries
+            .into_iter()
+            .map(|c| (c.path.clone(), c))
+            .collect();
+        for c in &mut entries {
+            if let Some(before) = earlier.remove(&c.path) {
+                c.size = before.size;
+                c.measured_at = before.measured_at;
+                if c.needs_check {
+                    // What git said last time stands until the worktree is measured again.
+                    c.safety = before.safety;
+                    c.deletable = before.deletable;
+                    c.saveable = before.saveable;
+                    if before.note.as_deref() == Some(LOCKED) {
+                        // Locked then, not now: ask git this time.
+                        c.measured_at = None;
+                    } else {
+                        c.note = before.note;
+                    }
+                }
+            }
+        }
+        if !discovery_complete {
+            // A search cut short says nothing about the places it did not reach: keep what
+            // an earlier search found there, as long as it still exists.
+            // A worktree only for as long as it has the `.git` file of one.
+            let still_there = |c: &Candidate| {
+                is_real_dir(&c.path)
+                    && (c.kind != Kind::Worktree
+                        || fs::symlink_metadata(c.path.join(".git")).is_ok_and(|m| m.is_file()))
+            };
+            let mut kept: Vec<Candidate> = earlier.into_values().filter(still_there).collect();
+            for c in &mut kept {
+                // Whether it is still locked cannot be told without listing it; a locked
+                // one stays as it was noted.
+                c.needs_check = c.kind == Kind::Worktree && c.note.as_deref() != Some(LOCKED);
+            }
+            kept.sort_by(|a, b| a.path.cmp(&b.path));
+            entries.extend(kept);
+            repos_scanned = repos_scanned.max(prior.repos_scanned);
+        }
+    }
+
+    let due = plan_measuring(&mut entries, opts.max_age, unix_now());
+
+    // No single folder may use more than this much of the budget; it then reports a lower
+    // bound instead of starving everything after it.
+    let per_target = (opts.budget / 8).max(Duration::from_secs(2));
+    let index_of = |entries: &[Candidate]| Index {
+        version: INDEX_VERSION,
+        home: home.to_path_buf(),
+        scanned_at: unix_now(),
+        discovery_complete,
+        repos_scanned,
+        entries: entries.to_vec(),
+    };
+
+    // Sizes that stand: a worktree being measured adds these in rather than walking them.
+    let mut sizes: HashMap<PathBuf, Size> = entries
+        .iter()
+        .zip(&due)
+        .filter(|(_, due)| !**due)
+        .filter_map(|(c, _)| Some((c.path.clone(), c.size?)))
+        .collect();
+    let reused = sizes.len();
+    let mut outdated = 0usize;
+    let mut reached = vec![false; entries.len()];
+    let mut last_save = Instant::now();
+    for i in 0..entries.len() {
+        if !due[i] {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            // Not reached this time. An earlier size, if there is one, is still shown.
+            outdated += usize::from(entries[i].size.is_some());
+            continue;
+        }
+        if entries[i].needs_check {
+            check_worktree(&mut entries[i], home);
+        }
+        let before = entries[i].size;
+        // Something that ran out of time before is given all the time that is left.
+        let limit = match before {
+            Some(size) if !size.complete => deadline,
+            _ => deadline.min(Instant::now() + per_target),
+        };
+        let mut size = dir_size(&entries[i].path, limit, &sizes);
+        if let Some(old) = before {
+            // Two lower bounds: the larger one says more.
+            if !size.complete && !old.complete && old.bytes > size.bytes {
+                size = old;
+            }
+        }
+        sizes.insert(entries[i].path.clone(), size);
+        entries[i].size = Some(size);
+        entries[i].measured_at = Some(unix_now());
+        reached[i] = true;
+        if last_save.elapsed() >= SAVE_EVERY {
+            save(&index_of(&entries));
+            last_save = Instant::now();
+        }
+    }
+
+    let index = index_of(&entries);
+    let mut report = report_from(home, opts, &index, false);
+    report.reused = reused;
+    report.outdated = outdated;
+    report.pending = (0..entries.len())
+        .filter(|&i| (due[i] && !reached[i]) || entries[i].size.map_or(true, |s| !s.complete))
+        .count();
+    (report, index)
+}
+
+/// Put `entries` in the order they should be measured and say which of them need it: those
+/// never measured, measured only in part, measured `max_age` or longer ago, or touched since
+/// they were measured. `now` is in seconds since 1970.
+fn plan_measuring(entries: &mut Vec<Candidate>, max_age: Duration, now: u64) -> Vec<bool> {
+    let stale = |c: &Candidate| match (c.size, c.measured_at) {
+        (Some(size), Some(at)) => {
+            !size.complete
+                || now.saturating_sub(at) >= max_age.as_secs()
+                || c.last_touch.is_some_and(|t| unix_secs(t) > at)
+        }
+        _ => true,
+    };
+
+    let worktree_touch: HashMap<PathBuf, Option<SystemTime>> = entries
         .iter()
         .filter(|c| c.kind == Kind::Worktree)
         .map(|c| (c.path.clone(), c.last_touch))
         .collect();
-    let worktree_paths: Vec<PathBuf> = worktree_touch.keys().cloned().collect();
+    // The worktree a build folder is inside, or the entry's own path.
+    let group_of = |c: &Candidate| match (&c.kind, &c.repo) {
+        (Kind::Build, Some(repo)) if worktree_touch.contains_key(repo) => repo.clone(),
+        _ => c.path.clone(),
+    };
+    // A worktree's size is built from the sizes of the build folders inside it, so it is
+    // measured again whenever one of them is, and after them. Per worktree with such a
+    // folder: the latest time any of those folders was measured (0 for never).
+    let mut inner_due: HashMap<PathBuf, u64> = HashMap::new();
+    for c in entries.iter() {
+        if c.kind == Kind::Build && worktree_touch.contains_key(&group_of(c)) && stale(c) {
+            let latest = inner_due.entry(group_of(c)).or_insert(0);
+            *latest = (*latest).max(c.measured_at.unwrap_or(0));
+        }
+    }
+    let inner = |c: &Candidate| match c.kind {
+        Kind::Worktree => inner_due.get(&c.path).copied(),
+        _ => None,
+    };
+    // A folder inside a worktree is not measured again just because the worktree is: its
+    // saved size is added in.
+    let due_of = |c: &Candidate| stale(c) || inner(c).is_some();
 
-    // Measuring order, for when the budget runs out before everything is measured:
-    // tool caches first (few and large), then projects from the longest untouched to the
-    // most recent, since stale ones are what will actually be deleted. A worktree comes
-    // directly after the build folders inside it, whose sizes it reuses.
+    // Measuring order, for when the budget runs out first. What has never been measured
+    // comes first, then what was measured longest ago, so that successive scans work
+    // through everything rather than repeating the same start. Within that: tool caches
+    // (few and large), then projects from the longest untouched to the most recent, since
+    // stale ones are what will actually be deleted. A worktree comes after the build
+    // folders inside it that are being measured.
+    let unknown_touch = SystemTime::now();
     let order = |c: &Candidate| {
-        let group = match (&c.kind, &c.repo) {
-            (Kind::Worktree, _) => Some(c.path.clone()),
-            (Kind::Build, Some(repo)) if worktree_touch.contains_key(repo) => Some(repo.clone()),
-            _ => None,
-        };
-        let touched = match &group {
-            Some(g) => worktree_touch.get(g).copied().flatten(),
+        let group = group_of(c);
+        let touched = match worktree_touch.get(&group) {
+            Some(worktree) => *worktree,
             None => c.last_touch,
         };
         (
+            c.measured_at.unwrap_or(0).max(inner(c).unwrap_or(0)),
             c.kind != Kind::Cache,
-            touched.unwrap_or_else(SystemTime::now),
-            group.unwrap_or_else(|| c.path.clone()),
+            touched.unwrap_or(unknown_touch),
+            group,
             c.kind == Kind::Worktree,
         )
     };
-    found.sort_by_cached_key(order);
-    // No single folder may use more than this much of the budget; it then reports a lower
-    // bound instead of starving everything after it.
-    let per_target = (opts.budget / 8).max(Duration::from_secs(2));
+    // The sort borrows `entries` whole, so each entry's key is worked out first.
+    let mut keyed: Vec<_> = std::mem::take(entries)
+        .into_iter()
+        .map(|c| (order(&c), due_of(&c), c))
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let due = keyed.iter().map(|(_, due, _)| *due).collect();
+    *entries = keyed.into_iter().map(|(_, _, c)| c).collect();
+    due
+}
 
-    let mut sizes: HashMap<PathBuf, (u64, bool)> = HashMap::new();
-    let mut targets = Vec::new();
-    let mut unmeasured = 0usize;
-    for c in found {
-        if Instant::now() >= deadline {
-            unmeasured += 1;
+/// One measured place on its way into a report: the listing row, and what decides which
+/// bundle it belongs to.
+struct Row {
+    target: Target,
+    /// The main checkout it belongs to: a worktree's repository, a build folder's
+    /// repository (its worktree's, when it is inside one). `None` for tool caches.
+    project: Option<PathBuf>,
+    /// The worktree a build folder is inside, if that worktree was measured too.
+    inside: Option<PathBuf>,
+    staleness: Staleness,
+}
+
+/// "3 worktrees, 4 build folders": what a bundle is made of.
+fn contents_text(members: &[&Row]) -> String {
+    let count = |kind: Kind| members.iter().filter(|m| m.target.kind == kind).count();
+    let part = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    [
+        part(count(Kind::Worktree), "worktree", "worktrees"),
+        part(count(Kind::Build), "build folder", "build folders"),
+        part(count(Kind::Cache), "cache", "caches"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// Group the rows that have gone untouched for a week or more into bundles, one per
+/// project and age band, and return them with the rows left over. A bundle smaller than
+/// the size floor is not made; its rows are handed back to be listed on their own.
+fn bundle_stale(rows: Vec<Row>, home: &Path, min_bytes: u64) -> (Vec<Bundle>, Vec<Row>) {
+    let mut groups: HashMap<(Staleness, Option<PathBuf>), Vec<Row>> = HashMap::new();
+    let mut alone = Vec::new();
+    for row in rows {
+        if row.staleness == Staleness::InUse {
+            alone.push(row);
+        } else {
+            groups
+                .entry((row.staleness, row.project.clone()))
+                .or_default()
+                .push(row);
+        }
+    }
+
+    let mut bundles = Vec::new();
+    for ((staleness, project), mut rows) in groups {
+        rows.sort_by(|a, b| {
+            (b.target.freed_bytes, b.target.bytes, &a.target.path)
+                .cmp(&(a.target.freed_bytes, a.target.bytes, &b.target.path))
+        });
+        let worktrees: HashSet<&PathBuf> = rows
+            .iter()
+            .filter(|r| r.target.kind == Kind::Worktree)
+            .map(|r| &r.target.path)
+            .collect();
+        let goes_now = |r: &Row| r.target.deletable && r.target.safety == Safety::Regenerates;
+        // Worktrees that would be deleted take the build folders inside them along.
+        let going: HashSet<&PathBuf> = rows
+            .iter()
+            .filter(|r| r.target.kind == Kind::Worktree && goes_now(r))
+            .map(|r| &r.target.path)
+            .collect();
+        // A build folder inside a worktree of this bundle is part of that worktree's size.
+        let top_level: Vec<&Row> = rows
+            .iter()
+            .filter(|r| !r.inside.as_ref().is_some_and(|w| worktrees.contains(w)))
+            .collect();
+        let delete: Vec<&Row> = rows
+            .iter()
+            .filter(|r| goes_now(r) && !r.inside.as_ref().is_some_and(|w| going.contains(w)))
+            .collect();
+        let bytes: u64 = top_level.iter().map(|r| r.target.bytes).sum();
+        if bytes < min_bytes {
+            alone.extend(rows);
             continue;
         }
-        let (bytes, complete) = dir_size(&c.path, deadline.min(Instant::now() + per_target), &sizes);
-        sizes.insert(c.path.clone(), (bytes, complete));
-        let remove = c
-            .remove
-            .unwrap_or_else(|| format!("rm -rf {}", shell_path(&c.path, home)));
-        targets.push(Target {
-            display_path: display_path(&c.path, home),
-            kind: c.kind,
-            what: c.what,
-            cost: c.cost,
-            remove,
-            safety: c.safety,
+        // A folder inside a worktree is dated by the worktree, as it is banded by it.
+        let ages: Vec<u64> = top_level.iter().filter_map(|r| r.target.age_days).collect();
+        let delete_paths: Vec<PathBuf> = delete.iter().map(|r| r.target.path.clone()).collect();
+        // Shown: everything counted, and anything inside a kept worktree that can still go.
+        let members: Vec<Target> = rows
+            .iter()
+            .filter(|r| {
+                !r.inside.as_ref().is_some_and(|w| worktrees.contains(w)) || delete_paths.contains(&r.target.path)
+            })
+            .map(|r| r.target.clone())
+            .collect();
+        let mut bundle = Bundle {
+            name: match &project {
+                Some(project) => display_path(project, home),
+                None => "Tool caches".to_string(),
+            },
+            is_project: project.is_some(),
+            staleness,
+            heading: staleness.heading().to_string(),
+            detail: String::new(),
+            contents: contents_text(&top_level),
             bytes,
-            complete,
-            age_days: age_days(c.last_touch),
-            repo: c.repo.as_deref().map(|r| display_path(r, home)),
-            branch: c.branch,
-            note: c.note,
-            deletable: c.deletable,
-            path: c.path,
+            freed_bytes: top_level.iter().map(|r| r.target.freed_bytes).sum(),
+            regenerates_bytes: top_level
+                .iter()
+                .filter(|r| r.target.safety == Safety::Regenerates)
+                .map(|r| r.target.bytes)
+                .sum(),
+            regenerates_freed_bytes: top_level
+                .iter()
+                .filter(|r| r.target.safety == Safety::Regenerates)
+                .map(|r| r.target.freed_bytes)
+                .sum(),
+            oldest_days: ages.iter().copied().max().unwrap_or(0),
+            newest_days: ages.iter().copied().min().unwrap_or(0),
+            deletable_freed_bytes: delete.iter().map(|r| r.target.freed_bytes).sum(),
+            held_back: top_level
+                .iter()
+                .filter(|r| !delete_paths.contains(&r.target.path))
+                .count(),
+            save_paths: top_level
+                .iter()
+                .filter(|r| r.target.saveable)
+                .map(|r| r.target.path.clone())
+                .collect(),
+            delete_paths,
+            members,
+        };
+        bundle.detail = bundle.detail_text();
+        bundles.push(bundle);
+    }
+    // The longest untouched first; among those, what frees the most right now, then what
+    // would free the most once its held-back folders have been looked at.
+    bundles.sort_by(|a, b| {
+        (a.staleness, b.deletable_freed_bytes, b.freed_bytes, b.bytes, &a.name).cmp(&(
+            b.staleness,
+            a.deletable_freed_bytes,
+            a.freed_bytes,
+            a.bytes,
+            &b.name,
+        ))
+    });
+    (bundles, alone)
+}
+
+/// The listing for what `index` holds: filtered, bundled, sorted and totalled as `opts` asks.
+fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> Report {
+    let worktrees: HashMap<&PathBuf, &Candidate> = index
+        .entries
+        .iter()
+        .filter(|c| c.kind == Kind::Worktree)
+        .map(|c| (&c.path, c))
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut unmeasured = 0usize;
+    for c in &index.entries {
+        let Some(size) = c.size else {
+            unmeasured += 1;
+            continue;
+        };
+        let saveable = c.saveable && !c.deletable;
+        let remove = if saveable {
+            // `git worktree remove` would refuse it; this saves its work first.
+            format!("guardian disk save --delete {}", shell_path(&c.path, home))
+        } else {
+            c.remove
+                .clone()
+                .unwrap_or_else(|| format!("rm -rf {}", shell_path(&c.path, home)))
+        };
+        // The worktree a build folder is inside, if that worktree has been measured. By
+        // path, not by repository: a folder in a submodule or a nested repository belongs
+        // to that, but is on disk inside the worktree and counted in its size.
+        let inside = match c.kind {
+            // A worktree made inside another is on disk inside it too.
+            Kind::Build | Kind::Worktree => worktrees
+                .values()
+                .filter(|w| w.size.is_some() && w.path != c.path && c.path.starts_with(&w.path))
+                .map(|w| w.path.clone())
+                .max_by_key(|w| w.as_os_str().len()),
+            Kind::Cache => None,
+        };
+        let project = match c.kind {
+            Kind::Cache => None,
+            Kind::Worktree => c.repo.clone(),
+            Kind::Build => match inside.as_ref().and_then(|w| worktrees.get(w)) {
+                Some(worktree) => worktree.repo.clone(),
+                None => c
+                    .repo
+                    .clone()
+                    .or_else(|| c.path.parent().map(Path::to_path_buf)),
+            },
+        };
+        let age = age_days(c.last_touch);
+        // A build folder is as stale as the worktree around it, so the two stay together.
+        let staleness = match inside.as_ref().and_then(|w| worktrees.get(w)) {
+            Some(worktree) => Staleness::of(age_days(worktree.last_touch)),
+            None => Staleness::of(age),
+        };
+        rows.push(Row {
+            target: Target {
+                display_path: display_path(&c.path, home),
+                kind: c.kind,
+                what: c.what.clone(),
+                cost: c.cost.clone(),
+                remove,
+                safety: c.safety,
+                bytes: size.bytes,
+                freed_bytes: size.freed.min(size.bytes),
+                complete: size.complete,
+                measured_at: c.measured_at,
+                age_days: age,
+                repo: c.repo.as_deref().map(|r| display_path(r, home)),
+                branch: c.branch.clone(),
+                note: c.note.clone(),
+                deletable: c.deletable,
+                saveable,
+                path: c.path.clone(),
+            },
+            project,
+            inside,
+            staleness,
         });
     }
 
-    targets.retain(|t| t.bytes >= opts.min_bytes);
     if opts.older_than_days > 0 {
-        targets.retain(|t| {
-            t.kind == Kind::Cache || t.age_days.is_some_and(|d| d >= opts.older_than_days)
+        rows.retain(|r| {
+            r.target.kind == Kind::Cache
+                || r.target.age_days.is_some_and(|d| d >= opts.older_than_days)
         });
     }
-    targets.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+
+    let (mut bundles, alone) = bundle_stale(rows, home, opts.min_bytes);
+
+    // Everything not bundled is listed on its own, by what deleting gives back; among
+    // equals, by what is on disk.
+    let worktree_paths: Vec<&PathBuf> = worktrees.keys().copied().collect();
+    let mut targets: Vec<Target> = alone.into_iter().map(|r| r.target).collect();
+    targets.retain(|t| t.bytes >= opts.min_bytes);
+    targets.sort_by(|a, b| (b.freed_bytes, b.bytes).cmp(&(a.freed_bytes, a.bytes)));
 
     // A build folder inside a listed worktree is already part of that worktree's size.
     let listed_worktrees: HashSet<&PathBuf> = targets
@@ -834,21 +1692,29 @@ pub fn survey_home(home: &Path, opts: &Options) -> Report {
         .map(|t| &t.path)
         .collect();
     let counted_once = |t: &&Target| {
-        t.kind == Kind::Worktree
-            || !worktree_paths
-                .iter()
-                .any(|w| listed_worktrees.contains(w) && t.path.starts_with(w))
+        !worktree_paths
+            .iter()
+            .any(|w| listed_worktrees.contains(w) && t.path != **w && t.path.starts_with(w))
     };
-    let sum = |s: Safety| -> u64 {
+    let sum = |s: Safety, of: fn(&Target) -> u64| -> u64 {
         targets
             .iter()
             .filter(counted_once)
             .filter(|t| t.safety == s)
-            .map(|t| t.bytes)
+            .map(of)
             .sum()
     };
-    let (regenerates_bytes, review_bytes) = (sum(Safety::Regenerates), sum(Safety::Review));
+    let on_disk: fn(&Target) -> u64 = |t| t.bytes;
+    let freed: fn(&Target) -> u64 = |t| t.freed_bytes;
+    let bundled = |of: fn(&Bundle) -> u64| -> u64 { bundles.iter().map(of).sum() };
+    let regenerates_bytes = sum(Safety::Regenerates, on_disk) + bundled(|b| b.regenerates_bytes);
+    let review_bytes = sum(Safety::Review, on_disk) + bundled(|b| b.bytes - b.regenerates_bytes);
+    let regenerates_freed_bytes =
+        sum(Safety::Regenerates, freed) + bundled(|b| b.regenerates_freed_bytes);
+    let review_freed_bytes =
+        sum(Safety::Review, freed) + bundled(|b| b.freed_bytes - b.regenerates_freed_bytes);
     targets.truncate(opts.top.max(1));
+    bundles.truncate(opts.top.max(1));
 
     let (volume, used_percent, available_gb) =
         crate::sampler::disk::sample_volume_containing(home)
@@ -859,12 +1725,53 @@ pub fn survey_home(home: &Path, opts: &Options) -> Report {
         volume,
         used_percent,
         available_gb,
+        bundles,
         targets,
         unmeasured,
-        repos_scanned,
+        repos_scanned: index.repos_scanned,
         regenerates_bytes,
         review_bytes,
+        regenerates_freed_bytes,
+        review_freed_bytes,
+        discovery_complete: index.discovery_complete,
+        scanned_at: index.scanned_at,
+        from_cache,
+        reused: 0,
+        outdated: 0,
+        pending: index
+            .entries
+            .iter()
+            .filter(|c| c.size.map_or(true, |s| !s.complete))
+            .count(),
     }
+}
+
+/// Survey `home`, starting from the index in `index_file` and writing it back. Two scans
+/// never write at once: one that finds another already writing still scans, unless
+/// `only_as_writer`, when it returns `None` and leaves the other to it.
+fn survey_saved(home: &Path, opts: &Options, index_file: &Path, only_as_writer: bool) -> Option<Report> {
+    let lock = IndexLock::try_take(index_file);
+    if lock.is_none() && only_as_writer {
+        return None;
+    }
+    let prior = load_index(index_file, home);
+    let mut save = |index: &Index| {
+        if lock.is_some() {
+            // Best effort: a scan that cannot save is still a scan.
+            let _ = save_index(index_file, index);
+        }
+    };
+    let (report, index) = survey_with(home, opts, prior, &mut save);
+    save(&index);
+    Some(report)
+}
+
+/// The last saved scan of `home`, without looking at the disk beyond checking that each
+/// place still exists. `None` when there is no saved scan.
+fn cached_at(home: &Path, opts: &Options, index_file: &Path) -> Option<Report> {
+    let mut index = load_index(index_file, home)?;
+    index.entries.retain(|c| is_real_dir(&c.path));
+    Some(report_from(home, opts, &index, true))
 }
 
 /// `(used percent, GB available)` on the volume holding `home`.
@@ -872,29 +1779,74 @@ pub fn volume_usage(home: &Path) -> Option<(f64, f64)> {
     crate::sampler::disk::sample_volume_containing(home).map(|(_, _, avail, used)| (used, avail))
 }
 
-/// Survey the current user's home directory at throttled I/O priority.
+/// Survey the current user's home directory at throttled I/O priority, measuring only what
+/// the saved index has no current size for, and save what was learned.
 pub fn survey(opts: &Options) -> Option<Report> {
     let home = dirs::home_dir()?;
     throttle_io();
-    Some(survey_home(&home, opts))
+    survey_saved(&home, opts, &index_path(), false)
+}
+
+/// What a background refresh did.
+pub enum Refresh {
+    Done(Report),
+    /// Another scan was already running; nothing was done.
+    Busy,
+}
+
+/// Bring the saved index up to date. For running unattended: gives way to a scan that is
+/// already under way.
+pub fn refresh(opts: &Options) -> Option<Refresh> {
+    let home = dirs::home_dir()?;
+    throttle_io();
+    Some(match survey_saved(&home, opts, &index_path(), true) {
+        Some(report) => Refresh::Done(report),
+        None => Refresh::Busy,
+    })
+}
+
+/// The last saved scan, at once and without scanning. `None` when nothing has been saved.
+pub fn cached(opts: &Options) -> Option<Report> {
+    cached_at(&dirs::home_dir()?, opts, &index_path())
 }
 
 impl Target {
+    /// What deleting it would free, as text; `+` marks a lower bound.
     pub fn size_text(&self) -> String {
         if self.complete {
-            human_size(self.bytes)
+            human_size(self.freed_bytes)
         } else {
-            format!("{}+", human_size(self.bytes))
+            format!("{}+", human_size(self.freed_bytes))
         }
+    }
+
+    /// Said when a good part of what it occupies would not come back: its files are clones
+    /// of files elsewhere (a bun or pnpm install and the cache it came from), are held by a
+    /// snapshot, or have other names outside it.
+    pub fn shared_text(&self) -> Option<String> {
+        let shared = self.bytes.saturating_sub(self.freed_bytes);
+        if shared < (self.bytes / 10).max(10 * 1024 * 1024) {
+            return None;
+        }
+        Some(format!(
+            "{} in size, of which {} is shared with other copies and freed only when they go too",
+            human_size(self.bytes),
+            human_size(shared)
+        ))
     }
 
     /// "untouched 34 days", or nothing for tool caches.
     pub fn age_text(&self) -> Option<String> {
         let days = self.age_days?;
-        Some(match days {
-            0 => "used today".to_string(),
-            1 => "untouched 1 day".to_string(),
-            n => format!("untouched {n} days"),
+        // A cache's date is when its top level last changed, which is not when it was
+        // last read.
+        Some(match (self.kind, days) {
+            (Kind::Cache, 0) => "added to today".to_string(),
+            (Kind::Cache, 1) => "nothing new for 1 day".to_string(),
+            (Kind::Cache, n) => format!("nothing new for {n} days"),
+            (_, 0) => "used today".to_string(),
+            (_, 1) => "untouched 1 day".to_string(),
+            (_, n) => format!("untouched {n} days"),
         })
     }
 
@@ -916,15 +1868,57 @@ impl Target {
         if let Some(note) = &self.note {
             details.push(note.clone());
         }
-        if details.is_empty() {
+        if self.note.is_none() && (details.is_empty() || self.kind == Kind::Cache) {
             details.push(self.cost.clone());
         }
         line.push_str(&format!("\n             {}", details.join("; ")));
+        if let Some(shared) = self.shared_text() {
+            line.push_str(&format!("\n             {shared}"));
+        }
         line
     }
 }
 
+impl Bundle {
+    /// "untouched 35 to 56 days"; for tool caches, "nothing new for 35 to 56 days".
+    pub fn ages_text(&self) -> String {
+        let lead = if self.is_project { "untouched" } else { "nothing new for" };
+        if self.oldest_days == self.newest_days {
+            format!("{lead} {} days", self.oldest_days)
+        } else {
+            format!("{lead} {} to {} days", self.newest_days, self.oldest_days)
+        }
+    }
+
+    /// How stale it is, how much of it can go without a look, and what is held back.
+    pub fn detail_text(&self) -> String {
+        let held_freed = human_size(self.freed_bytes.saturating_sub(self.deletable_freed_bytes));
+        let now = match self.delete_paths.len() {
+            0 => "nothing in it can be deleted now".to_string(),
+            1 => "1 folder can be deleted now".to_string(),
+            n => format!("{n} folders can be deleted now"),
+        };
+        let held = match self.held_back {
+            0 => String::new(),
+            1 => format!("; 1 more ({held_freed}) needs a look or its own command"),
+            n => format!("; {n} more ({held_freed}) need a look or their own command"),
+        };
+        let saveable = match self.save_paths.len() {
+            0 => String::new(),
+            1 => "; 1 of those holds unsaved work that can be committed and pushed first".to_string(),
+            n => format!("; {n} of those hold unsaved work that can be committed and pushed first"),
+        };
+        format!("{}; {now}{held}{saveable}", self.ages_text())
+    }
+}
+
 impl Report {
+    /// True when another scan would find or measure more: places are pending, or the
+    /// search for repositories was cut short.
+    pub fn work_left(&self) -> bool {
+        self.pending > 0 || !self.discovery_complete
+    }
+
     pub fn render(&self) -> String {
         let mut out = format!(
             "Disk: {:.1}% used, {:.1} GB free on {}\nScanned {} git repositor{} and the usual tool caches.\n\n",
@@ -934,10 +1928,50 @@ impl Report {
             self.repos_scanned,
             if self.repos_scanned == 1 { "y" } else { "ies" }
         );
-        if self.targets.is_empty() {
+        if self.from_cache {
+            out.push_str(&format!(
+                "From the scan saved {}; `guardian disk` without --cached brings it up to date.\n\n",
+                ago_text(unix_now().saturating_sub(self.scanned_at))
+            ));
+        }
+        if self.targets.is_empty() && self.bundles.is_empty() {
             out.push_str("Nothing large enough to list was found.\n");
         } else {
-            out.push_str("Largest first. This listing deletes nothing; `guardian disk clean` offers to.\n\n");
+            out.push_str("Stale things first, bundled by project; then the rest, largest first. Sizes are what deleting would free; a bundle's is what can be deleted now. This listing deletes nothing; `guardian disk clean` offers to.\n\n");
+        }
+        let mut heading = None;
+        for b in &self.bundles {
+            if heading != Some(b.staleness) {
+                if heading.is_some() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("{}\n", b.staleness.heading()));
+                heading = Some(b.staleness);
+            }
+            out.push_str(&format!(
+                "  {:>9}  {}: {}\n             {}\n",
+                human_size(b.deletable_freed_bytes),
+                b.name,
+                b.contents,
+                b.detail_text()
+            ));
+            for m in b.members.iter().take(3) {
+                out.push_str(&format!(
+                    "             {:>9}  {} ({})\n",
+                    m.size_text(),
+                    m.what,
+                    m.display_path
+                ));
+            }
+            if b.members.len() > 3 {
+                out.push_str(&format!("                        and {} more\n", b.members.len() - 3));
+            }
+            if !b.delete_paths.is_empty() {
+                out.push_str("             $ guardian disk clean    (offers this bundle as one choice)\n");
+            }
+        }
+        if heading.is_some() {
+            out.push('\n');
         }
         for (label, safety) in [
             ("Comes back on its own", Safety::Regenerates),
@@ -961,18 +1995,36 @@ impl Report {
         if self.regenerates_bytes + self.review_bytes > 0 {
             out.push_str(&format!(
                 "Found: {} that comes back on its own, {} to look at first.\n",
-                human_size(self.regenerates_bytes),
-                human_size(self.review_bytes)
+                human_size(self.regenerates_freed_bytes),
+                human_size(self.review_freed_bytes)
             ));
         }
-        if self.targets.iter().any(|t| !t.complete) {
+        let shared = (self.regenerates_bytes + self.review_bytes)
+            .saturating_sub(self.regenerates_freed_bytes + self.review_freed_bytes);
+        if shared >= 100 * 1024 * 1024 {
+            out.push_str(&format!(
+                "Folder sizes add up to {} more than that: those files are shared between copies (cloned dependency folders and the cache they came from) and are freed only when every copy is deleted.\n",
+                human_size(shared)
+            ));
+        }
+        let listed = self.targets.iter().chain(self.bundles.iter().flat_map(|b| &b.members));
+        if listed.into_iter().any(|t| !t.complete) {
             out.push_str("Sizes ending in + ran out of time and are lower bounds.\n");
         }
         if self.unmeasured > 0 {
             out.push_str(&format!(
-                "{} more recently used places were not measured in time (oldest are measured first); rerun with --seconds 120 for all of them.\n",
+                "{} more recently used places were not measured in time (oldest are measured first); run it again to carry on from here, or give it longer with --seconds 120.\n",
                 self.unmeasured
             ));
+        }
+        if self.outdated > 0 {
+            out.push_str(&format!(
+                "{} sizes are from an earlier scan and were not measured again in time; run it again to carry on.\n",
+                self.outdated
+            ));
+        }
+        if !self.discovery_complete {
+            out.push_str("The search for repositories ran out of time, so there may be more to find; give it longer with --seconds 120.\n");
         }
         out
     }
@@ -1059,8 +2111,27 @@ fn plan_delete(path: &Path, home: &Path) -> Result<Plan, String> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
         return Err("not a path Guardian recognizes".to_string());
     };
-    if classify_project_dir(parent, name).is_none() {
+    let Some((_, _, safety)) = classify_project_dir(parent, name) else {
         return Err("it is not a build folder, dependency folder, worktree or cache Guardian knows".to_string());
+    };
+    // A dependency cloned for editing is a checkout of its own, with work in it. A folder
+    // that needs a look (a virtual environment) is searched well down; one that comes back
+    // on its own, at its top levels, where such a clone sits (`node_modules/pkg`).
+    let found = if safety == Safety::Review {
+        nested_checkout(path, 6, true)
+    } else {
+        nested_checkout(path, 2, false)
+    };
+    match found {
+        Nested::None => {}
+        Nested::Checkout(inner) if inner == path => {}
+        Nested::Checkout(inner) => {
+            return Err(format!(
+                "{} inside it is a git checkout of its own",
+                inner.strip_prefix(path).unwrap_or(&inner).display()
+            ))
+        }
+        Nested::TooLarge => return Err("it is too large to check for git checkouts inside it".to_string()),
     }
     // Never delete anything git tracks: that is source, whatever the folder is called.
     // Whether the folder is in a checkout is read from disk, not asked of git: a git that
@@ -1087,7 +2158,9 @@ pub fn why_not_deletable(path: &Path, home: &Path) -> Option<String> {
 pub fn delete_target(path: &Path, home: &Path) -> Result<Deleted, String> {
     // Refuse early, before spending time measuring something that will not be deleted.
     plan_delete(path, home)?;
-    let (freed_bytes, _) = dir_size(path, Instant::now() + Duration::from_secs(20), &HashMap::new());
+    // What the delete will give back, not what the folder occupies: clones of files kept
+    // elsewhere free nothing.
+    let freed_bytes = dir_size(path, Instant::now() + Duration::from_secs(20), &HashMap::new()).freed;
     // Measuring can take a while, so the checks are run again and the delete follows at once.
     match plan_delete(path, home)? {
         Plan::Directory { real } => fs::remove_dir_all(real).map_err(|e| e.to_string())?,
@@ -1109,18 +2182,16 @@ pub fn delete_target(path: &Path, home: &Path) -> Result<Deleted, String> {
     })
 }
 
-/// Parse an answer to "delete which?": item numbers (`1 3 5`, `2,4`, `1-3`), or `old`.
+/// Parse an answer to "delete which?" about a numbered list of `count` choices: numbers
+/// (`1 3 5`, `2,4`, `1-3`), or `old` for the choices at the indices in `old`.
 /// `Ok(None)` means nothing was chosen.
-pub fn parse_selection(input: &str, targets: &[Target]) -> Result<Option<Vec<usize>>, String> {
+pub fn parse_selection(input: &str, count: usize, old: &[usize]) -> Result<Option<Vec<usize>>, String> {
     let input = input.trim().to_lowercase();
     if input.is_empty() || input == "n" || input == "no" || input == "q" {
         return Ok(None);
     }
     if input == "old" {
-        let picked: Vec<usize> = (0..targets.len())
-            .filter(|i| targets[*i].is_old_and_safe())
-            .collect();
-        return Ok((!picked.is_empty()).then_some(picked));
+        return Ok((!old.is_empty()).then(|| old.to_vec()));
     }
     let mut picked = Vec::new();
     for part in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()) {
@@ -1131,8 +2202,8 @@ pub fn parse_selection(input: &str, targets: &[Target]) -> Result<Option<Vec<usi
         let parse = |s: &str| {
             s.parse::<usize>()
                 .ok()
-                .filter(|n| (1..=targets.len()).contains(n))
-                .ok_or_else(|| format!("`{part}` is not a number from 1 to {}", targets.len()))
+                .filter(|n| (1..=count).contains(n))
+                .ok_or_else(|| format!("`{part}` is not a number from 1 to {count}"))
         };
         let (from, to) = (parse(from)?, parse(to)?);
         if from > to {
@@ -1155,6 +2226,14 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Self {
+            // The code under test runs git as the process finds it. Without this it would
+            // read the developer's own git configuration (global ignores, signing, URL
+            // rewrites, hooks) and the tests would pass or fail by what is in it.
+            static NO_HOST_GIT_CONFIG: std::sync::Once = std::sync::Once::new();
+            NO_HOST_GIT_CONFIG.call_once(|| {
+                std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+                std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+            });
             let dir = std::env::temp_dir().join(format!("guardian-disk-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
@@ -1193,6 +2272,66 @@ mod tests {
             );
         }
 
+        /// Make `rel` look last changed `days` ago: the folder and what is directly in it.
+        fn age(&self, rel: &str, days: u64) {
+            let when = SystemTime::now() - Duration::from_secs(days * 86_400 + 3_600);
+            let dir = self.path(rel);
+            let set = |path: &Path| {
+                if fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
+                    fs::File::open(path).unwrap().set_modified(when).unwrap();
+                }
+            };
+            if dir.is_dir() {
+                for entry in fs::read_dir(&dir).unwrap().flatten() {
+                    set(&entry.path());
+                }
+            }
+            set(&dir);
+        }
+
+        /// Make the checkout at `rel` look last worked in `days` ago. `git_dir` is its git
+        /// directory, relative to the scratch home: `<rel>/.git`, or for a linked worktree
+        /// `<main>/.git/worktrees/<name>`.
+        fn age_checkout(&self, rel: &str, git_dir: &str, days: u64) {
+            self.age(&format!("{git_dir}/logs"), days);
+            self.age(git_dir, days);
+            self.age(rel, days);
+        }
+
+        /// A repository at `rel` with one commit, pushed to a bare repository beside it that
+        /// stands in for its remote (`origin`). Its identity, signing and hooks are set in
+        /// the repository itself, so saving there does not depend on this machine's git
+        /// configuration, and nothing ever leaves the scratch folder.
+        fn repo_with_remote(&self, rel: &str) -> PathBuf {
+            self.repo(rel);
+            let remote = format!("{rel}-remote.git");
+            self.git(&remote, &["init", "-q", "--bare"]);
+            let no_hooks = self.path(".no-hooks");
+            for (key, value) in [
+                ("user.name", "t"),
+                ("user.email", "t@example.invalid"),
+                ("commit.gpgsign", "false"),
+                ("core.hooksPath", no_hooks.to_str().unwrap()),
+            ] {
+                self.git(rel, &["config", key, value]);
+            }
+            let remote = self.path(&remote);
+            self.git(rel, &["remote", "add", "origin", remote.to_str().unwrap()]);
+            self.git(rel, &["push", "-q", "-u", "origin", "main"]);
+            remote
+        }
+
+        /// What `rev` names in the repository or worktree at `dir`; empty if nothing.
+        fn rev(&self, dir: &Path, rev: &str) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["rev-parse", "-q", "--verify", rev])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
         /// A repository at `rel` with one commit.
         fn repo(&self, rel: &str) {
             self.git(rel, &["init", "-q"]);
@@ -1212,7 +2351,7 @@ mod tests {
         Instant::now() + Duration::from_secs(30)
     }
 
-    fn none() -> HashMap<PathBuf, (u64, bool)> {
+    fn none() -> HashMap<PathBuf, Size> {
         HashMap::new()
     }
 
@@ -1239,14 +2378,18 @@ mod tests {
         let s = Scratch::new("size");
         s.file("a/one.bin", 200_000);
         s.file("a/b/two.bin", 300_000);
-        let (bytes, complete) = dir_size(&s.0, far(), &none());
+        let Size { bytes, freed, complete } = settled(&s.0, |size| size.freed == size.bytes);
         assert!(complete);
+        assert_eq!(freed, bytes, "nothing here is shared");
         assert!((500_000..2_000_000).contains(&bytes), "{bytes}");
     }
 
     #[test]
     fn missing_path_is_zero() {
-        assert_eq!(dir_size(Path::new("/nonexistent/guardian/xyz"), far(), &none()), (0, true));
+        assert_eq!(
+            dir_size(Path::new("/nonexistent/guardian/xyz"), far(), &none()),
+            Size { bytes: 0, freed: 0, complete: true }
+        );
     }
 
     #[test]
@@ -1255,7 +2398,7 @@ mod tests {
         s.file("big/data.bin", 1_000_000);
         s.file("small/note.txt", 10);
         std::os::unix::fs::symlink(s.path("big"), s.path("small/link")).unwrap();
-        let (bytes, _) = dir_size(&s.path("small"), far(), &none());
+        let bytes = dir_size(&s.path("small"), far(), &none()).bytes;
         assert!(bytes < 500_000, "{bytes}");
     }
 
@@ -1265,9 +2408,10 @@ mod tests {
         s.file("wt/src/a.rs", 1_000);
         s.file("wt/node_modules/dep/x.js", 500_000);
         let mut known = none();
-        known.insert(s.path("wt/node_modules"), (7_000_000, false));
-        let (bytes, complete) = dir_size(&s.path("wt"), far(), &known);
+        known.insert(s.path("wt/node_modules"), Size { bytes: 7_000_000, freed: 3_000_000, complete: false });
+        let Size { bytes, freed, complete } = dir_size(&s.path("wt"), far(), &known);
         assert!((7_000_000..7_200_000).contains(&bytes), "{bytes}");
+        assert!((3_000_000..3_200_000).contains(&freed), "{freed}");
         assert!(!complete, "an incomplete inner size makes the outer one a lower bound");
     }
 
@@ -1330,10 +2474,11 @@ mod tests {
         assert_eq!(npm.remove, "npm cache clean --force");
         assert_eq!(npm.safety, Safety::Regenerates);
         assert!(!npm.deletable, "npm has its own cleaner; Guardian does not delete it");
-        assert_eq!(npm.age_days, None);
+        assert_eq!(npm.age_text().as_deref(), Some("added to today"));
         let ollama = find(&report, "~/.ollama/models");
         assert_eq!(ollama.safety, Safety::Review);
         assert!(!ollama.deletable);
+        assert_eq!(ollama.age_days, None, "a model is not stale for having been downloaded long ago");
         let playwright = find(&report, "~/Library/Caches/ms-playwright");
         assert!(playwright.deletable);
         assert!(report.regenerates_bytes >= 450_000);
@@ -1425,6 +2570,8 @@ mod tests {
         let dirty = find(&report, "~/code/app-wt-dirty");
         assert_eq!(dirty.safety, Safety::Review);
         assert!(!dirty.deletable);
+        assert!(dirty.saveable, "its unsaved work can be committed and pushed");
+        assert!(!clean.saveable, "nothing to save in a clean one");
         assert_eq!(dirty.note.as_deref(), Some("1 uncommitted or untracked file"));
 
         // The node_modules inside the listed worktree is not counted a second time.
@@ -1636,36 +2783,45 @@ mod tests {
             remove: "r".to_string(),
             safety,
             bytes: 1,
+            freed_bytes: 1,
             complete: true,
+            measured_at: None,
             age_days: age,
             repo: None,
             branch: None,
             note: None,
             deletable,
+            saveable: false,
         }
     }
 
     #[test]
     fn selection_parsing() {
-        let items = vec![
-            target(Some(40), Safety::Regenerates, Kind::Build, true),
-            target(Some(2), Safety::Regenerates, Kind::Build, true),
-            target(Some(90), Safety::Review, Kind::Worktree, true),
-            target(Some(30), Safety::Regenerates, Kind::Worktree, true),
-            target(None, Safety::Regenerates, Kind::Cache, true),
-        ];
-        assert_eq!(parse_selection("", &items), Ok(None));
-        assert_eq!(parse_selection("  n ", &items), Ok(None));
-        assert_eq!(parse_selection("1 3", &items), Ok(Some(vec![0, 2])));
-        assert_eq!(parse_selection("3,1,1", &items), Ok(Some(vec![0, 2])));
-        assert_eq!(parse_selection("2-4", &items), Ok(Some(vec![1, 2, 3])));
-        // `old`: comes back on its own, untouched two weeks, not a shared tool cache.
-        assert_eq!(parse_selection("OLD", &items), Ok(Some(vec![0, 3])));
-        assert!(parse_selection("0", &items).is_err());
-        assert!(parse_selection("6", &items).is_err());
-        assert!(parse_selection("4-2", &items).is_err());
-        assert!(parse_selection("all", &items).is_err());
-        assert!(parse_selection("y", &items).is_err(), "a stray yes selects nothing");
+        // Five choices; the first and fourth are what `old` stands for.
+        let pick = |input: &str| parse_selection(input, 5, &[0, 3]);
+        assert_eq!(pick(""), Ok(None));
+        assert_eq!(pick("  n "), Ok(None));
+        assert_eq!(pick("1 3"), Ok(Some(vec![0, 2])));
+        assert_eq!(pick("3,1,1"), Ok(Some(vec![0, 2])));
+        assert_eq!(pick("2-4"), Ok(Some(vec![1, 2, 3])));
+        assert_eq!(pick("OLD"), Ok(Some(vec![0, 3])));
+        assert_eq!(parse_selection("old", 5, &[]), Ok(None), "nothing old to pick");
+        assert!(pick("0").is_err());
+        assert!(pick("6").is_err());
+        assert!(pick("4-2").is_err());
+        assert!(pick("all").is_err());
+        assert!(pick("y").is_err(), "a stray yes selects nothing");
+    }
+
+    #[test]
+    fn old_and_safe_is_two_weeks_untouched_and_not_a_shared_cache() {
+        let old = |age, safety, kind, deletable| target(age, safety, kind, deletable).is_old_and_safe();
+        assert!(old(Some(40), Safety::Regenerates, Kind::Build, true));
+        assert!(old(Some(30), Safety::Regenerates, Kind::Worktree, true));
+        assert!(!old(Some(2), Safety::Regenerates, Kind::Build, true));
+        assert!(!old(Some(90), Safety::Review, Kind::Worktree, true));
+        assert!(!old(Some(90), Safety::Regenerates, Kind::Build, false));
+        assert!(!old(Some(90), Safety::Regenerates, Kind::Cache, true));
     }
 
     // --- text ---
@@ -1683,6 +2839,8 @@ mod tests {
             "\"$HOME/we\\$ird\\\"dir\""
         );
         assert_eq!(shell_path(Path::new("/opt/x y"), home), "\"/opt/x y\"");
+        assert_eq!(shell_path(Path::new("/Users/me/a!b/it's"), home), "\"$HOME\"/'a!b/it'\\''s'");
+        assert_eq!(shell_path(Path::new("/opt/x!y"), home), "'/opt/x!y'");
         assert_eq!(display_path(Path::new("/Users/me/a b"), home), "~/a b");
         assert_eq!(display_path(Path::new("/opt/x"), home), "/opt/x");
     }
@@ -1712,5 +2870,1041 @@ mod tests {
         assert!(text.contains("$ npm cache clean --force"), "{text}");
         assert!(text.contains("to empty trash"), "{text}");
         assert!(text.contains("used today"), "{text}");
+    }
+
+    // --- saving unsaved work before a worktree goes ---
+
+    #[test]
+    fn saving_commits_and_pushes_and_then_the_worktree_can_go() {
+        let s = Scratch::new("save");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/src/new.rs", 100);
+        fs::write(wt.join("README.md"), "changed\n").unwrap();
+        assert!(why_not_deletable(&wt, &s.0).unwrap().contains("2 uncommitted or untracked files"));
+
+        // Planning says what would happen and changes nothing.
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.new_branch), ("feature", false));
+        assert_eq!((plan.remote.as_str(), plan.remote_branch.as_str()), ("origin", "feature"));
+        assert!(!plan.beside && !plan.up_to_date, "not on the remote yet: it goes up under its own name");
+        assert_eq!(plan.files, vec!["README.md", "src/new.rs"]);
+        assert!(why_not_deletable(&wt, &s.0).is_some());
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), "", "nothing pushed yet");
+
+        let saved = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!((saved.branch.as_str(), saved.committed_files, saved.pushed_to.as_str()), ("feature", 2, "origin/feature"));
+        let head = s.rev(&wt, "HEAD");
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), head, "the remote has the commit");
+        assert!(!head.is_empty());
+        let subject = git(&wt, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject.trim(), save::COMMIT_MESSAGE);
+
+        // Saved, so it may be deleted, and the work outlives it.
+        assert_eq!(why_not_deletable(&wt, &s.0), None);
+        delete_target(&wt, &s.0).unwrap();
+        assert!(!wt.exists());
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), head);
+
+        // Saving again where nothing is uncommitted just makes sure the branch is pushed.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "tidy", "../app-wt-tidy"]);
+        let saved = save_worktree(&s.path("code/app-wt-tidy"), &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!((saved.committed_files, saved.pushed_to.as_str()), (0, "origin/tidy"));
+        assert_eq!(s.rev(&remote, "refs/heads/tidy"), s.rev(&s.path("code/app-wt-tidy"), "HEAD"));
+        // And once the remote has it, there is nothing left to do.
+        assert!(plan_save(&s.path("code/app-wt-tidy"), &s.0).unwrap().up_to_date);
+        let again = save_worktree(&s.path("code/app-wt-tidy"), &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!((again.committed_files, again.pushed_to.as_str()), (0, "origin/tidy"));
+    }
+
+    #[test]
+    fn saving_never_pushes_onto_the_branch_it_was_started_from() {
+        let s = Scratch::new("save-upstream");
+        let remote = s.repo_with_remote("code/app");
+        let main_before = s.rev(&remote, "refs/heads/main");
+        // Started from origin/main, so git records origin/main as what it follows: the
+        // usual way an agent's worktree is made.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "mine", "../app-wt", "origin/main"]);
+        let wt = s.path("code/app-wt");
+        assert_eq!(git(&wt, &["config", "--get", "branch.mine.merge"]).unwrap().trim(), "refs/heads/main");
+        s.file("code/app-wt/notes.txt", 10);
+
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.remote_branch.as_str(), plan.new_branch), ("mine", "mine", false));
+        assert!(!plan.beside, "there is no origin/mine yet");
+        let saved = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!(saved.pushed_to, "origin/mine");
+        assert_eq!(s.rev(&remote, "refs/heads/mine"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&remote, "refs/heads/main"), main_before, "main is untouched");
+        assert_eq!(
+            git(&wt, &["config", "--get", "branch.mine.merge"]).unwrap().trim(),
+            "refs/heads/main",
+            "what it follows is left as it was set"
+        );
+
+        // origin/mine is now a branch on the remote, as a pull request's is. More work is
+        // not added to it: it goes beside it, and a later save beside that.
+        let pushed = s.rev(&remote, "refs/heads/mine");
+        s.file("code/app-wt/more.txt", 10);
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert!(plan.beside);
+        assert_eq!(plan.remote_branch, "guardian-save/mine");
+        assert_eq!(save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap().pushed_to, "origin/guardian-save/mine");
+        assert_eq!(s.rev(&remote, "refs/heads/guardian-save/mine"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&remote, "refs/heads/mine"), pushed, "the branch on the remote is as it was");
+        assert_eq!(s.rev(&remote, "refs/heads/main"), main_before);
+        s.file("code/app-wt/even-more.txt", 10);
+        assert_eq!(plan_save(&wt, &s.0).unwrap().remote_branch, "guardian-save/mine-2");
+    }
+
+    #[test]
+    fn a_fork_is_pushed_to_and_not_the_repository_it_follows() {
+        let s = Scratch::new("save-fork");
+        let upstream = s.repo_with_remote("code/app");
+        // `origin` stands for the original; the user's fork is where pushes go.
+        s.git("code/fork.git", &["init", "-q", "--bare"]);
+        let fork = s.path("code/fork.git");
+        s.git("code/app", &["remote", "add", "fork", fork.to_str().unwrap()]);
+        s.git("code/app", &["config", "remote.pushDefault", "fork"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feat", "../app-wt", "origin/main"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/x.txt", 10);
+        assert_eq!(plan_save(&wt, &s.0).unwrap().remote, "fork");
+        let saved = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!(saved.pushed_to, "fork/feat");
+        assert_eq!(s.rev(&fork, "refs/heads/feat"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&upstream, "refs/heads/feat"), "", "nothing went to the original");
+    }
+
+    #[test]
+    fn work_on_a_shared_branch_is_saved_on_a_branch_of_its_own() {
+        let s = Scratch::new("save-shared");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["branch", "develop"]);
+        s.git("code/app", &["push", "-q", "-u", "origin", "develop"]);
+        let develop_before = s.rev(&remote, "refs/heads/develop");
+        s.git("code/app", &["worktree", "add", "-q", "../app-wt", "develop"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/hotfix.txt", 10);
+
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.new_branch), ("guardian-save/app-wt", true));
+        assert_eq!(plan.from_branch.as_deref(), Some("develop"));
+        let saved = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!(saved.pushed_to, "origin/guardian-save/app-wt");
+        assert_eq!(s.rev(&remote, "refs/heads/guardian-save/app-wt"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&remote, "refs/heads/develop"), develop_before, "develop is untouched");
+        assert_eq!(s.rev(&s.path("code/app"), "refs/heads/develop"), develop_before, "here too");
+        assert_eq!(why_not_deletable(&wt, &s.0), None);
+    }
+
+    #[test]
+    fn saving_a_detached_head_gives_its_commits_a_branch() {
+        let s = Scratch::new("save-detached");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "--detach", "../app wt"]);
+        let wt = s.path("code/app wt");
+        s.file("code/app wt/idea.txt", 10);
+        s.git("code/app wt", &["add", "idea.txt"]);
+        s.git("code/app wt", &["commit", "-q", "-m", "an idea"]);
+        let report = survey_home(&s.0, &small_floor());
+        let listed = find(&report, "~/code/app wt");
+        assert!(listed.note.as_deref().unwrap().contains("only here (detached HEAD)"), "{:?}", listed.note);
+        assert!(listed.saveable && !listed.deletable);
+
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.new_branch), ("guardian-save/app-wt", true));
+        assert!(plan.files.is_empty());
+        let saved = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap();
+        assert_eq!(saved.pushed_to, "origin/guardian-save/app-wt");
+        assert_eq!(s.rev(&remote, "refs/heads/guardian-save/app-wt"), s.rev(&wt, "HEAD"));
+        assert_eq!(why_not_deletable(&wt, &s.0), None);
+    }
+
+    #[test]
+    fn saving_refuses_what_a_plain_commit_would_get_wrong() {
+        let s = Scratch::new("save-refuse");
+        s.repo_with_remote("code/app");
+        let refused = |rel: &str| plan_save(&s.path(rel), &s.0).expect_err(rel);
+
+        assert!(refused("code/app").contains("not a linked git worktree"));
+
+        // A new file that looks like credentials would be published by a push.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "a", "../wt-secret"]);
+        s.file("code/wt-secret/.env.example", 10);
+        assert!(plan_save(&s.path("code/wt-secret"), &s.0).is_ok(), "a template is fine");
+        s.file("code/wt-secret/.env", 10);
+        s.file("code/wt-secret/deploy/server.pem", 10);
+        let why = refused("code/wt-secret");
+        assert!(why.contains(".env") && why.contains("deploy/server.pem") && why.contains("credentials"), "{why}");
+        let before = s.rev(&s.path("code/wt-secret"), "HEAD");
+        assert!(save_worktree(&s.path("code/wt-secret"), &s.0, &SaveOptions::default()).is_err());
+        assert_eq!(s.rev(&s.path("code/wt-secret"), "HEAD"), before, "nothing was committed");
+        assert!(why_not_deletable(&s.path("code/wt-secret"), &s.0).is_some(), "and it is still kept");
+
+        // A merge under way: committing would conclude it.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "b", "../wt-merging"]);
+        s.file("code/app/.git/worktrees/wt-merging/MERGE_HEAD", 41);
+        assert!(refused("code/wt-merging").contains("under way"));
+
+        // A repository inside it would be committed as a pointer, without its contents.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "c", "../wt-nested"]);
+        s.repo("code/wt-nested/vendor/lib");
+        assert!(refused("code/wt-nested").contains("git repository of its own"));
+
+        // Files hidden from status would be left out of the commit.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "d", "../wt-hidden"]);
+        s.git("code/wt-hidden", &["update-index", "--skip-worktree", "README.md"]);
+        assert!(refused("code/wt-hidden").contains("hidden from git status"));
+
+        // A dependency folder nobody told git to ignore is not work in progress.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "f", "../wt-deps"]);
+        s.file("code/wt-deps/web/package.json", 2);
+        s.file("code/wt-deps/web/node_modules/dep/index.js", 10);
+        let why = refused("code/wt-deps");
+        assert!(why.contains("web/node_modules is not ignored by git"), "{why}");
+
+        // A key in a file with an ordinary name.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "g", "../wt-key"]);
+        let key = ["-----BEGIN RSA ", "PRIVATE KEY-----\nMIIE\n"].concat();
+        fs::write(s.path("code/wt-key/notes.txt"), key).unwrap();
+        assert!(refused("code/wt-key").contains("notes.txt looks like credentials"));
+
+        // Staging a file does not make it safe to publish: the same checks apply.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "h", "../wt-staged"]);
+        s.file("code/wt-staged/.env", 10);
+        s.git("code/wt-staged", &["add", "-f", ".env"]);
+        assert!(refused("code/wt-staged").contains(".env looks like credentials"));
+
+        // Nor is an edit to a file git already has, if the edit adds a key.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "i", "../wt-edited"]);
+        let token = ["token = \"ghp", "_0123456789abcdefghijklmnopqrstuvwxyz\"\n"].concat();
+        fs::write(s.path("code/wt-edited/README.md"), token).unwrap();
+        assert!(refused("code/wt-edited").contains("README.md looks like credentials"));
+
+        // A push setting that points somewhere other than a remote of the repository.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "j", "../wt-elsewhere"]);
+        s.git("code/app", &["config", "branch.j.pushRemote", "https://example.invalid/elsewhere.git"]);
+        s.file("code/wt-elsewhere/x.txt", 10);
+        let why = refused("code/wt-elsewhere");
+        assert!(why.contains("pushRemote") && why.contains("push it yourself"), "{why}");
+
+        // Nowhere to push to.
+        s.repo("code/lonely");
+        s.git("code/lonely", &["worktree", "add", "-q", "-b", "e", "../wt-lonely"]);
+        s.file("code/wt-lonely/x.txt", 10);
+        assert!(refused("code/wt-lonely").contains("no remote"));
+
+        // Outside the home folder.
+        assert!(plan_save(Path::new("/tmp"), &s.0).is_err());
+    }
+
+    #[test]
+    fn a_push_that_fails_keeps_the_commit_and_says_so() {
+        let s = Scratch::new("save-nopush");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/work.txt", 10);
+        // The remote answers, and refuses the push.
+        let hook = remote.join("hooks/pre-receive");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\necho 'pushes are closed' >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let why = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap_err();
+        assert!(why.contains("is committed to branch feature, which stays in the repository"), "{why}");
+        assert!(why.contains("the push to origin did not go through"), "{why}");
+        let subject = git(&wt, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject.trim(), save::COMMIT_MESSAGE, "the work is in a commit, on its branch");
+        assert!(wt.join("work.txt").exists());
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), "", "and nothing reached the remote");
+
+        // A remote that cannot be reached at all is found out before anything is committed.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "other", "../app-wt-2"]);
+        s.file("code/app-wt-2/work.txt", 10);
+        fs::remove_dir_all(&remote).unwrap();
+        let before = s.rev(&s.path("code/app-wt-2"), "HEAD");
+        let why = save_worktree(&s.path("code/app-wt-2"), &s.0, &SaveOptions::default()).unwrap_err();
+        assert!(why.contains("could not be reached"), "{why}");
+        assert_eq!(s.rev(&s.path("code/app-wt-2"), "HEAD"), before);
+    }
+
+    #[test]
+    fn a_save_commits_what_was_shown_or_nothing() {
+        let s = Scratch::new("save-id");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/shown.txt", 10);
+        let shown = plan_save(&wt, &s.0).unwrap();
+        assert_eq!(plan_save(&wt, &s.0).unwrap().id, shown.id, "the same plan has the same id");
+
+        // Something appears between being asked and saying yes.
+        s.file("code/app-wt/appeared.txt", 10);
+        let agreed = SaveOptions { expected_id: Some(shown.id.clone()), ..SaveOptions::default() };
+        let why = save_worktree(&wt, &s.0, &agreed).unwrap_err();
+        assert!(why.contains("changed since you were asked"), "{why}");
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), "");
+        assert!(why_not_deletable(&wt, &s.0).is_some(), "nothing was committed");
+
+        fs::remove_file(wt.join("appeared.txt")).unwrap();
+        assert_eq!(plan_save(&wt, &s.0).unwrap().id, shown.id, "back as it was shown");
+
+        // The same files, but one of them edited since.
+        fs::write(wt.join("shown.txt"), "something else entirely\n").unwrap();
+        let why = save_worktree(&wt, &s.0, &agreed).unwrap_err();
+        assert!(why.contains("changed since you were asked"), "{why}");
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), "");
+
+        let agreed = SaveOptions { expected_id: Some(plan_save(&wt, &s.0).unwrap().id), ..SaveOptions::default() };
+        assert!(save_worktree(&wt, &s.0, &agreed).is_ok());
+    }
+
+    #[test]
+    fn commit_hooks_run_unless_told_not_to() {
+        let s = Scratch::new("save-hooks");
+        let remote = s.repo_with_remote("code/app");
+        let hooks = s.path("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("pre-commit"), "#!/bin/sh\necho 'secret scanner says no' >&2\nexit 1\n").unwrap();
+        fs::set_permissions(hooks.join("pre-commit"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        s.git("code/app", &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        // A detached HEAD, so that a branch is made before the commit is tried.
+        s.git("code/app", &["worktree", "add", "-q", "--detach", "../app-wt"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/work.txt", 10);
+        let head = s.rev(&wt, "HEAD");
+
+        let why = save_worktree(&wt, &s.0, &SaveOptions::default()).unwrap_err();
+        assert!(why.contains("a commit hook may have refused it") && why.contains("secret scanner says no"), "{why}");
+        // Left as it was found: still detached at the same commit, nothing staged, no
+        // branch left behind, nothing pushed.
+        assert_eq!(s.rev(&wt, "HEAD"), head);
+        assert_eq!(git(&wt, &["symbolic-ref", "-q", "HEAD"]), None, "still detached");
+        assert_eq!(s.rev(&wt, "refs/heads/guardian-save/app-wt"), "");
+        assert_eq!(git(&wt, &["status", "--porcelain"]).unwrap().trim(), "?? work.txt");
+        assert_eq!(s.rev(&remote, "refs/heads/guardian-save/app-wt"), "");
+
+        let skip = SaveOptions { no_verify: true, ..SaveOptions::default() };
+        let saved = save_worktree(&wt, &s.0, &skip).unwrap();
+        assert_eq!(saved.pushed_to, "origin/guardian-save/app-wt");
+    }
+
+    #[test]
+    fn ignored_files_that_a_commit_cannot_save_are_named_in_the_plan() {
+        let s = Scratch::new("save-ignored");
+        s.repo_with_remote("code/app");
+        fs::write(s.path("code/app/.gitignore"), "node_modules\nlocal.db\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        s.file("code/app-wt/local.db", 10);
+        s.file("code/app-wt/node_modules/dep/x.js", 10);
+        s.file("code/app-wt/work.txt", 10);
+        let plan = plan_save(&s.path("code/app-wt"), &s.0).unwrap();
+        assert_eq!(plan.files, vec!["work.txt"]);
+        assert_eq!(plan.ignored, vec!["local.db"], "dependencies come back; the database does not");
+    }
+
+    // --- what a delete must not take with it ---
+
+    #[test]
+    fn a_worktree_holding_another_checkout_in_an_ignored_folder_is_kept() {
+        let s = Scratch::new("nested-checkout");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), ".nested/\n.env\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "outer", "../outer"]);
+        // A worktree made from inside a worktree, in a folder git ignores, with work in it.
+        s.git("code/outer", &["worktree", "add", "-q", "-b", "inner", ".nested/inner"]);
+        s.file("code/outer/.nested/inner/unsaved.txt", 10);
+
+        let report = survey_home(&s.0, &small_floor());
+        let outer = find(&report, "~/code/outer");
+        assert!(!outer.deletable && !outer.saveable);
+        let note = outer.note.as_deref().unwrap();
+        assert!(note.contains(".nested/inner is another git checkout inside it"), "{note}");
+        assert!(delete_target(&s.path("code/outer"), &s.0).is_err());
+        assert!(s.path("code/outer/.nested/inner/unsaved.txt").exists());
+
+        // An ignored file is still only something to look at first.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "plain", "../plain"]);
+        s.file("code/plain/.env", 10);
+        assert_eq!(why_not_deletable(&s.path("code/plain"), &s.0), None);
+    }
+
+    #[test]
+    fn an_ignored_folder_with_an_unusual_name_is_still_looked_into() {
+        let s = Scratch::new("nested-name");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), "caf\u{e9} notes/\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "outer", "../outer"]);
+        // git prints this name quoted and escaped unless asked not to.
+        s.repo("code/outer/caf\u{e9} notes/inner");
+        s.file("code/outer/caf\u{e9} notes/inner/unsaved.txt", 10);
+        let why = why_not_deletable(&s.path("code/outer"), &s.0).expect("the checkout inside is found");
+        assert!(why.contains("caf\u{e9} notes/inner is another git checkout inside it"), "{why}");
+    }
+
+    #[test]
+    fn a_package_cloned_into_dependencies_to_be_patched_is_kept() {
+        let s = Scratch::new("nested-deps");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), "node_modules\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        s.file("code/app-wt/node_modules/plain/index.js", 10);
+        assert_eq!(why_not_deletable(&s.path("code/app-wt"), &s.0), None);
+        assert_eq!(why_not_deletable(&s.path("code/app-wt/node_modules"), &s.0), None);
+
+        s.repo("code/app-wt/node_modules/@scope/patched");
+        let why = why_not_deletable(&s.path("code/app-wt"), &s.0).unwrap();
+        assert!(why.contains("node_modules/@scope/patched is a git checkout of its own inside it"), "{why}");
+        let why = why_not_deletable(&s.path("code/app-wt/node_modules"), &s.0).unwrap();
+        assert!(why.contains("@scope/patched inside it is a git checkout of its own"), "{why}");
+    }
+
+    #[test]
+    fn a_virtual_environment_holding_a_cloned_dependency_is_kept() {
+        let s = Scratch::new("nested-venv");
+        s.file("code/app/.venv/pyvenv.cfg", 10);
+        s.file("code/app/.venv/lib/site.py", 10);
+        assert_eq!(why_not_deletable(&s.path("code/app/.venv"), &s.0), None);
+        // `pip install -e git+…` clones here, and the clone gets edited.
+        s.repo("code/app/.venv/src/somelib");
+        let why = why_not_deletable(&s.path("code/app/.venv"), &s.0).unwrap();
+        assert!(why.contains("src/somelib inside it is a git checkout of its own"), "{why}");
+    }
+
+    #[test]
+    fn nothing_inside_a_tool_cache_is_listed_as_a_projects_folder() {
+        let s = Scratch::new("cache-insides");
+        s.file("go/pkg/mod/github.com/a/b@v1/package.json", 2);
+        s.file("go/pkg/mod/github.com/a/b@v1/node_modules/x.js", 300_000);
+        s.file("code/web/node_modules/x.js", 300_000);
+        let report = survey_home(&s.0, &small_floor());
+        assert_eq!(listed(&report), vec!["~/code/web/node_modules", "~/go/pkg/mod"]);
+    }
+
+    #[test]
+    fn a_folder_in_a_repository_nested_in_a_worktree_is_counted_once() {
+        let s = Scratch::new("nested-count");
+        s.repo("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        // A repository of its own inside the worktree, with dependencies installed.
+        s.repo("code/app-wt/vendor/lib");
+        s.file("code/app-wt/vendor/lib/node_modules/dep/x.js", 600_000);
+        s.age_checkout("code/app-wt", "code/app/.git/worktrees/app-wt", 20);
+        let report = survey_home(&s.0, &small_floor());
+        let b = bundle(&report, "~/code/app", Staleness::Fortnight);
+        let wt = b.members.iter().find(|m| m.display_path == "~/code/app-wt").unwrap();
+        assert!(wt.bytes >= 600_000);
+        assert_eq!(b.bytes, wt.bytes, "what is inside the worktree is not added to it again");
+        assert_eq!(b.contents, "1 worktree");
+    }
+
+    // --- stale things, bundled ---
+
+    fn bundle<'a>(report: &'a Report, name: &str, staleness: Staleness) -> &'a Bundle {
+        report
+            .bundles
+            .iter()
+            .find(|b| b.name == name && b.staleness == staleness)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {staleness:?} bundle {name} in {:?}",
+                    report.bundles.iter().map(|b| (&b.name, b.staleness)).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    #[test]
+    fn ages_fall_into_bands() {
+        assert_eq!(Staleness::of(None), Staleness::InUse);
+        assert_eq!(Staleness::of(Some(6)), Staleness::InUse);
+        assert_eq!(Staleness::of(Some(7)), Staleness::Week);
+        assert_eq!(Staleness::of(Some(13)), Staleness::Week);
+        assert_eq!(Staleness::of(Some(14)), Staleness::Fortnight);
+        assert_eq!(Staleness::of(Some(30)), Staleness::Month);
+        assert_eq!(Staleness::of(Some(89)), Staleness::Month);
+        assert_eq!(Staleness::of(Some(90)), Staleness::Quarter);
+        assert!(Staleness::Quarter < Staleness::Month && Staleness::Week < Staleness::InUse);
+        assert!(Staleness::Fortnight.is_old() && !Staleness::Week.is_old());
+    }
+
+    #[test]
+    fn stale_folders_are_bundled_by_project_the_longest_untouched_first() {
+        let s = Scratch::new("bundles");
+        // Untouched for two months: two folders, each too small to list on its own.
+        s.repo("code/old-app");
+        s.file("code/old-app/web/package.json", 10);
+        s.file("code/old-app/web/node_modules/x.js", 300_000);
+        s.file("code/old-app/api/node_modules/x.js", 350_000);
+        s.age("code/old-app/web/node_modules", 60);
+        s.age("code/old-app/api/node_modules", 75);
+        // A folder is as fresh as the latest sign of work in its repository.
+        s.age_checkout("code/old-app", "code/old-app/.git", 75);
+        // Untouched for three weeks.
+        s.repo("code/mid-app");
+        s.file("code/mid-app/Cargo.toml", 10);
+        s.file("code/mid-app/target/debug/app", 700_000);
+        s.age("code/mid-app/target", 20);
+        s.age_checkout("code/mid-app", "code/mid-app/.git", 20);
+        // In use.
+        s.repo("code/live-app");
+        s.file("code/live-app/node_modules/x.js", 900_000);
+        // Tool caches nothing has been added to for six weeks: one Guardian deletes, one
+        // with a cleaner of its own.
+        s.file("Library/Caches/ms-playwright/chromium/bin", 800_000);
+        s.age("Library/Caches/ms-playwright", 45);
+        s.file(".cache/uv/blob", 600_000);
+        s.age(".cache/uv", 45);
+
+        let opts = Options {
+            min_bytes: 500_000,
+            top: 50,
+            ..Options::default()
+        };
+        let report = survey_home(&s.0, &opts);
+        let order: Vec<(&str, Staleness)> = report.bundles.iter().map(|b| (b.name.as_str(), b.staleness)).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("Tool caches", Staleness::Month),
+                ("~/code/old-app", Staleness::Month),
+                ("~/code/mid-app", Staleness::Fortnight),
+            ],
+            "longest untouched first; within a band, what frees the most"
+        );
+        assert_eq!(listed(&report), vec!["~/code/live-app/node_modules"], "what is in use is listed on its own");
+
+        let old = bundle(&report, "~/code/old-app", Staleness::Month);
+        assert_eq!(old.contents, "2 build folders");
+        assert_eq!((old.newest_days, old.oldest_days), (60, 75));
+        assert_eq!(old.delete_paths.len(), 2);
+        assert_eq!(old.held_back, 0);
+        assert!(old.is_project);
+        assert!(old.freed_bytes >= 650_000 && old.freed_bytes == old.deletable_freed_bytes);
+        assert_eq!(old.members[0].display_path, "~/code/old-app/api/node_modules", "largest first");
+        assert_eq!(old.ages_text(), "untouched 60 to 75 days");
+
+        let caches = bundle(&report, "Tool caches", Staleness::Month);
+        assert!(!caches.is_project);
+        assert_eq!(caches.contents, "2 caches");
+        assert_eq!(caches.delete_paths, vec![s.path("Library/Caches/ms-playwright")]);
+        assert_eq!(caches.held_back, 1, "uv has its own cleaner");
+        assert_eq!(caches.ages_text(), "nothing new for 45 days");
+
+        // The totals cover bundles and single folders alike.
+        assert!(report.regenerates_bytes >= 300_000 + 350_000 + 700_000 + 900_000 + 800_000 + 600_000);
+
+        let text = report.render();
+        let month = text.find("Untouched 30 to 89 days").unwrap();
+        let fortnight = text.find("Untouched 14 to 29 days").unwrap();
+        let single = text.find("Comes back on its own").unwrap();
+        assert!(month < fortnight && fortnight < single, "{text}");
+        assert!(text.contains("~/code/old-app: 2 build folders"), "{text}");
+        assert!(text.contains("untouched 60 to 75 days; 2 folders can be deleted now\n"), "{text}");
+        assert!(text.contains("1 folder can be deleted now; 1 more ("), "{text}");
+        assert!(text.contains(") needs a look or its own command"), "{text}");
+    }
+
+    #[test]
+    fn a_bundle_too_small_to_list_hands_its_folders_back() {
+        let s = Scratch::new("bundle-floor");
+        s.file("code/app/node_modules/x.js", 300_000);
+        s.age("code/app/node_modules", 40);
+        let big_floor = Options {
+            min_bytes: 5_000_000,
+            ..small_floor()
+        };
+        let report = survey_home(&s.0, &big_floor);
+        assert!(report.bundles.is_empty() && report.targets.is_empty());
+        // With a floor it clears, it is a bundle of one.
+        let report = survey_home(&s.0, &small_floor());
+        assert_eq!(report.bundles.len(), 1);
+        assert_eq!(report.bundles[0].contents, "1 build folder");
+        assert!(report.targets.is_empty());
+    }
+
+    #[test]
+    fn a_stale_worktree_is_bundled_with_what_is_inside_it() {
+        let s = Scratch::new("bundle-worktrees");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), "node_modules\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "done", "../app-wt-done"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "wip", "../app-wt-wip"]);
+        s.file("code/app-wt-done/node_modules/dep/x.js", 400_000);
+        s.file("code/app-wt-wip/node_modules/dep/x.js", 500_000);
+        s.file("code/app-wt-wip/notes.txt", 100);
+        s.age_checkout("code/app-wt-done", "code/app/.git/worktrees/app-wt-done", 20);
+        s.age_checkout("code/app-wt-wip", "code/app/.git/worktrees/app-wt-wip", 22);
+
+        let report = survey_home(&s.0, &small_floor());
+        let b = bundle(&report, "~/code/app", Staleness::Fortnight);
+        assert_eq!(b.contents, "2 worktrees", "the folders inside them are part of them");
+        // The clean worktree goes whole. The one with unsaved work stays, but the
+        // dependencies inside it can still go.
+        assert_eq!(
+            b.delete_paths,
+            vec![s.path("code/app-wt-wip/node_modules"), s.path("code/app-wt-done")]
+        );
+        assert_eq!(b.held_back, 1);
+        assert_eq!(b.save_paths, vec![s.path("code/app-wt-wip")]);
+        assert!(b.detail.contains("1 of those holds unsaved work that can be committed and pushed first"), "{}", b.detail);
+        let wip = b.members.iter().find(|m| m.display_path == "~/code/app-wt-wip").unwrap();
+        assert_eq!(wip.remove, "guardian disk save --delete ~/code/app-wt-wip");
+        let shown: Vec<&str> = b.members.iter().map(|m| m.display_path.as_str()).collect();
+        assert_eq!(shown, vec!["~/code/app-wt-wip", "~/code/app-wt-wip/node_modules", "~/code/app-wt-done"]);
+        assert!(b.freed_bytes >= 900_000, "both worktrees, each counted once: {}", b.freed_bytes);
+        assert!(b.freed_bytes < 1_400_000, "{}", b.freed_bytes);
+    }
+
+    #[test]
+    fn time_since_a_scan_reads_naturally() {
+        assert_eq!(ago_text(30), "just now");
+        assert_eq!(ago_text(90), "2 minutes ago");
+        assert_eq!(ago_text(3_600), "60 minutes ago");
+        assert_eq!(ago_text(7_200), "2 hours ago");
+        assert_eq!(ago_text(3 * 86_400), "3 days ago");
+    }
+
+    // --- space shared with other copies ---
+
+    /// Measure `path`, again if need be until `want` holds or a few seconds pass. Seen once
+    /// in a few dozen runs of these tests: a file written a moment ago, with many other
+    /// tests writing at the same time, briefly reports none of its space as its own.
+    fn settled(path: &Path, want: impl Fn(&Size) -> bool) -> Size {
+        let mut size = dir_size(path, far(), &none());
+        for _ in 0..60 {
+            if want(&size) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            size = dir_size(path, far(), &none());
+        }
+        size
+    }
+
+    /// Clone `from` to `to` the way bun and pnpm install from their caches. False on a
+    /// volume that cannot clone (anything but APFS).
+    fn clone_file(from: &Path, to: &Path) -> bool {
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        Command::new("cp")
+            .arg("-c")
+            .arg(from)
+            .arg(to)
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|st| st.success())
+    }
+
+    #[test]
+    fn a_file_with_two_names_counts_once_and_frees_only_if_both_are_inside() {
+        let s = Scratch::new("links");
+        s.file("tree/a.bin", 400_000);
+        fs::hard_link(s.path("tree/a.bin"), s.path("tree/a-again.bin")).unwrap();
+        s.file("tree/b.bin", 300_000);
+        fs::hard_link(s.path("tree/b.bin"), s.path("b-elsewhere.bin")).unwrap();
+        let size = settled(&s.path("tree"), |size| size.freed >= 400_000);
+        assert!(size.complete);
+        assert!((700_000..800_000).contains(&size.bytes), "a and b, once each: {}", size.bytes);
+        assert!((400_000..500_000).contains(&size.freed), "only a comes back: {}", size.freed);
+    }
+
+    #[test]
+    fn cloned_dependencies_are_sized_by_what_deleting_them_frees() {
+        let s = Scratch::new("clones");
+        s.file("pkg-cache/big.bin", 12_000_000);
+        if !clone_file(&s.path("pkg-cache/big.bin"), &s.path("code/web/node_modules/big.bin")) {
+            eprintln!("skipped: this volume cannot clone files");
+            return;
+        }
+        s.file("code/web/node_modules/own.js", 500_000);
+
+        settled(&s.path("code/web/node_modules"), |size| size.freed >= 500_000);
+        let report = survey_home(&s.0, &small_floor());
+        let t = find(&report, "~/code/web/node_modules");
+        assert!(t.bytes >= 12_500_000, "{}", t.bytes);
+        assert!((500_000..700_000).contains(&t.freed_bytes), "{}", t.freed_bytes);
+        assert_eq!(report.regenerates_freed_bytes, t.freed_bytes);
+        assert!(report.regenerates_bytes >= 12_500_000);
+        let shared = t.shared_text().expect("most of it is shared");
+        assert!(shared.contains("shared with other copies"), "{shared}");
+        assert!(report.render().contains("shared with other copies"));
+
+        let deleted = delete_target(&s.path("code/web/node_modules"), &s.0).unwrap();
+        assert!(deleted.freed_bytes < 700_000, "the clone frees nothing: {}", deleted.freed_bytes);
+        assert!(s.path("pkg-cache/big.bin").exists());
+    }
+
+    #[test]
+    fn a_folder_that_shares_nothing_says_nothing_about_sharing() {
+        let mut t = target(Some(1), Safety::Regenerates, Kind::Build, true);
+        t.bytes = 500 * 1024 * 1024;
+        t.freed_bytes = t.bytes;
+        assert_eq!(t.shared_text(), None);
+        // A little sharing is not worth a line.
+        t.freed_bytes = t.bytes - 5 * 1024 * 1024;
+        assert_eq!(t.shared_text(), None);
+        t.freed_bytes = 0;
+        assert_eq!(t.size_text(), "0 MB");
+        assert!(t.shared_text().unwrap().starts_with("500 MB in size, of which 500 MB is shared"));
+    }
+
+    // --- the saved index ---
+
+    fn index_file(s: &Scratch) -> PathBuf {
+        s.path(".guardian/disk_index.json")
+    }
+
+    fn listed(report: &Report) -> Vec<&str> {
+        let mut paths: Vec<&str> = report.targets.iter().map(|t| t.display_path.as_str()).collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// Make `dir` look modified a few seconds from now: later than any scan so far.
+    fn touch_later(dir: &Path) {
+        fs::File::open(dir)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_second_scan_measures_only_what_changed() {
+        let s = Scratch::new("index-reuse");
+        s.file(".npm/_cacache/blob", 200_000);
+        s.file(".cache/uv/blob", 300_000);
+        s.file("code/web/node_modules/x.js", 400_000);
+        let index = index_file(&s);
+
+        let first = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        assert_eq!((first.reused, first.unmeasured, first.outdated), (0, 0, 0));
+        assert_eq!(first.targets.len(), 3);
+        assert!(first.discovery_complete && !first.from_cache);
+
+        let second = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        assert_eq!(second.reused, 3, "nothing changed, so nothing is measured again");
+        assert_eq!(listed(&second), listed(&first));
+
+        s.file("code/web/node_modules/y.js", 600_000);
+        touch_later(&s.path("code/web/node_modules"));
+        let third = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        assert_eq!(third.reused, 2, "only the folder that changed is measured again");
+        assert!(find(&third, "~/code/web/node_modules").bytes >= 1_000_000);
+        assert_eq!(
+            find(&third, "~/.npm/_cacache").measured_at,
+            find(&first, "~/.npm/_cacache").measured_at
+        );
+
+        let afresh = Options {
+            max_age: Duration::ZERO,
+            ..small_floor()
+        };
+        assert_eq!(survey_saved(&s.0, &afresh, &index, false).unwrap().reused, 0);
+    }
+
+    #[test]
+    fn a_scan_with_no_time_keeps_what_earlier_scans_found() {
+        let s = Scratch::new("index-cut");
+        s.file(".npm/_cacache/blob", 200_000);
+        s.file("code/web/node_modules/x.js", 400_000);
+        s.file("code/api/node_modules/x.js", 400_000);
+        let index = index_file(&s);
+        survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+
+        fs::remove_dir_all(s.path("code/api/node_modules")).unwrap();
+        s.file(".cache/uv/blob", 300_000);
+        // No time to search the home folder or to measure anything.
+        let no_time = Options {
+            budget: Duration::ZERO,
+            max_age: Duration::ZERO,
+            ..small_floor()
+        };
+        let report = survey_saved(&s.0, &no_time, &index, false).unwrap();
+        assert!(!report.discovery_complete);
+        assert_eq!(
+            listed(&report),
+            vec!["~/.npm/_cacache", "~/code/web/node_modules"],
+            "found earlier and still there; the deleted folder is dropped"
+        );
+        assert_eq!(report.unmeasured, 1, "the new cache is known but not yet measured");
+        assert_eq!(report.outdated, 2);
+        assert_eq!(report.pending, 3);
+        assert!(report.work_left());
+        let text = report.render();
+        assert!(text.contains("2 sizes are from an earlier scan"), "{text}");
+        assert!(text.contains("there may be more to find"), "{text}");
+
+        // The next scan with time carries on: it measures the new cache and searches again.
+        let report = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        assert!(report.discovery_complete);
+        assert_eq!(
+            listed(&report),
+            vec!["~/.cache/uv", "~/.npm/_cacache", "~/code/web/node_modules"]
+        );
+        assert_eq!((report.unmeasured, report.outdated, report.pending), (0, 0, 0));
+        assert!(!report.work_left());
+    }
+
+    #[test]
+    fn never_measured_goes_first_then_the_longest_unmeasured() {
+        let now = 1_000_000;
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let c = |path: &str, kind: Kind, repo: Option<&str>, measured: Option<u64>, touched: Option<u64>| Candidate {
+            path: PathBuf::from(path),
+            kind,
+            what: String::new(),
+            cost: String::new(),
+            remove: None,
+            safety: Safety::Regenerates,
+            repo: repo.map(PathBuf::from),
+            last_touch: touched.map(at),
+            branch: None,
+            note: None,
+            deletable: true,
+            size: measured.map(|_| Size { bytes: 1, freed: 1, complete: true }),
+            measured_at: measured,
+            needs_check: false,
+            saveable: false,
+        };
+        let mut entries = vec![
+            c("/h/.cache/recent", Kind::Cache, None, Some(now - 10), None),
+            c("/h/.cache/old", Kind::Cache, None, Some(now - 90_000), None),
+            c("/h/wt", Kind::Worktree, Some("/h/main"), Some(now - 20), Some(100)),
+            c("/h/wt/node_modules", Kind::Build, Some("/h/wt"), None, Some(100)),
+            c("/h/new/target", Kind::Build, Some("/h/new"), None, Some(50)),
+            c("/h/edited/target", Kind::Build, Some("/h/edited"), Some(now - 30), Some(now - 5)),
+            c("/h/settled/target", Kind::Build, Some("/h/settled"), Some(now - 40), Some(now - 500)),
+        ];
+        let due = plan_measuring(&mut entries, DEFAULT_MAX_AGE, now);
+        let planned: Vec<(&str, bool)> = entries
+            .iter()
+            .map(|c| c.path.to_str().unwrap())
+            .zip(due.iter().copied())
+            .collect();
+        assert_eq!(
+            planned,
+            vec![
+                // Never measured, longest untouched first.
+                ("/h/new/target", true),
+                ("/h/wt/node_modules", true),
+                // Measured longer ago than a saved size is trusted for.
+                ("/h/.cache/old", true),
+                // Measured recently and untouched since: its size stands.
+                ("/h/settled/target", false),
+                // Touched after it was measured.
+                ("/h/edited/target", true),
+                // Measured again because a folder inside it is, and after that folder.
+                ("/h/wt", true),
+                ("/h/.cache/recent", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_size_measured_in_part_is_measured_again() {
+        let s = Scratch::new("index-part");
+        s.file(".npm/_cacache/blob", 200_000);
+        let index = index_file(&s);
+        survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        let mut saved = load_index(&index, &s.0).unwrap();
+        saved.entries[0].size = Some(Size { bytes: 5, freed: 5, complete: false });
+        save_index(&index, &saved).unwrap();
+
+        let saved_report = cached_at(&s.0, &small_floor(), &index).unwrap();
+        assert_eq!(saved_report.pending, 1, "a size measured in part is work left over");
+
+        let report = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        assert_eq!((report.reused, report.pending), (0, 0));
+        let npm = find(&report, "~/.npm/_cacache");
+        assert!(npm.complete && npm.bytes >= 200_000);
+    }
+
+    #[test]
+    fn only_one_scan_writes_the_index() {
+        let s = Scratch::new("index-lock");
+        s.file(".npm/_cacache/blob", 200_000);
+        let index = index_file(&s);
+        let held = IndexLock::try_take(&index).expect("the first to ask gets it");
+        assert!(IndexLock::try_take(&index).is_none());
+
+        assert!(
+            survey_saved(&s.0, &small_floor(), &index, true).is_none(),
+            "a background refresh gives way to a scan already running"
+        );
+        let report = survey_saved(&s.0, &small_floor(), &index, false).expect("a listing still scans");
+        assert_eq!(report.targets.len(), 1);
+        assert!(!index.exists(), "but writes nothing while another scan holds the index");
+
+        drop(held);
+        // Other tests start git in this same process, and a child being started holds a
+        // copy of every open file for an instant, the lock included. A real scan is the
+        // only thing its process does, so there the lock goes when the scan does.
+        let mut saved = None;
+        for _ in 0..100 {
+            saved = survey_saved(&s.0, &small_floor(), &index, true);
+            if saved.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saved.is_some(), "once the other scan is done, a refresh runs");
+        assert!(index.exists());
+    }
+
+    #[test]
+    fn cached_listing_reads_the_saved_scan_without_measuring() {
+        let s = Scratch::new("index-cached");
+        s.file(".npm/_cacache/blob", 200_000);
+        s.file("code/web/node_modules/x.js", 400_000);
+        let index = index_file(&s);
+        assert!(cached_at(&s.0, &small_floor(), &index).is_none(), "nothing saved yet");
+        survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+
+        // Neither change is measured; a folder that has gone is simply left out.
+        s.file("code/web/node_modules/y.js", 900_000);
+        fs::remove_dir_all(s.path(".npm/_cacache")).unwrap();
+        let report = cached_at(&s.0, &small_floor(), &index).unwrap();
+        assert!(report.from_cache);
+        assert_eq!(listed(&report), vec!["~/code/web/node_modules"]);
+        assert!(report.targets[0].bytes < 900_000);
+        assert!(report.render().contains("From the scan saved just now"));
+
+        // An index for another home directory, or from another version, is not used.
+        let elsewhere = Scratch::new("index-cached-other");
+        assert!(cached_at(&elsewhere.0, &small_floor(), &index).is_none());
+        let mut saved = load_index(&index, &s.0).unwrap();
+        saved.version += 1;
+        save_index(&index, &saved).unwrap();
+        assert!(cached_at(&s.0, &small_floor(), &index).is_none());
+        assert!(survey_saved(&s.0, &small_floor(), &index, false).unwrap().reused == 0);
+    }
+
+    #[test]
+    fn a_worktree_is_checked_again_only_once_it_has_been_touched() {
+        let s = Scratch::new("index-worktree");
+        s.repo("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        s.file("code/app-wt/src/lib.rs", 10);
+        s.git("code/app-wt", &["add", "src/lib.rs"]);
+        s.git("code/app-wt", &["commit", "-q", "-m", "src"]);
+        let index = index_file(&s);
+
+        let first = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        let wt = find(&first, "~/code/app-wt");
+        assert!(wt.deletable && wt.note.as_deref().unwrap().contains("no uncommitted work"), "{:?}", wt.note);
+
+        // A new file in a folder that already existed moves none of the times a scan looks
+        // at, so the next scan keeps what git said rather than asking again...
+        s.file("code/app-wt/src/scratch.rs", 10);
+        let second = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        assert_eq!(find(&second, "~/code/app-wt").note, wt.note);
+        // ...which is why deleting never goes by the listing: it asks git there and then.
+        let why = why_not_deletable(&s.path("code/app-wt"), &s.0).expect("unsaved work is found");
+        assert!(why.contains("1 uncommitted or untracked file"), "{why}");
+
+        // Once the worktree shows any sign of use, the scan asks git again.
+        touch_later(&s.path("code/app-wt"));
+        let third = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
+        let wt = find(&third, "~/code/app-wt");
+        assert!(!wt.deletable);
+        assert_eq!(wt.note.as_deref(), Some("1 uncommitted or untracked file"));
+
+        // So does a scan told to trust nothing saved.
+        fs::remove_file(s.path("code/app-wt/src/scratch.rs")).unwrap();
+        let afresh = Options {
+            max_age: Duration::ZERO,
+            ..small_floor()
+        };
+        let fourth = survey_saved(&s.0, &afresh, &index, false).unwrap();
+        assert!(find(&fourth, "~/code/app-wt").deletable);
+    }
+
+    #[test]
+    fn a_worktree_not_yet_checked_is_never_offered() {
+        let s = Scratch::new("index-unchecked");
+        s.repo("code/app");
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        // Time to find it (two thirds of nothing is still nothing to measure with).
+        let found = candidates(&s.0, &small_floor(), far());
+        let wt = found
+            .candidates
+            .iter()
+            .find(|c| c.kind == Kind::Worktree)
+            .expect("the worktree is listed");
+        assert!(found.complete);
+        assert!(!wt.deletable && wt.safety == Safety::Review);
+        assert_eq!(wt.note.as_deref(), Some(UNCHECKED));
+        assert!(wt.needs_check);
+    }
+
+    #[test]
+    fn a_half_written_index_left_by_a_stopped_scan_is_cleared_away() {
+        let s = Scratch::new("index-leftover");
+        s.file(".npm/_cacache/blob", 200_000);
+        s.file(".guardian/disk_index.json.4242.tmp", 10);
+        s.file(".guardian/something-else.tmp", 10);
+        survey_saved(&s.0, &small_floor(), &index_file(&s), false).unwrap();
+        assert!(!s.path(".guardian/disk_index.json.4242.tmp").exists());
+        assert!(s.path(".guardian/something-else.tmp").exists());
+        assert!(index_file(&s).exists());
+    }
+
+    #[test]
+    fn a_path_that_json_cannot_hold_is_left_out_of_the_saved_index() {
+        use std::os::unix::ffi::OsStringExt;
+        let s = Scratch::new("index-utf8");
+        let entry = |path: PathBuf| Candidate {
+            path,
+            kind: Kind::Build,
+            what: String::new(),
+            cost: String::new(),
+            remove: None,
+            safety: Safety::Regenerates,
+            repo: None,
+            last_touch: None,
+            branch: None,
+            note: None,
+            deletable: true,
+            size: Some(Size { bytes: 1, freed: 1, complete: true }),
+            measured_at: Some(1),
+            needs_check: false,
+            saveable: false,
+        };
+        let not_utf8 = PathBuf::from(std::ffi::OsString::from_vec(b"/h/caf\xe9/target".to_vec()));
+        let index = Index {
+            version: INDEX_VERSION,
+            home: s.0.clone(),
+            scanned_at: 1,
+            discovery_complete: true,
+            repos_scanned: 0,
+            entries: vec![entry(not_utf8), entry(PathBuf::from("/h/plain/target"))],
+        };
+        save_index(&index_file(&s), &index).unwrap();
+        let saved = load_index(&index_file(&s), &s.0).unwrap();
+        let paths: Vec<&Path> = saved.entries.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(paths, vec![Path::new("/h/plain/target")]);
+    }
+
+    #[test]
+    fn a_broken_index_file_is_ignored_and_replaced() {
+        let s = Scratch::new("index-broken");
+        s.file(".npm/_cacache/blob", 200_000);
+        s.file(".guardian/disk_index.json", 0);
+        fs::write(index_file(&s), "{ not json").unwrap();
+        let report = survey_saved(&s.0, &small_floor(), &index_file(&s), false).unwrap();
+        assert_eq!((report.targets.len(), report.reused), (1, 0));
+        assert!(load_index(&index_file(&s), &s.0).is_some());
     }
 }

@@ -144,6 +144,8 @@ warn_cursor_rss_megabytes = 4096
 enabled = true
 warn_used_percent = 85.0
 critical_used_percent = 93.0
+# Minutes between background refreshes of the saved `guardian disk` scan; 0 turns them off
+background_scan_minutes = 180
 
 [queue]
 # When true, blocked beforeSubmitPrompt may save prompt text to ~/.guardian/agent_queue.jsonl (if Cursor sends it)

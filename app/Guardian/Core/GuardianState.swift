@@ -210,7 +210,11 @@ struct DiskTarget: Codable, Sendable, Identifiable {
     var remove: String = ""
     /// regenerates | review
     var safety: String = "review"
+    /// What it occupies on disk.
     var bytes: UInt64 = 0
+    /// What deleting it would free: less than `bytes` when its files are clones of files
+    /// elsewhere (a bun or pnpm install). Equal to `bytes` from a guardian before 0.12.
+    var freedBytes: UInt64 = 0
     var complete: Bool = true
     /// Whole days since the project or worktree was last touched; nil for tool caches.
     var ageDays: Int?
@@ -220,13 +224,17 @@ struct DiskTarget: Codable, Sendable, Identifiable {
     var note: String?
     /// True when `guardian disk delete` will remove it (it re-checks first).
     var deletable: Bool = false
+    /// True for a worktree kept from deletion only by unsaved work that
+    /// `guardian disk save --delete` can commit and push first.
+    var saveable: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case path
         case displayPath = "display_path"
         case kind, what, cost, remove, safety, bytes, complete
+        case freedBytes = "freed_bytes"
         case ageDays = "age_days"
-        case repo, branch, note, deletable
+        case repo, branch, note, deletable, saveable
     }
 
     init(from decoder: Decoder) throws {
@@ -239,19 +247,46 @@ struct DiskTarget: Codable, Sendable, Identifiable {
         remove = (try? c.decodeIfPresent(String.self, forKey: .remove)) ?? ""
         safety = (try? c.decodeIfPresent(String.self, forKey: .safety)) ?? "review"
         bytes = (try? c.decodeIfPresent(UInt64.self, forKey: .bytes)) ?? 0
+        freedBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .freedBytes)) ?? bytes
         complete = (try? c.decodeIfPresent(Bool.self, forKey: .complete)) ?? true
         ageDays = try? c.decodeIfPresent(Int.self, forKey: .ageDays)
         repo = try? c.decodeIfPresent(String.self, forKey: .repo)
         branch = try? c.decodeIfPresent(String.self, forKey: .branch)
         note = try? c.decodeIfPresent(String.self, forKey: .note)
         deletable = (try? c.decodeIfPresent(Bool.self, forKey: .deletable)) ?? false
+        saveable = (try? c.decodeIfPresent(Bool.self, forKey: .saveable)) ?? false
     }
 
     var regenerates: Bool { safety == "regenerates" }
 
+    /// Untouched for this long counts as old (OLD_DAYS in src/disk_targets.rs).
+    static let oldDays = 14
+
+    /// Something Guardian can delete that comes back on its own and has gone untouched for
+    /// `oldDays`: what `guardian disk clean` selects with `old`.
+    var isOldAndSafe: Bool {
+        deletable && regenerates && kind != "cache" && (ageDays ?? 0) >= Self.oldDays
+    }
+
+    /// `targets` without those inside another of them: deleting a worktree takes the build
+    /// folders in it along, so they are not deleted, or counted, a second time.
+    static func withoutNested(_ targets: [DiskTarget]) -> [DiskTarget] {
+        targets.filter { inner in
+            !targets.contains { $0.path != inner.path && inner.path.hasPrefix($0.path + "/") }
+        }
+    }
+
+    /// What deleting it would free; `+` marks a lower bound.
     var sizeText: String {
-        let text = Self.sizeText(bytes)
+        let text = Self.sizeText(freedBytes)
         return complete ? text : text + "+"
+    }
+
+    /// Said when a good part of what it occupies would not come back (same rule as the CLI).
+    var sharedText: String? {
+        let shared = bytes > freedBytes ? bytes - freedBytes : 0
+        guard shared >= max(bytes / 10, 10 * 1_048_576) else { return nil }
+        return "\(Self.sizeText(bytes)) in size, of which \(Self.sizeText(shared)) is shared with other copies and freed only when they go too"
     }
 
     static func sizeText(_ bytes: UInt64) -> String {
@@ -261,6 +296,14 @@ struct DiskTarget: Codable, Sendable, Identifiable {
 
     var ageText: String? {
         guard let ageDays else { return nil }
+        // A cache's date is when its top level last changed, not when it was last read.
+        if kind == "cache" {
+            switch ageDays {
+            case 0: return "added to today"
+            case 1: return "nothing new for 1 day"
+            default: return "nothing new for \(ageDays) days"
+            }
+        }
         switch ageDays {
         case 0: return "used today"
         case 1: return "untouched 1 day"
@@ -272,34 +315,181 @@ struct DiskTarget: Codable, Sendable, Identifiable {
     var detailText: String {
         var parts: [String] = []
         if let ageText { parts.append(ageText) }
-        if let note, !note.isEmpty { parts.append(note) }
-        if parts.isEmpty { parts.append(cost) }
+        if let note, !note.isEmpty {
+            parts.append(note)
+        } else if parts.isEmpty || kind == "cache" {
+            parts.append(cost)
+        }
+        if let sharedText { parts.append(sharedText) }
         return parts.joined(separator: "; ")
     }
 }
 
-/// Output of `guardian disk --json`.
-struct DiskReport: Codable, Sendable {
-    var targets: [DiskTarget]
-    let unmeasured: Int
-    let reposScanned: Int
-    let regeneratesBytes: UInt64
-    let reviewBytes: UInt64
+/// One bundle of `guardian disk --json`: the stale folders of one project (or the stale tool
+/// caches), listed and deleted as one.
+struct DiskBundle: Codable, Sendable, Identifiable {
+    var id: String { staleness + "|" + name }
+    /// The project as `~/…`, or "Tool caches".
+    var name: String = ""
+    var isProject: Bool = true
+    /// quarter | month | fortnight | week
+    var staleness: String = "week"
+    /// The age band in words: "Untouched 30 to 89 days".
+    var heading: String = ""
+    /// How stale it is and how much of it can go without a look.
+    var detail: String = ""
+    /// "3 worktrees, 4 build folders"
+    var contents: String = ""
+    /// What deleting all of it would free.
+    var freedBytes: UInt64 = 0
+    /// What deleting `deletePaths` would free.
+    var deletableFreedBytes: UInt64 = 0
+    /// What can be deleted now without a look. Nothing here is inside anything else here.
+    var deletePaths: [String] = []
+    var heldBack: Int = 0
+    var members: [DiskTarget] = []
 
     enum CodingKeys: String, CodingKey {
-        case targets, unmeasured
-        case reposScanned = "repos_scanned"
-        case regeneratesBytes = "regenerates_bytes"
-        case reviewBytes = "review_bytes"
+        case name, staleness, heading, detail, contents, members
+        case isProject = "is_project"
+        case freedBytes = "freed_bytes"
+        case deletableFreedBytes = "deletable_freed_bytes"
+        case deletePaths = "delete_paths"
+        case heldBack = "held_back"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        isProject = (try? c.decodeIfPresent(Bool.self, forKey: .isProject)) ?? true
+        staleness = (try? c.decodeIfPresent(String.self, forKey: .staleness)) ?? "week"
+        heading = (try? c.decodeIfPresent(String.self, forKey: .heading)) ?? ""
+        detail = (try? c.decodeIfPresent(String.self, forKey: .detail)) ?? ""
+        contents = (try? c.decodeIfPresent(String.self, forKey: .contents)) ?? ""
+        freedBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .freedBytes)) ?? 0
+        deletableFreedBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .deletableFreedBytes)) ?? 0
+        deletePaths = (try? c.decodeIfPresent([String].self, forKey: .deletePaths)) ?? []
+        heldBack = (try? c.decodeIfPresent(Int.self, forKey: .heldBack)) ?? 0
+        members = (try? c.decodeIfPresent([DiskTarget].self, forKey: .members)) ?? []
+    }
+
+    /// Untouched for two weeks or more (OLD_DAYS in src/disk_targets.rs): what
+    /// `guardian disk clean` selects with `old`, for projects.
+    var isOld: Bool { ["quarter", "month", "fortnight"].contains(staleness) }
+}
+
+/// Output of `guardian disk --json`.
+struct DiskReport: Codable, Sendable {
+    /// Stale things grouped by project and age, the longest untouched first. Empty from a
+    /// guardian that does not bundle.
+    var bundles: [DiskBundle]
+    /// Everything not in a bundle.
+    var targets: [DiskTarget]
+    let unmeasured: Int
+    let reposScanned: Int
+    /// What deleting every target of each kind would free.
+    let regeneratesBytes: UInt64
+    let reviewBytes: UInt64
+    /// When the scan behind this report finished; nil from a guardian before 0.12.
+    let scannedAt: Date?
+    /// True when this is the saved scan read back rather than a new one.
+    let fromCache: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case bundles, targets, unmeasured
+        case reposScanned = "repos_scanned"
+        case regeneratesBytes = "regenerates_bytes"
+        case reviewBytes = "review_bytes"
+        case regeneratesFreedBytes = "regenerates_freed_bytes"
+        case reviewFreedBytes = "review_freed_bytes"
+        case scannedAt = "scanned_at"
+        case fromCache = "from_cache"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(bundles, forKey: .bundles)
+        try c.encode(targets, forKey: .targets)
+        try c.encode(unmeasured, forKey: .unmeasured)
+        try c.encode(reposScanned, forKey: .reposScanned)
+        try c.encode(regeneratesBytes, forKey: .regeneratesFreedBytes)
+        try c.encode(reviewBytes, forKey: .reviewFreedBytes)
+        try c.encodeIfPresent(scannedAt.map { UInt64($0.timeIntervalSince1970) }, forKey: .scannedAt)
+        try c.encode(fromCache, forKey: .fromCache)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        bundles = (try? c.decodeIfPresent([DiskBundle].self, forKey: .bundles)) ?? []
         targets = (try? c.decodeIfPresent([DiskTarget].self, forKey: .targets)) ?? []
         unmeasured = (try? c.decodeIfPresent(Int.self, forKey: .unmeasured)) ?? 0
         reposScanned = (try? c.decodeIfPresent(Int.self, forKey: .reposScanned)) ?? 0
-        regeneratesBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesBytes)) ?? 0
-        reviewBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .reviewBytes)) ?? 0
+        // The freed totals where the CLI gives them (0.12 on), else what is on disk.
+        regeneratesBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesFreedBytes))
+            ?? (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesBytes)) ?? 0
+        reviewBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .reviewFreedBytes))
+            ?? (try? c.decodeIfPresent(UInt64.self, forKey: .reviewBytes)) ?? 0
+        scannedAt = (try? c.decodeIfPresent(UInt64.self, forKey: .scannedAt))
+            .map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        fromCache = (try? c.decodeIfPresent(Bool.self, forKey: .fromCache)) ?? false
+    }
+}
+
+/// What `guardian disk save` would do to a worktree (`--plan --json`).
+struct SavePlan: Codable, Sendable {
+    let branch: String
+    /// True when `branch` is created for the save: HEAD is detached, or it was on a shared
+    /// branch (`fromBranch`) that work in progress is not pushed to.
+    let newBranch: Bool
+    let fromBranch: String?
+    /// Files that will be committed.
+    let files: [String]
+    let remote: String
+    /// The name it is pushed under: the branch's own, or `guardian-save/…` beside it.
+    let remoteBranch: String
+    /// True when the branch is already on the remote and the save is pushed beside it.
+    let beside: Bool
+    /// True when nothing is uncommitted and the remote already has the branch.
+    let upToDate: Bool
+    /// Ignored files kept nowhere else: not saved, and deleted with the worktree.
+    let ignored: [String]
+    /// Passed back with the save, which refuses if the worktree has changed since.
+    let id: String
+
+    enum CodingKeys: String, CodingKey {
+        case branch, files, remote, ignored, beside, id
+        case newBranch = "new_branch"
+        case fromBranch = "from_branch"
+        case remoteBranch = "remote_branch"
+        case upToDate = "up_to_date"
+    }
+}
+
+/// One element of `guardian disk save --plan --json`.
+struct SavePlanResult: Codable, Sendable {
+    let path: String
+    let ok: Bool
+    let plan: SavePlan?
+    let error: String?
+}
+
+/// One element of `guardian disk save --delete --yes --json`.
+struct SaveResult: Codable, Sendable {
+    let path: String
+    let ok: Bool
+    let saved: Bool?
+    let deleted: Bool?
+    let branch: String?
+    let committedFiles: Int?
+    let pushedTo: String?
+    let freedBytes: UInt64?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case path, ok, saved, deleted, branch, error
+        case committedFiles = "committed_files"
+        case pushedTo = "pushed_to"
+        case freedBytes = "freed_bytes"
     }
 }
 
