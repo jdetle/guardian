@@ -142,6 +142,8 @@ pub struct BackgroundScan {
     rose: bool,
     /// Scans in a row that ended with places still to measure.
     catch_ups: u8,
+    /// The running scan has been told to stop and has not been collected yet.
+    stopping: bool,
 }
 
 impl BackgroundScan {
@@ -154,6 +156,7 @@ impl BackgroundScan {
             last_level: 0,
             rose: false,
             catch_ups: 0,
+            stopping: false,
         }
     }
 
@@ -162,15 +165,21 @@ impl BackgroundScan {
     pub fn tick(&mut self, interval_minutes: u64, pressure: PressureLevel, level: &DiskPressureLevel) {
         if let Some(child) = &mut self.running {
             match child.try_wait() {
-                Ok(None) if pressure == PressureLevel::Critical => {
-                    // It saves as it goes, so the next scan carries on from about here.
+                Ok(None) if pressure == PressureLevel::Critical && !self.stopping => {
+                    // It saves as it goes, so the next scan carries on from about here. It is
+                    // collected on a later sample, not waited for: a scan stuck on a stalled
+                    // disk must not hold up sampling, least of all now.
                     let _ = child.kill();
-                    let _ = child.wait();
-                    self.running = None;
+                    self.stopping = true;
                     self.catch_ups = self.catch_ups.saturating_add(1);
                     eprintln!("[guardiand] background disk scan stopped: load is critical");
+                    return;
                 }
                 Ok(None) => return,
+                Ok(Some(_)) if self.stopping => {
+                    self.stopping = false;
+                    self.running = None;
+                }
                 Ok(Some(status)) => {
                     let how = outcome(status.code());
                     self.last_failed = how == Outcome::Failed;
@@ -180,7 +189,10 @@ impl BackgroundScan {
                     };
                     self.running = None;
                 }
-                Err(_) => self.running = None,
+                Err(_) => {
+                    self.stopping = false;
+                    self.running = None;
+                }
             }
         }
 

@@ -76,15 +76,16 @@ pub struct SavePlan {
     /// Files git ignores that are kept nowhere else (a `.env`, a local database). A commit
     /// does not save them and removing the worktree deletes them.
     pub ignored: Vec<String>,
-    /// Stands for everything above. A save given this id refuses if a fresh plan differs.
+    /// Stands for the commit it starts from, where it goes, and the files to commit with
+    /// their sizes and modification times. A save given this id refuses if a fresh plan's
+    /// differs: a file added, removed or edited since.
     pub id: String,
-    /// Make the pushed branch the one this branch follows (only when it follows none and
-    /// is pushed under its own name).
-    #[serde(skip)]
-    set_upstream: bool,
-    /// What HEAD was, to put things back if the commit fails after a branch was made.
+    /// What HEAD was, to tell whether a commit that reported failure was made after all.
     #[serde(skip)]
     head: String,
+    /// Something was staged before the save touched anything.
+    #[serde(skip)]
+    had_staged: bool,
 }
 
 /// How a save is to be done.
@@ -244,17 +245,22 @@ pub fn holds_secret(text: &str) -> bool {
 }
 
 /// One changed path from `git status --porcelain -z`.
-struct Change {
-    path: String,
-    untracked: bool,
+pub(super) struct Change {
+    pub(super) path: String,
+    pub(super) untracked: bool,
+    /// Added to the index but in no commit yet (`git add` of a new file).
+    added: bool,
+    /// Something of it is staged.
+    staged: bool,
     /// Ignored by git (`!!`): not part of any commit.
-    ignored: bool,
+    pub(super) ignored: bool,
     conflicted: bool,
 }
 
 /// Parse `git status --porcelain -z`: NUL-separated `XY path` records, where a rename or
-/// copy is followed by a record holding the old path.
-fn parse_status(text: &str) -> Vec<Change> {
+/// copy is followed by a record holding the old path. With `-z` git writes paths as they
+/// are; without it, a name with anything unusual in it comes quoted and escaped.
+pub(super) fn parse_status(text: &str) -> Vec<Change> {
     let mut changes = Vec::new();
     let mut records = text.split('\0').filter(|r| !r.is_empty());
     while let Some(record) = records.next() {
@@ -269,6 +275,8 @@ fn parse_status(text: &str) -> Vec<Change> {
         changes.push(Change {
             path: path.to_string(),
             untracked: code == "??",
+            added: code.starts_with('A'),
+            staged: !code.starts_with([' ', '?', '!']),
             ignored: code == "!!",
             conflicted: code.contains('U') || code == "AA" || code == "DD",
         });
@@ -421,13 +429,16 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
         .filter(|shown| !ignored_path_regenerates(path, shown))
         .collect();
     let mut files = Vec::new();
+    let mut stamps: Vec<(u64, u128)> = Vec::new();
     let mut secrets = Vec::new();
+    let mut had_staged = false;
     let (mut new_files, mut new_bytes) = (0usize, 0u64);
     for change in parse_status(&status("--untracked-files=all", "--ignored=no")?) {
         let on_disk = path.join(&change.path);
         if change.ignored {
             continue;
         }
+        had_staged |= change.staged;
         if change.conflicted {
             return Err(format!("{} has an unresolved merge conflict", change.path));
         }
@@ -437,19 +448,30 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
                 change.path.trim_end_matches('/')
             ));
         }
-        if !change.untracked && on_disk.join(".git").exists() {
+        if on_disk.join(".git").exists() {
             return Err(format!(
-                "the submodule {} has changes of its own; save those first",
+                "{} is a submodule or a repository of its own with changes; save those first",
                 change.path
             ));
         }
-        if change.untracked {
+        // New to git whether or not it has been staged: `git add` does not make a file any
+        // safer to publish.
+        let new_to_git = change.untracked || change.added;
+        let meta = fs::symlink_metadata(&on_disk).ok();
+        stamps.push((
+            meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            meta.as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        if new_to_git {
             if let Some(folder) = inside_build_folder(path, &change.path) {
                 return Err(format!(
                     "{folder} is not ignored by git, so a commit would add everything in it; add it to .gitignore first"
                 ));
             }
-            let meta = fs::symlink_metadata(&on_disk).ok();
             let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             if bytes > MAX_NEW_FILE_BYTES {
                 return Err(format!(
@@ -466,19 +488,23 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
                     super::human_size(MAX_NEW_BYTES)
                 ));
             }
-            let is_file = meta.is_some_and(|m| m.is_file());
-            let by_content = is_file
-                && fs::File::open(&on_disk)
-                    .ok()
-                    .map(|file| {
-                        let mut start = Vec::new();
-                        let _ = file.take(SCAN_BYTES).read_to_end(&mut start);
-                        holds_secret(&String::from_utf8_lossy(&start))
-                    })
-                    .unwrap_or(false);
-            if looks_secret(&change.path) || by_content {
+            if looks_secret(&change.path) {
                 secrets.push(change.path.clone());
             }
+        }
+        // Every file that would be committed is read for a key or a token, new or not: an
+        // edit to a file git already has can add one.
+        let by_content = meta.is_some_and(|m| m.is_file())
+            && fs::File::open(&on_disk)
+                .ok()
+                .map(|file| {
+                    let mut start = Vec::new();
+                    let _ = file.take(SCAN_BYTES).read_to_end(&mut start);
+                    holds_secret(&String::from_utf8_lossy(&start))
+                })
+                .unwrap_or(false);
+        if by_content && !secrets.contains(&change.path) {
+            secrets.push(change.path.clone());
         }
         files.push(change.path);
     }
@@ -490,7 +516,10 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
             if secrets.len() == 1 { "it" } else { "them" }
         ));
     }
-    files.sort();
+    // Sorted together, so that the same worktree always gives the same id.
+    let mut listed: Vec<(String, (u64, u128))> = files.into_iter().zip(stamps).collect();
+    listed.sort();
+    let (files, stamps): (Vec<String>, Vec<(u64, u128)>) = listed.into_iter().unzip();
 
     let current = ask(path, &["symbolic-ref", "--short", "-q", "HEAD"]);
     let configured = |key: &str| {
@@ -504,16 +533,28 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
     if remotes.is_empty() {
         return Err("its repository has no remote to push to".to_string());
     }
-    // Where the user's own `git push` would go: the branch's push remote, the repository's
-    // default push remote (a fork, with the original as what it follows), the remote it
-    // follows; failing those, `origin`, or the only remote there is.
-    let remote = configured("pushRemote")
-        .or_else(|| ask(path, &["config", "--get", "remote.pushDefault"]))
-        .or_else(|| configured("remote").filter(|remote| remote != "."))
-        .filter(|remote| remotes.contains(remote))
-        .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
-        .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone()))
-        .ok_or("its repository has several remotes and none is called origin; push it yourself")?;
+    // Where the user's own `git push` would go: the branch's push remote, else the
+    // repository's default push remote (a fork, with the original as what it follows),
+    // else the remote it follows; failing those, `origin`, or the only remote there is. A
+    // push setting that names something else (a URL) is not second-guessed.
+    let push_setting = |value: Option<String>, setting: &str| match value {
+        Some(remote) if remotes.contains(&remote) => Ok(Some(remote)),
+        Some(other) => Err(format!(
+            "{setting} sends its pushes to {other}, which is not one of the repository's remotes; push it yourself"
+        )),
+        None => Ok(None),
+    };
+    let remote = match push_setting(configured("pushRemote"), "its branch's pushRemote")? {
+        Some(remote) => remote,
+        None => match push_setting(ask(path, &["config", "--get", "remote.pushDefault"]), "remote.pushDefault")? {
+            Some(remote) => remote,
+            None => configured("remote")
+                .filter(|remote| remote != "." && remotes.contains(remote))
+                .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
+                .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone()))
+                .ok_or("its repository has several remotes and none is called origin; push it yourself")?,
+        },
+    };
 
     let there = remote_state(path, &remote)?;
     let local_exists = |name: &str| ask(path, &["rev-parse", "-q", "--verify", &format!("refs/heads/{name}")]).is_some();
@@ -544,12 +585,8 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
     } else {
         branch.clone()
     };
-    // Only where nothing is configured and it goes up under its own name: an upstream
-    // someone set is left as it is.
-    let set_upstream = !beside && (new_branch || configured("merge").is_none());
-
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (&head, &branch, new_branch, &remote, &remote_branch, &files).hash(&mut hasher);
+    (&head, &branch, new_branch, &remote, &remote_branch, &files, &stamps, &ignored).hash(&mut hasher);
     Ok(SavePlan {
         path: path.to_path_buf(),
         branch,
@@ -562,8 +599,8 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
         up_to_date,
         ignored,
         id: format!("{:016x}", hasher.finish()),
-        set_upstream,
         head,
+        had_staged,
     })
 }
 
@@ -611,8 +648,18 @@ pub fn save_worktree(path: &Path, home: &Path, options: &SaveOptions) -> Result<
                 })
             });
         if let Err(why) = committed {
-            // Leave it as it was found: back on what it had checked out, with nothing staged.
-            let _ = run(path, &["reset", "-q"], LOCAL_TIMEOUT);
+            // git can report a problem after the commit exists (a hook that runs afterwards,
+            // a timeout). Then the work is in that commit, and nothing here is undone.
+            if ask(path, &["rev-parse", "HEAD"]).as_deref() != Some(plan.head.as_str()) {
+                return Err(format!(
+                    "its work is committed to branch {branch}, which stays in the repository, but git reported a problem and nothing was pushed: {why}"
+                ));
+            }
+            // Leave it as it was found: back on what it had checked out, and with nothing
+            // staged unless something already was.
+            if !plan.had_staged {
+                let _ = run(path, &["reset", "-q"], LOCAL_TIMEOUT);
+            }
             let mut back = String::new();
             if plan.new_branch {
                 let to = plan.from_branch.clone().unwrap_or_else(|| plan.head.clone());
@@ -636,14 +683,9 @@ pub fn save_worktree(path: &Path, home: &Path, options: &SaveOptions) -> Result<
         format!("its work is committed to branch {branch}, which stays in the repository, but ")
     };
     let refspec = format!("refs/heads/{branch}:refs/heads/{}", plan.remote_branch);
-    let mut push = vec!["push", "-q"];
-    if plan.set_upstream {
-        push.push("--set-upstream");
-    }
-    push.extend([plan.remote.as_str(), refspec.as_str()]);
     // Never forced, and with the repository's own push hooks: they may be what keeps
-    // something from being published.
-    run(path, &push, PUSH_TIMEOUT)
+    // something from being published. What the branch follows is not changed either.
+    run(path, &["push", "-q", plan.remote.as_str(), refspec.as_str()], PUSH_TIMEOUT)
         .map_err(|e| format!("{kept}the push to {} did not go through: {e}", plan.remote))?;
 
     // Ask the remote itself, not this repository's record of it.
@@ -704,6 +746,10 @@ mod tests {
             .iter()
             .map(|c| (c.path.as_str(), c.untracked, c.ignored, c.conflicted))
             .collect();
+        let staged: Vec<bool> = changes.iter().map(|c| c.staged).collect();
+        assert_eq!(staged, vec![false, false, true, false, true, false]);
+        let added = parse_status("A  new.rs\0AM edited-since.rs\0 M old.rs\0");
+        assert_eq!(added.iter().map(|c| (c.added, c.staged)).collect::<Vec<_>>(), vec![(true, true), (true, true), (false, false)]);
         assert_eq!(
             seen,
             vec![

@@ -257,8 +257,10 @@ final class GuardianClient: ObservableObject {
                 }
                 self.deleteMessage = Self.deleteSummary(chosen: chosen, deleted: deleted, kept: kept)
                 self.loadState()
-                // Bring the totals up to date; quick, since only what changed is measured.
-                if !deleted.isEmpty { self.scanDisk() }
+                // Bring the list and totals up to date; quick, since only what changed is
+                // measured. Also when the command gave no answer: it may have deleted some
+                // of them before it stopped, and the list must not go on showing those.
+                if !deleted.isEmpty || results.isEmpty { self.scanDisk() }
             }
         }
     }
@@ -348,7 +350,7 @@ final class GuardianClient: ObservableObject {
             parts.append("Kept \(shown(result.path)): \(result.error ?? "it could not be deleted").")
         }
         if deleted.isEmpty && kept.isEmpty {
-            parts.append("Nothing was deleted: the delete command did not run.")
+            parts.append("The delete command gave no answer, so it is not known what was deleted. Looking again.")
         }
         return parts.joined(separator: " ")
     }

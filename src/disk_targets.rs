@@ -625,12 +625,13 @@ enum Nested {
     TooLarge,
 }
 
-/// Look in `dir` and below for a git checkout. Used on folders git ignores: nothing git
-/// reports about the checkout around them says what such a folder holds, and removing the
-/// checkout around it deletes it. A worktree made from inside a worktree sits in exactly
-/// such a place, as does a dependency cloned for editing.
-fn nested_checkout(dir: &Path) -> Nested {
-    const MAX_DEPTH: usize = 6;
+/// Look in `dir` and down to `max_depth` below it for a git checkout. Used on folders git
+/// ignores: nothing git reports about the checkout around them says what such a folder
+/// holds, and removing the checkout around it deletes it. A worktree made from inside a
+/// worktree sits in exactly such a place, as does a dependency cloned for editing.
+/// `strict`: there being more below `max_depth` counts as too large to be sure, rather
+/// than as nothing found.
+fn nested_checkout(dir: &Path, max_depth: usize, strict: bool) -> Nested {
     const MAX_DIRS: usize = 20_000;
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
     let mut visited = 0usize;
@@ -640,7 +641,7 @@ fn nested_checkout(dir: &Path) -> Nested {
         }
         visited += 1;
         if visited > MAX_DIRS {
-            return Nested::TooLarge;
+            return if strict { Nested::TooLarge } else { Nested::None };
         }
         let Ok(entries) = fs::read_dir(&at) else {
             continue;
@@ -650,8 +651,11 @@ fn nested_checkout(dir: &Path) -> Nested {
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            if depth + 1 > MAX_DEPTH {
-                return Nested::TooLarge;
+            if depth + 1 > max_depth {
+                if strict {
+                    return Nested::TooLarge;
+                }
+                continue;
             }
             stack.push((entry.path(), depth + 1));
         }
@@ -686,11 +690,14 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     // Spelled out rather than left to the user's git config: with
     // `status.showUntrackedFiles=no`, a bare `git status` (and the check inside
     // `git worktree remove`) reports a worktree full of new files as clean.
+    // `-z`: without it git quotes and escapes any name that is not plain ASCII, and a path
+    // read that way names nothing on disk.
     let Some(status) = git(
         &wt.path,
         &[
             "status",
             "--porcelain",
+            "-z",
             "--untracked-files=normal",
             "--ignored=traditional",
             "--ignore-submodules=none",
@@ -698,8 +705,8 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     ) else {
         return blocked("could not be checked for unsaved work".to_string());
     };
-    let entries = || status.lines().filter(|l| !l.trim().is_empty());
-    let dirty = entries().filter(|l| !l.starts_with("!!")).count();
+    let changes = save::parse_status(&status);
+    let dirty = changes.iter().filter(|c| !c.ignored).count();
     if dirty > 0 {
         return unsaved(format!(
             "{dirty} uncommitted or untracked file{}",
@@ -739,15 +746,28 @@ fn worktree_state(wt: &Linked) -> WorktreeState {
     }
     // Ignored files are deleted with the worktree and git keeps no copy: local settings
     // (.env), databases, notes. Build output and dependencies are the exception.
-    let kept_nowhere: Vec<String> = entries()
-        .filter_map(|l| l.strip_prefix("!! "))
-        .map(|p| p.trim_matches('"').trim_end_matches('/').to_string())
-        .filter(|p| !ignored_path_regenerates(&wt.path, p))
+    let ignored: Vec<String> = changes
+        .iter()
+        .filter(|c| c.ignored)
+        .map(|c| c.path.trim_end_matches('/').to_string())
         .collect();
+    let (regenerating, kept_nowhere): (Vec<String>, Vec<String>) = ignored
+        .into_iter()
+        .partition(|p| ignored_path_regenerates(&wt.path, p));
+    // Dependencies come back, but not a package cloned into them to be patched: its top
+    // levels are looked at (`node_modules/pkg`, `node_modules/@scope/pkg`).
+    for folder in &regenerating {
+        if let Nested::Checkout(inner) = nested_checkout(&wt.path.join(folder), 2, false) {
+            let shown = inner.strip_prefix(&wt.path).unwrap_or(&inner).to_string_lossy().to_string();
+            return blocked(format!(
+                "{shown} is a git checkout of its own inside it; removing this worktree would delete it and any unsaved work in it"
+            ));
+        }
+    }
     // An ignored folder can hold a whole other checkout, unsaved work and all, and
     // `git worktree remove` deletes it without a word.
     for ignored in &kept_nowhere {
-        match nested_checkout(&wt.path.join(ignored)) {
+        match nested_checkout(&wt.path.join(ignored), 6, true) {
             Nested::None => {}
             Nested::Checkout(inner) => {
                 let shown = inner.strip_prefix(&wt.path).unwrap_or(&inner).to_string_lossy().to_string();
@@ -1065,6 +1085,12 @@ fn candidates(home: &Path, opts: &Options, deadline: Instant) -> Discovery {
     // share must not mean that no worktree is listed at all.
     let listing_deadline = deadline.max(Instant::now()) + opts.budget / 6;
     for main in &repos {
+        // Checked here too: asking git for a repository's worktrees is the slow part, and
+        // is not worth starting once the time is up.
+        if Instant::now() >= listing_deadline {
+            complete = false;
+            break;
+        }
         complete &= worktree_candidates(main, home, listing_deadline, &mut found.candidates);
     }
 
@@ -1256,10 +1282,13 @@ fn survey_with(
         if !discovery_complete {
             // A search cut short says nothing about the places it did not reach: keep what
             // an earlier search found there, as long as it still exists.
-            let mut kept: Vec<Candidate> = earlier
-                .into_values()
-                .filter(|c| is_real_dir(&c.path))
-                .collect();
+            // A worktree only for as long as it has the `.git` file of one.
+            let still_there = |c: &Candidate| {
+                is_real_dir(&c.path)
+                    && (c.kind != Kind::Worktree
+                        || fs::symlink_metadata(c.path.join(".git")).is_ok_and(|m| m.is_file()))
+            };
+            let mut kept: Vec<Candidate> = earlier.into_values().filter(still_there).collect();
             for c in &mut kept {
                 // Whether it is still locked cannot be told without listing it; a locked
                 // one stays as it was noted.
@@ -1588,12 +1617,13 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
         // path, not by repository: a folder in a submodule or a nested repository belongs
         // to that, but is on disk inside the worktree and counted in its size.
         let inside = match c.kind {
-            Kind::Build => worktrees
+            // A worktree made inside another is on disk inside it too.
+            Kind::Build | Kind::Worktree => worktrees
                 .values()
-                .filter(|w| w.size.is_some() && c.path.starts_with(&w.path))
+                .filter(|w| w.size.is_some() && w.path != c.path && c.path.starts_with(&w.path))
                 .map(|w| w.path.clone())
                 .max_by_key(|w| w.as_os_str().len()),
-            _ => None,
+            Kind::Cache => None,
         };
         let project = match c.kind {
             Kind::Cache => None,
@@ -1661,10 +1691,9 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
         .map(|t| &t.path)
         .collect();
     let counted_once = |t: &&Target| {
-        t.kind == Kind::Worktree
-            || !worktree_paths
-                .iter()
-                .any(|w| listed_worktrees.contains(w) && t.path.starts_with(w))
+        !worktree_paths
+            .iter()
+            .any(|w| listed_worktrees.contains(w) && t.path != **w && t.path.starts_with(w))
     };
     let sum = |s: Safety, of: fn(&Target) -> u64| -> u64 {
         targets
@@ -2084,19 +2113,24 @@ fn plan_delete(path: &Path, home: &Path) -> Result<Plan, String> {
     let Some((_, _, safety)) = classify_project_dir(parent, name) else {
         return Err("it is not a build folder, dependency folder, worktree or cache Guardian knows".to_string());
     };
-    // A folder that needs a look (a virtual environment) can hold a dependency cloned for
-    // editing: a checkout of its own, with work in it.
-    if safety == Safety::Review {
-        match nested_checkout(path) {
-            Nested::None => {}
-            Nested::Checkout(inner) => {
-                return Err(format!(
-                    "{} inside it is a git checkout of its own",
-                    inner.strip_prefix(path).unwrap_or(&inner).display()
-                ))
-            }
-            Nested::TooLarge => return Err("it is too large to check for git checkouts inside it".to_string()),
+    // A dependency cloned for editing is a checkout of its own, with work in it. A folder
+    // that needs a look (a virtual environment) is searched well down; one that comes back
+    // on its own, at its top levels, where such a clone sits (`node_modules/pkg`).
+    let found = if safety == Safety::Review {
+        nested_checkout(path, 6, true)
+    } else {
+        nested_checkout(path, 2, false)
+    };
+    match found {
+        Nested::None => {}
+        Nested::Checkout(inner) if inner == path => {}
+        Nested::Checkout(inner) => {
+            return Err(format!(
+                "{} inside it is a git checkout of its own",
+                inner.strip_prefix(path).unwrap_or(&inner).display()
+            ))
         }
+        Nested::TooLarge => return Err("it is too large to check for git checkouts inside it".to_string()),
     }
     // Never delete anything git tracks: that is source, whatever the folder is called.
     // Whether the folder is in a checkout is read from disk, not asked of git: a git that
@@ -2191,6 +2225,14 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Self {
+            // The code under test runs git as the process finds it. Without this it would
+            // read the developer's own git configuration (global ignores, signing, URL
+            // rewrites, hooks) and the tests would pass or fail by what is in it.
+            static NO_HOST_GIT_CONFIG: std::sync::Once = std::sync::Once::new();
+            NO_HOST_GIT_CONFIG.call_once(|| {
+                std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+                std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+            });
             let dir = std::env::temp_dir().join(format!("guardian-disk-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
@@ -3028,6 +3070,25 @@ mod tests {
         fs::write(s.path("code/wt-key/notes.txt"), key).unwrap();
         assert!(refused("code/wt-key").contains("notes.txt looks like credentials"));
 
+        // Staging a file does not make it safe to publish: the same checks apply.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "h", "../wt-staged"]);
+        s.file("code/wt-staged/.env", 10);
+        s.git("code/wt-staged", &["add", "-f", ".env"]);
+        assert!(refused("code/wt-staged").contains(".env looks like credentials"));
+
+        // Nor is an edit to a file git already has, if the edit adds a key.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "i", "../wt-edited"]);
+        let token = ["token = \"ghp", "_0123456789abcdefghijklmnopqrstuvwxyz\"\n"].concat();
+        fs::write(s.path("code/wt-edited/README.md"), token).unwrap();
+        assert!(refused("code/wt-edited").contains("README.md looks like credentials"));
+
+        // A push setting that points somewhere other than a remote of the repository.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "j", "../wt-elsewhere"]);
+        s.git("code/app", &["config", "branch.j.pushRemote", "https://example.invalid/elsewhere.git"]);
+        s.file("code/wt-elsewhere/x.txt", 10);
+        let why = refused("code/wt-elsewhere");
+        assert!(why.contains("pushRemote") && why.contains("push it yourself"), "{why}");
+
         // Nowhere to push to.
         s.repo("code/lonely");
         s.git("code/lonely", &["worktree", "add", "-q", "-b", "e", "../wt-lonely"]);
@@ -3088,6 +3149,15 @@ mod tests {
         assert!(why_not_deletable(&wt, &s.0).is_some(), "nothing was committed");
 
         fs::remove_file(wt.join("appeared.txt")).unwrap();
+        assert_eq!(plan_save(&wt, &s.0).unwrap().id, shown.id, "back as it was shown");
+
+        // The same files, but one of them edited since.
+        fs::write(wt.join("shown.txt"), "something else entirely\n").unwrap();
+        let why = save_worktree(&wt, &s.0, &agreed).unwrap_err();
+        assert!(why.contains("changed since you were asked"), "{why}");
+        assert_eq!(s.rev(&remote, "refs/heads/feature"), "");
+
+        let agreed = SaveOptions { expected_id: Some(plan_save(&wt, &s.0).unwrap().id), ..SaveOptions::default() };
         assert!(save_worktree(&wt, &s.0, &agreed).is_ok());
     }
 
@@ -3163,6 +3233,40 @@ mod tests {
         s.git("code/app", &["worktree", "add", "-q", "-b", "plain", "../plain"]);
         s.file("code/plain/.env", 10);
         assert_eq!(why_not_deletable(&s.path("code/plain"), &s.0), None);
+    }
+
+    #[test]
+    fn an_ignored_folder_with_an_unusual_name_is_still_looked_into() {
+        let s = Scratch::new("nested-name");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), "caf\u{e9} notes/\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "outer", "../outer"]);
+        // git prints this name quoted and escaped unless asked not to.
+        s.repo("code/outer/caf\u{e9} notes/inner");
+        s.file("code/outer/caf\u{e9} notes/inner/unsaved.txt", 10);
+        let why = why_not_deletable(&s.path("code/outer"), &s.0).expect("the checkout inside is found");
+        assert!(why.contains("caf\u{e9} notes/inner is another git checkout inside it"), "{why}");
+    }
+
+    #[test]
+    fn a_package_cloned_into_dependencies_to_be_patched_is_kept() {
+        let s = Scratch::new("nested-deps");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), "node_modules\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "feature", "../app-wt"]);
+        s.file("code/app-wt/node_modules/plain/index.js", 10);
+        assert_eq!(why_not_deletable(&s.path("code/app-wt"), &s.0), None);
+        assert_eq!(why_not_deletable(&s.path("code/app-wt/node_modules"), &s.0), None);
+
+        s.repo("code/app-wt/node_modules/@scope/patched");
+        let why = why_not_deletable(&s.path("code/app-wt"), &s.0).unwrap();
+        assert!(why.contains("node_modules/@scope/patched is a git checkout of its own inside it"), "{why}");
+        let why = why_not_deletable(&s.path("code/app-wt/node_modules"), &s.0).unwrap();
+        assert!(why.contains("@scope/patched inside it is a git checkout of its own"), "{why}");
     }
 
     #[test]

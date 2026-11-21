@@ -212,20 +212,15 @@ fn list_bulk(dir: &Path, buf: &mut Vec<u8>, out: &mut Vec<Entry>) -> Option<()> 
         first = false;
         let mut at = 0usize;
         for _ in 0..count {
-            let Some(length) = buf
+            // An entry that does not fit the buffer it came in: not a listing to trust.
+            let length = buf
                 .get(at..at + 4)
                 .and_then(|b| b.try_into().ok())
-                .map(u32::from_ne_bytes)
-            else {
-                return Some(());
-            };
-            let length = length as usize;
-            let Some(data) = buf.get(at..at.saturating_add(length)) else {
-                return Some(());
-            };
+                .map(u32::from_ne_bytes)? as usize;
             if length < 4 {
-                return Some(());
+                return None;
             }
+            let data = buf.get(at..at.checked_add(length)?)?;
             if let Some(entry) = parse_entry(data) {
                 out.push(entry);
             }
