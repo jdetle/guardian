@@ -20,6 +20,12 @@ pub const MIN_GAP: Duration = Duration::from_secs(10 * 60);
 /// is newer than this: usage hovering at a threshold would otherwise scan over and over.
 pub const RISE_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
+/// A scan that runs out of time with places still to measure is followed by another after
+/// `MIN_GAP` instead of a whole interval, at most this many times in a row. The cap is for a
+/// folder too large to ever be measured inside one scan: without it the daemon would rescan
+/// every ten minutes for good.
+pub const MAX_CATCH_UPS: u8 = 6;
+
 /// No scan in the daemon's first minutes: it usually starts at login, when everything else
 /// is starting too.
 const STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
@@ -35,6 +41,8 @@ const SCAN_SECONDS: &str = "120";
 /// - `disk_rose`: it has reached a higher level since the last scan started.
 /// - `index_age`: time since the index was last written; `None` if it never was.
 /// - `since_last_start`: time since this daemon last started a scan, and the gap to leave.
+/// - `catching_up`: the last scan left places unmeasured, and the cap on follow-up scans
+///   has not been reached.
 pub fn due(
     interval_minutes: u64,
     pressure: PressureLevel,
@@ -42,6 +50,7 @@ pub fn due(
     disk_rose: bool,
     index_age: Option<Duration>,
     since_last_start: Option<(Duration, Duration)>,
+    catching_up: bool,
 ) -> bool {
     if interval_minutes == 0 || pressure == PressureLevel::Critical {
         return false;
@@ -57,8 +66,33 @@ pub fn due(
     let interval = Duration::from_secs(interval_minutes.saturating_mul(60));
     match index_age {
         None => true,
-        // The disk has just become tight: have the list ready before it is asked for.
-        Some(age) => age >= interval || (disk_rose && age >= RISE_MIN_AGE),
+        Some(age) => {
+            age >= interval
+                // The disk has just become tight: have the list ready before it is asked for.
+                || (disk_rose && age >= RISE_MIN_AGE)
+                // The last scan did not get through everything: carry on soon.
+                || (catching_up && age >= MIN_GAP)
+        }
+    }
+}
+
+/// How a finished scan ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Everything is measured (or another scan was already doing it).
+    Done,
+    /// Saved what it measured, with places left over.
+    MoreToDo,
+    /// Could not run: an older `guardian` without `disk refresh`, a crash, a signal.
+    Failed,
+}
+
+/// Read a scan's exit status; `None` when it was ended by a signal.
+pub fn outcome(code: Option<i32>) -> Outcome {
+    match code {
+        Some(0) => Outcome::Done,
+        Some(crate::disk_targets::REFRESH_EXIT_MORE) => Outcome::MoreToDo,
+        _ => Outcome::Failed,
     }
 }
 
@@ -106,6 +140,8 @@ pub struct BackgroundScan {
     last_level: u8,
     /// The disk has got tighter and no scan has started since.
     rose: bool,
+    /// Scans in a row that ended with places still to measure.
+    catch_ups: u8,
 }
 
 impl BackgroundScan {
@@ -117,6 +153,7 @@ impl BackgroundScan {
             last_failed: false,
             last_level: 0,
             rose: false,
+            catch_ups: 0,
         }
     }
 
@@ -130,11 +167,17 @@ impl BackgroundScan {
                     let _ = child.kill();
                     let _ = child.wait();
                     self.running = None;
+                    self.catch_ups = self.catch_ups.saturating_add(1);
                     eprintln!("[guardiand] background disk scan stopped: load is critical");
                 }
                 Ok(None) => return,
                 Ok(Some(status)) => {
-                    self.last_failed = !status.success();
+                    let how = outcome(status.code());
+                    self.last_failed = how == Outcome::Failed;
+                    self.catch_ups = match how {
+                        Outcome::MoreToDo => self.catch_ups.saturating_add(1),
+                        _ => 0,
+                    };
                     self.running = None;
                 }
                 Err(_) => self.running = None,
@@ -158,7 +201,16 @@ impl BackgroundScan {
         if self.daemon_started.elapsed() < STARTUP_GRACE {
             return;
         }
-        if !due(interval_minutes, pressure, now > 0, self.rose, index_age(), since_last_start) {
+        let catching_up = (1..=MAX_CATCH_UPS).contains(&self.catch_ups);
+        if !due(
+            interval_minutes,
+            pressure,
+            now > 0,
+            self.rose,
+            index_age(),
+            since_last_start,
+            catching_up,
+        ) {
             return;
         }
         self.last_start = Some(Instant::now());
@@ -166,7 +218,10 @@ impl BackgroundScan {
         self.running = start_scan();
         self.last_failed = self.running.is_none();
         if self.running.is_some() {
-            eprintln!("[guardiand] background disk scan started");
+            eprintln!(
+                "[guardiand] background disk scan started{}",
+                if catching_up { " (carrying on: the last one left places unmeasured)" } else { "" }
+            );
         }
     }
 }
@@ -181,45 +236,84 @@ mod tests {
 
     #[test]
     fn scans_when_the_index_is_missing_or_older_than_the_interval() {
-        assert!(due(180, Clear, false, false, None, None));
-        assert!(due(180, Clear, false, false, Some(4 * HOUR), None));
-        assert!(!due(180, Clear, false, false, Some(2 * HOUR), None));
-        assert!(due(180, Clear, false, false, Some(3 * HOUR), None));
+        assert!(due(180, Clear, false, false, None, None, false));
+        assert!(due(180, Clear, false, false, Some(4 * HOUR), None, false));
+        assert!(!due(180, Clear, false, false, Some(2 * HOUR), None, false));
+        assert!(due(180, Clear, false, false, Some(3 * HOUR), None, false));
     }
 
     #[test]
     fn zero_minutes_turns_it_off() {
-        assert!(!due(0, Clear, true, true, None, None));
-        assert!(!due(0, Clear, true, true, Some(100 * HOUR), None));
+        assert!(!due(0, Clear, true, true, None, None, false));
+        assert!(!due(0, Clear, true, true, Some(100 * HOUR), None, false));
     }
 
     #[test]
     fn never_at_critical_load_and_under_strain_only_when_the_disk_is_tight() {
-        assert!(!due(180, Critical, true, true, None, None));
-        assert!(!due(180, Strained, false, false, Some(9 * HOUR), None));
-        assert!(due(180, Strained, true, false, Some(9 * HOUR), None));
-        assert!(!due(180, Strained, true, false, Some(HOUR), None));
+        assert!(!due(180, Critical, true, true, None, None, false));
+        assert!(!due(180, Strained, false, false, Some(9 * HOUR), None, false));
+        assert!(due(180, Strained, true, false, Some(9 * HOUR), None, false));
+        assert!(!due(180, Strained, true, false, Some(HOUR), None, false));
     }
 
     #[test]
     fn a_disk_that_just_got_tight_is_scanned_without_waiting_for_the_interval() {
-        assert!(due(180, Clear, true, true, Some(HOUR), None));
-        assert!(due(180, Strained, true, true, Some(HOUR), None));
+        assert!(due(180, Clear, true, true, Some(HOUR), None, false));
+        assert!(due(180, Strained, true, true, Some(HOUR), None, false));
         // Unless the index is recent: usage hovering at a threshold must not scan repeatedly.
-        assert!(!due(180, Clear, true, true, Some(50 * MINUTE), None));
+        assert!(!due(180, Clear, true, true, Some(50 * MINUTE), None, false));
         // Tight for a while is not "just got tight".
-        assert!(!due(180, Clear, true, false, Some(HOUR), None));
+        assert!(!due(180, Clear, true, false, Some(HOUR), None, false));
     }
 
     #[test]
     fn leaves_a_gap_after_the_last_start() {
         let just_started = Some((2 * MINUTE, MIN_GAP));
-        assert!(!due(180, Clear, false, false, None, just_started));
-        assert!(!due(180, Clear, true, true, Some(9 * HOUR), just_started));
-        assert!(due(180, Clear, false, false, None, Some((11 * MINUTE, MIN_GAP))));
+        assert!(!due(180, Clear, false, false, None, just_started, false));
+        assert!(!due(180, Clear, true, true, Some(9 * HOUR), just_started, false));
+        assert!(due(180, Clear, false, false, None, Some((11 * MINUTE, MIN_GAP)), false));
         // After a scan that failed, the gap is the whole interval.
-        assert!(!due(180, Clear, false, false, None, Some((HOUR, 3 * HOUR))));
-        assert!(due(180, Clear, false, false, None, Some((3 * HOUR, 3 * HOUR))));
+        assert!(!due(180, Clear, false, false, None, Some((HOUR, 3 * HOUR)), false));
+        assert!(due(180, Clear, false, false, None, Some((3 * HOUR, 3 * HOUR)), false));
+    }
+
+    #[test]
+    fn a_scan_that_left_work_is_followed_up_after_the_minimum_gap() {
+        let catching_up = |pressure, tight, age, since| due(180, pressure, tight, false, Some(age), since, true);
+        assert!(catching_up(Clear, false, 11 * MINUTE, Some((11 * MINUTE, MIN_GAP))));
+        assert!(!catching_up(Clear, false, 9 * MINUTE, Some((11 * MINUTE, MIN_GAP))));
+        assert!(!catching_up(Clear, false, 11 * MINUTE, Some((9 * MINUTE, MIN_GAP))));
+        // The same limits on load apply to a follow-up scan.
+        assert!(!catching_up(Critical, true, HOUR, None));
+        assert!(!catching_up(Strained, false, HOUR, None));
+        assert!(catching_up(Strained, true, HOUR, None));
+        // Without leftover work, an index eleven minutes old is left alone.
+        assert!(!due(180, Clear, false, false, Some(11 * MINUTE), None, false));
+        // Turned off is turned off.
+        assert!(!due(0, Clear, true, false, Some(HOUR), None, true));
+    }
+
+    #[test]
+    fn exit_status_says_how_a_scan_ended() {
+        assert_eq!(outcome(Some(0)), Outcome::Done);
+        assert_eq!(outcome(Some(crate::disk_targets::REFRESH_EXIT_MORE)), Outcome::MoreToDo);
+        // An older guardian has no `disk refresh` and exits 2; a signal gives no status.
+        assert_eq!(outcome(Some(2)), Outcome::Failed);
+        assert_eq!(outcome(Some(1)), Outcome::Failed);
+        assert_eq!(outcome(None), Outcome::Failed);
+    }
+
+    #[test]
+    fn follow_up_scans_stop_after_the_cap() {
+        let mut scan = BackgroundScan::new();
+        let catching_up = |scan: &BackgroundScan| (1..=MAX_CATCH_UPS).contains(&scan.catch_ups);
+        assert!(!catching_up(&scan));
+        scan.catch_ups = 1;
+        assert!(catching_up(&scan));
+        scan.catch_ups = MAX_CATCH_UPS;
+        assert!(catching_up(&scan));
+        scan.catch_ups = MAX_CATCH_UPS + 1;
+        assert!(!catching_up(&scan), "after the cap, back to the normal interval");
     }
 
     #[test]

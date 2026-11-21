@@ -112,7 +112,8 @@ impl ScanArgs {
 #[derive(Subcommand)]
 enum DiskAction {
     /// Bring the saved scan up to date and print one line. guardiand runs this in the
-    /// background; it does nothing if another scan is already running.
+    /// background; it does nothing if another scan is already running. Exits with status 3
+    /// when it ran out of time with places still to measure.
     Refresh,
     /// Scan, then choose what to delete. Asks before deleting anything. Takes the same
     /// scan options as `guardian disk`, before or after the word `clean`.
@@ -242,13 +243,21 @@ fn print_free_space(home: &std::path::Path) {
 fn disk_refresh(scan: &ScanArgs) -> Result<(), String> {
     match disk_targets::refresh(&scan.options()).ok_or("could not find the home directory")? {
         disk_targets::Refresh::Busy => println!("Another disk scan is running; left to it."),
-        disk_targets::Refresh::Done(report) => println!(
-            "Disk scan saved: {} that comes back on its own, {} to look at first; {} sizes reused, {} places still to measure.",
-            disk_targets::human_size(report.regenerates_freed_bytes),
-            disk_targets::human_size(report.review_freed_bytes),
-            report.reused,
-            report.unmeasured + report.outdated
-        ),
+        disk_targets::Refresh::Done(report) => {
+            println!(
+                "Disk scan saved: {} that comes back on its own, {} to look at first; {} sizes reused, {} places still to measure{}.",
+                disk_targets::human_size(report.regenerates_freed_bytes),
+                disk_targets::human_size(report.review_freed_bytes),
+                report.reused,
+                report.pending,
+                if report.discovery_complete { "" } else { ", and the search was cut short" }
+            );
+            if report.work_left() {
+                // Not a failure: what was measured is saved. It tells guardiand to run
+                // another scan soon rather than wait a whole interval.
+                std::process::exit(disk_targets::REFRESH_EXIT_MORE);
+            }
+        }
     }
     Ok(())
 }

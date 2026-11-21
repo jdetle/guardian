@@ -111,6 +111,9 @@ pub struct Report {
     /// Sizes shown from an earlier scan that were due for measuring again but not reached
     /// in time.
     pub outdated: usize,
+    /// Places another scan still has work to do on: never measured, measured only in part,
+    /// or due for measuring again and not reached.
+    pub pending: usize,
 }
 
 pub struct Options {
@@ -141,6 +144,10 @@ impl Default for Options {
 
 /// Untouched for this long counts as "old" when choosing what to delete in bulk.
 pub const OLD_DAYS: u64 = 14;
+
+/// Exit status of `guardian disk refresh` when it saved what it could but ran out of time
+/// with places still to measure or to search: guardiand then runs it again soon.
+pub const REFRESH_EXIT_MORE: i32 = 3;
 
 /// How long a saved size stands in for measuring again when nothing looks to have changed.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(12 * 3600);
@@ -1084,6 +1091,7 @@ fn survey_with(
         .collect();
     let reused = sizes.len();
     let mut outdated = 0usize;
+    let mut reached = vec![false; entries.len()];
     let mut last_save = Instant::now();
     for i in 0..entries.len() {
         if !due[i] {
@@ -1113,6 +1121,7 @@ fn survey_with(
         sizes.insert(entries[i].path.clone(), size);
         entries[i].size = Some(size);
         entries[i].measured_at = Some(unix_now());
+        reached[i] = true;
         if last_save.elapsed() >= SAVE_EVERY {
             save(&index_of(&entries));
             last_save = Instant::now();
@@ -1123,6 +1132,9 @@ fn survey_with(
     let mut report = report_from(home, opts, &index, false);
     report.reused = reused;
     report.outdated = outdated;
+    report.pending = (0..entries.len())
+        .filter(|&i| (due[i] && !reached[i]) || entries[i].size.map_or(true, |s| !s.complete))
+        .count();
     (report, index)
 }
 
@@ -1296,6 +1308,11 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
         from_cache,
         reused: 0,
         outdated: 0,
+        pending: index
+            .entries
+            .iter()
+            .filter(|c| c.size.map_or(true, |s| !s.complete))
+            .count(),
     }
 }
 
@@ -1428,6 +1445,12 @@ impl Target {
 }
 
 impl Report {
+    /// True when another scan would find or measure more: places are pending, or the
+    /// search for repositories was cut short.
+    pub fn work_left(&self) -> bool {
+        self.pending > 0 || !self.discovery_complete
+    }
+
     pub fn render(&self) -> String {
         let mut out = format!(
             "Disk: {:.1}% used, {:.1} GB free on {}\nScanned {} git repositor{} and the usual tool caches.\n\n",
@@ -2421,6 +2444,8 @@ mod tests {
         );
         assert_eq!(report.unmeasured, 1, "the new cache is known but not yet measured");
         assert_eq!(report.outdated, 2);
+        assert_eq!(report.pending, 3);
+        assert!(report.work_left());
         let text = report.render();
         assert!(text.contains("2 sizes are from an earlier scan"), "{text}");
         assert!(text.contains("there may be more to find"), "{text}");
@@ -2432,7 +2457,8 @@ mod tests {
             listed(&report),
             vec!["~/.cache/uv", "~/.npm/_cacache", "~/code/web/node_modules"]
         );
-        assert_eq!((report.unmeasured, report.outdated), (0, 0));
+        assert_eq!((report.unmeasured, report.outdated, report.pending), (0, 0, 0));
+        assert!(!report.work_left());
     }
 
     #[test]
@@ -2499,8 +2525,11 @@ mod tests {
         saved.entries[0].size = Some(Size { bytes: 5, freed: 5, complete: false });
         save_index(&index, &saved).unwrap();
 
+        let saved_report = cached_at(&s.0, &small_floor(), &index).unwrap();
+        assert_eq!(saved_report.pending, 1, "a size measured in part is work left over");
+
         let report = survey_saved(&s.0, &small_floor(), &index, false).unwrap();
-        assert_eq!(report.reused, 0);
+        assert_eq!((report.reused, report.pending), (0, 0));
         let npm = find(&report, "~/.npm/_cacache");
         assert!(npm.complete && npm.bytes >= 200_000);
     }
