@@ -6,6 +6,8 @@ import SwiftUI
 struct MenuBarView: View {
     @EnvironmentObject private var client: GuardianClient
     @State private var copiedPath: String?
+    /// Paths ticked for deletion in the disk list.
+    @State private var selected: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -243,8 +245,13 @@ struct MenuBarView: View {
 
     // MARK: - Disk
 
+    /// Height of the list of targets. Exact, not a maximum: a menu bar panel sizes itself to
+    /// the least its content needs, which for a scroll view with only a maximum is nothing,
+    /// and the rows vanished. Sized so the whole panel fits a 13-inch screen.
+    private static let listHeight: CGFloat = 214
+
     private var diskSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Free up disk space")
                     .font(.caption.weight(.semibold))
@@ -286,19 +293,13 @@ struct MenuBarView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(report.targets) { target in
-                                targetRow(target)
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 260)
-                    Text("The bin deletes after asking, and only what is safe: nothing git tracks, no worktree with uncommitted work. Other rows copy a command to run yourself.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    targetList(report.targets)
                 }
+            } else if !client.diskScanning {
+                Text("Lists build output, dependency folders, unused worktrees and caches, with what deleting each would free. Finding them deletes nothing.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -318,11 +319,126 @@ struct MenuBarView: View {
         return text
     }
 
-    private func targetRow(_ target: DiskTarget) -> some View {
+    /// Ticked rows that are still in the list, without any that sit inside another.
+    private func picked(from targets: [DiskTarget]) -> [DiskTarget] {
+        DiskTarget.withoutNested(targets.filter { $0.deletable && selected.contains($0.path) })
+    }
+
+    /// Everything found, in one scrolling list: first what Guardian deletes itself (tick,
+    /// then one button), then what needs its own tool or a decision (a command to copy).
+    @ViewBuilder
+    private func targetList(_ targets: [DiskTarget]) -> some View {
+        let deletable = targets.filter(\.deletable)
+        let manual = targets.filter { !$0.deletable }
+        let chosen = picked(from: targets)
+        let suggested = deletable.filter(\.isOldAndSafe)
+
+        if !deletable.isEmpty {
+            Text("Tick what to delete, then press Delete selected. Nothing is removed until you confirm.")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        Text(counts(deletable: deletable.count, manual: manual.count))
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(deletable) { target in
+                    deletableRow(target)
+                }
+                if !manual.isEmpty {
+                    Text("Needs a command: Guardian does not delete these itself. Copy the command and run it in a terminal.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, deletable.isEmpty ? 0 : 6)
+                    ForEach(manual) { target in
+                        commandRow(target)
+                    }
+                }
+            }
+        }
+        .frame(height: Self.listHeight)
+        if !deletable.isEmpty {
+            HStack {
+                Button(selected.isEmpty ? "Tick old and safe" : "Untick all") {
+                    selected = selected.isEmpty ? Set(suggested.map(\.path)) : []
+                }
+                .disabled(selected.isEmpty && suggested.isEmpty)
+                .help(suggested.isEmpty
+                    ? "Nothing here both comes back on its own and has gone untouched for \(DiskTarget.oldDays) days. Tick rows yourself."
+                    : "Ticks the \(suggested.count) that come back on their own and have gone untouched for \(DiskTarget.oldDays) days or more")
+                Spacer()
+                Button(chosen.isEmpty
+                    ? "Delete selected…"
+                    : "Delete \(chosen.count) selected (\(DiskTarget.sizeText(chosen.map(\.freedBytes).reduce(0, +))))…") {
+                    confirmDelete(chosen)
+                }
+                .disabled(chosen.isEmpty || !client.deletingPaths.isEmpty)
+                .help("Asks first. Deletes only what is safe: nothing git tracks, no worktree with uncommitted work. Each one is checked again at that moment.")
+            }
+        }
+    }
+
+    private func counts(deletable: Int, manual: Int) -> String {
+        var parts: [String] = []
+        if deletable > 0 { parts.append("\(deletable) Guardian can delete") }
+        if manual > 0 { parts.append("\(manual) that need a command") }
+        return parts.joined(separator: ", ") + ". Scroll for more."
+    }
+
+    private func deletableRow(_ target: DiskTarget) -> some View {
+        let isOn = Binding(
+            get: { selected.contains(target.path) },
+            set: { on in
+                if on { selected.insert(target.path) } else { selected.remove(target.path) }
+            }
+        )
+        return HStack(alignment: .top, spacing: 8) {
+            if client.deletingPaths.contains(target.path) {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16)
+            } else {
+                Toggle("Delete \(target.displayPath)", isOn: isOn)
+                    .toggleStyle(.checkbox)
+                    .labelsHidden()
+                    .disabled(!client.deletingPaths.isEmpty)
+            }
+            targetText(target)
+            Spacer(minLength: 0)
+            finderButton(target)
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(isOn.wrappedValue ? 0.12 : 0.05)))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if client.deletingPaths.isEmpty { isOn.wrappedValue.toggle() }
+        }
+    }
+
+    private func commandRow(_ target: DiskTarget) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            targetText(target)
+            Spacer(minLength: 0)
+            finderButton(target)
+            Button(copiedPath == target.path ? "Copied" : "Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(target.remove, forType: .string)
+                copiedPath = target.path
+            }
+            .controlSize(.small)
+            .help("Copy: \(target.remove)")
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+    }
+
+    private func targetText(_ target: DiskTarget) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(target.sizeText)
                 .font(.caption.monospacedDigit().weight(.medium))
-                .frame(width: 62, alignment: .trailing)
+                .frame(width: 56, alignment: .trailing)
             VStack(alignment: .leading, spacing: 1) {
                 Text(target.what)
                     .font(.caption)
@@ -335,65 +451,52 @@ struct MenuBarView: View {
                 Text(target.detailText)
                     .font(.caption2)
                     .foregroundStyle(target.regenerates ? Color.secondary : Color.orange)
-                    .lineLimit(3)
+                    .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 0)
-            Button {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: target.path)])
-            } label: {
-                Image(systemName: "folder")
-            }
-            .buttonStyle(.borderless)
-            .help("Show in Finder")
-            if client.deletingPath == target.path {
-                ProgressView()
-                    .controlSize(.small)
-            } else if target.deletable {
-                Button {
-                    confirmDelete(target)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .disabled(client.deletingPath != nil)
-                .help("Delete (asks first)")
-            } else {
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(target.remove, forType: .string)
-                    copiedPath = target.path
-                } label: {
-                    Image(systemName: copiedPath == target.path ? "checkmark" : "doc.on.doc")
-                }
-                .buttonStyle(.borderless)
-                .help("Copy: \(target.remove)")
+                    .help(target.detailText)
             }
         }
-        .padding(6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+    }
+
+    private func finderButton(_ target: DiskTarget) -> some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: target.path)])
+        } label: {
+            Image(systemName: "folder")
+        }
+        .buttonStyle(.borderless)
+        .help("Show in Finder")
     }
 
     /// Ask before deleting. Cancel is the default button; the delete button is marked
     /// destructive, so Return never deletes.
-    private func confirmDelete(_ target: DiskTarget) {
+    private func confirmDelete(_ targets: [DiskTarget]) {
+        guard !targets.isEmpty else { return }
+        let total = DiskTarget.sizeText(targets.map(\.freedBytes).reduce(0, +))
         let alert = NSAlert()
-        alert.alertStyle = target.regenerates ? .informational : .warning
-        alert.messageText = "Delete \(target.what.lowercased()), \(target.sizeText)?"
-        var lines = [target.displayPath, target.detailText]
-        if target.kind == "worktree" {
-            lines.append("Removed with git worktree remove. Ignored files in it, such as .env files and installed dependencies, are deleted with it.")
-        } else {
-            lines.append("It comes back: \(target.cost).")
+        alert.alertStyle = targets.allSatisfy(\.regenerates) ? .informational : .warning
+        alert.messageText = targets.count == 1
+            ? "Delete \(targets[0].what.lowercased()), freeing about \(total)?"
+            : "Delete these \(targets.count) items, freeing about \(total)?"
+        var lines = targets.prefix(8).map { target in
+            "\(target.sizeText)  \(target.displayPath)" + (target.regenerates ? "" : "\n    Look first: \(target.detailText)")
         }
-        lines.append("This cannot be undone.")
-        alert.informativeText = lines.joined(separator: "\n\n")
+        if targets.count > 8 {
+            lines.append("…and \(targets.count - 8) more")
+        }
+        var notes: [String] = []
+        if targets.contains(where: { $0.kind == "worktree" }) {
+            notes.append("Worktrees are removed with git worktree remove. Ignored files in them, such as .env files and installed dependencies, go with them; their branches stay.")
+        }
+        notes.append("Each one is checked again first, and anything with unsaved work is kept. This cannot be undone.")
+        alert.informativeText = lines.joined(separator: "\n") + "\n\n" + notes.joined(separator: "\n\n")
         alert.addButton(withTitle: "Cancel")
         let delete = alert.addButton(withTitle: "Delete")
         delete.hasDestructiveAction = true
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn {
-            client.deleteTarget(target)
+            selected.subtract(targets.map(\.path))
+            client.deleteTargets(targets)
         }
     }
 

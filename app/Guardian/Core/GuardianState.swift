@@ -255,6 +255,23 @@ struct DiskTarget: Codable, Sendable, Identifiable {
 
     var regenerates: Bool { safety == "regenerates" }
 
+    /// Untouched for this long counts as old (OLD_DAYS in src/disk_targets.rs).
+    static let oldDays = 14
+
+    /// Something Guardian can delete that comes back on its own and has gone untouched for
+    /// `oldDays`: what `guardian disk clean` selects with `old`.
+    var isOldAndSafe: Bool {
+        deletable && regenerates && kind != "cache" && (ageDays ?? 0) >= Self.oldDays
+    }
+
+    /// `targets` without those inside another of them: deleting a worktree takes the build
+    /// folders in it along, so they are not deleted, or counted, a second time.
+    static func withoutNested(_ targets: [DiskTarget]) -> [DiskTarget] {
+        targets.filter { inner in
+            !targets.contains { $0.path != inner.path && inner.path.hasPrefix($0.path + "/") }
+        }
+    }
+
     /// What deleting it would free; `+` marks a lower bound.
     var sizeText: String {
         let text = Self.sizeText(freedBytes)

@@ -21,8 +21,8 @@ final class GuardianClient: ObservableObject {
     @Published private(set) var diskReport: DiskReport?
     @Published private(set) var diskScanning = false
     @Published private(set) var diskScanError: String?
-    /// The path being deleted right now, if any.
-    @Published private(set) var deletingPath: String?
+    /// The paths being deleted right now.
+    @Published private(set) var deletingPaths: Set<String> = []
     /// The outcome of the last delete, in a sentence.
     @Published private(set) var deleteMessage: String?
     @Published var history: [GuardianStateData] = []
@@ -41,6 +41,7 @@ final class GuardianClient: ObservableObject {
     private let promptControlQueue = DispatchQueue(label: "guardian.prompt-controls")
     private let scanQueue = DispatchQueue(label: "guardian.disk-scan", qos: .utility)
     private let savedScanQueue = DispatchQueue(label: "guardian.disk-saved-scan", qos: .utility)
+    private let deleteQueue = DispatchQueue(label: "guardian.disk-delete", qos: .userInitiated)
     private var timer: Timer?
 
     static let maxHistoryCount = 150
@@ -212,43 +213,66 @@ final class GuardianClient: ObservableObject {
         }
     }
 
-    /// Delete one scanned target with `guardian disk delete`. The CLI re-checks it first
-    /// (nothing git tracks, no uncommitted work in a worktree) and refuses otherwise.
+    /// Delete scanned targets with `guardian disk delete`. The CLI re-checks each one first
+    /// (nothing git tracks, no uncommitted work in a worktree) and keeps what fails.
     /// Call only after the person has confirmed.
-    func deleteTarget(_ target: DiskTarget) {
-        guard deletingPath == nil else { return }
-        deletingPath = target.path
+    func deleteTargets(_ targets: [DiskTarget]) {
+        let chosen = DiskTarget.withoutNested(targets)
+        guard deletingPaths.isEmpty, !chosen.isEmpty else { return }
+        deletingPaths = Set(chosen.map(\.path))
         deleteMessage = nil
         let executable = guardianDir.appendingPathComponent("guardian")
-        scanQueue.async {
+        // Not the scan queue: a delete must not wait behind a scan that is running.
+        deleteQueue.async {
             let process = Process()
             process.executableURL = executable
-            process.arguments = ["disk", "delete", "--yes", "--json", target.path]
+            process.arguments = ["disk", "delete", "--yes", "--json"] + chosen.map(\.path)
             let out = Pipe()
             process.standardOutput = out
             process.standardError = FileHandle.nullDevice
-            var result: DeleteResult?
+            var results: [DeleteResult] = []
             do {
                 try process.run()
                 let data = out.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                result = (try? JSONDecoder().decode([DeleteResult].self, from: data))?.first
+                results = (try? JSONDecoder().decode([DeleteResult].self, from: data)) ?? []
             } catch {
-                result = nil
+                results = []
             }
             DispatchQueue.main.async {
-                self.deletingPath = nil
-                if let result, result.ok {
+                self.deletingPaths = []
+                let deleted = results.filter(\.ok)
+                let kept = results.filter { !$0.ok }
+                for done in deleted {
                     self.diskReport?.targets.removeAll {
-                        $0.path == target.path || $0.path.hasPrefix(target.path + "/")
+                        $0.path == done.path || $0.path.hasPrefix(done.path + "/")
                     }
-                    self.deleteMessage = "Deleted \(target.displayPath), freeing about \(DiskTarget.sizeText(result.freedBytes ?? target.freedBytes))."
-                    self.loadState()
-                } else {
-                    self.deleteMessage = "Kept \(target.displayPath): \(result?.error ?? "the delete command did not run")."
                 }
+                self.deleteMessage = Self.deleteSummary(chosen: chosen, deleted: deleted, kept: kept)
+                self.loadState()
+                // Bring the totals up to date; quick, since only what changed is measured.
+                if !deleted.isEmpty { self.scanDisk() }
             }
         }
+    }
+
+    /// One or two sentences on what a delete did.
+    static func deleteSummary(chosen: [DiskTarget], deleted: [DeleteResult], kept: [DeleteResult]) -> String {
+        let shown = { (path: String) in chosen.first { $0.path == path }?.displayPath ?? path }
+        var parts: [String] = []
+        if deleted.count == 1 {
+            parts.append("Deleted \(shown(deleted[0].path)), freeing about \(DiskTarget.sizeText(deleted[0].freedBytes ?? 0)).")
+        } else if deleted.count > 1 {
+            let freed = deleted.compactMap(\.freedBytes).reduce(0, +)
+            parts.append("Deleted \(deleted.count) items, freeing about \(DiskTarget.sizeText(freed)).")
+        }
+        for result in kept {
+            parts.append("Kept \(shown(result.path)): \(result.error ?? "it could not be deleted").")
+        }
+        if deleted.isEmpty && kept.isEmpty {
+            parts.append("Nothing was deleted: the delete command did not run.")
+        }
+        return parts.joined(separator: " ")
     }
 
     private func loadState() {
