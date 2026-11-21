@@ -887,6 +887,10 @@ CL_TPL="$HOOKS_DIR/claude-code-hooks.json"
 CL_PH="__GUARDIAN_CLAUDE_HOOK_ROOT__"
 merge_dir=$(mktemp -d)
 run_merge() { bash "$MERGE" "$1" "$CL_TPL" "$CL_PH" "$2" "$1.bak" >/dev/null 2>&1; }
+# How many handlers each template registers, counted from the templates themselves so that
+# adding a hook does not make these checks stale.
+cl_handlers=$(jq '[.hooks[][] | .hooks[]] | length' "$CL_TPL" 2>/dev/null)
+cursor_handlers=$(jq '[.hooks[][]] | length' "$HOOKS_DIR/hooks.json" 2>/dev/null)
 
 cat >"$merge_dir/base.json" <<'JSON'
 {"tui":"fullscreen","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/other/hook.sh"},{"type":"command","command":"/home/u/.claude/hooks/guardian/claude/pre-tool-use.sh"}]}],"Stop":[{"hooks":[{"type":"command","command":"/other/stop.sh"}]}]}}
@@ -896,10 +900,10 @@ cp "$merge_dir/base.json" "$merge_dir/after1.json"
 guardian_count=$(jq '[.hooks[][] | .hooks[] | select(.command | contains("/hooks/guardian/"))] | length' "$merge_dir/base.json" 2>/dev/null)
 other_kept=$(jq '[.hooks[][] | .hooks[] | select(.command | startswith("/other/"))] | length' "$merge_dir/base.json" 2>/dev/null)
 tui=$(jq -r '.tui // ""' "$merge_dir/base.json" 2>/dev/null)
-if [ "$guardian_count" = "3" ] && [ "$other_kept" = "2" ] && [ "$tui" = "fullscreen" ]; then
+if [ "${cl_handlers:-0}" -ge 3 ] && [ "$guardian_count" = "$cl_handlers" ] && [ "$other_kept" = "2" ] && [ "$tui" = "fullscreen" ]; then
     pass "installer merge: replaces Guardian handlers, keeps other hooks and settings"
 else
-    fail "installer merge: guardian=$guardian_count other=$other_kept tui=$tui"
+    fail "installer merge: guardian=$guardian_count (template has $cl_handlers) other=$other_kept tui=$tui"
 fi
 
 echo 'ORIGINAL-BACKUP-SENTINEL' >"$merge_dir/base.json.bak"
@@ -955,10 +959,10 @@ JSON
 run_merge "$merge_dir/legacy.json" /home/u/.claude/hooks/guardian
 n=$(jq '[.hooks[][] | .hooks[]] | length' "$merge_dir/legacy.json" 2>/dev/null)
 unmatched=$(jq '[.hooks.PreToolUse[] | select(.matcher == null)] | length' "$merge_dir/legacy.json" 2>/dev/null)
-if [ "$n" = "3" ] && [ "$unmatched" = "0" ]; then
+if [ "$n" = "$cl_handlers" ] && [ "$unmatched" = "0" ]; then
     pass "installer merge: upgrade from 0.3.1 removes duplicate and matcher-less Guardian entries"
 else
-    fail "installer merge: legacy upgrade left n=$n unmatched=$unmatched"
+    fail "installer merge: legacy upgrade left n=$n (template has $cl_handlers) unmatched=$unmatched"
 fi
 # Cursor's flat hook shape goes through the same helper
 cat >"$merge_dir/cursor.json" <<'JSON'
@@ -969,10 +973,10 @@ own=$(jq -r '.hooks.preToolUse[0].command' "$merge_dir/cursor.json" 2>/dev/null)
 fmt=$(jq -r '.hooks.afterFileEdit[0].command' "$merge_dir/cursor.json" 2>/dev/null)
 g=$(jq '[.hooks[][] | select(.command | contains("/hooks/guardian/"))] | length' "$merge_dir/cursor.json" 2>/dev/null)
 rel=$(jq '[.hooks[][] | select((.command | startswith("./hooks/")) and (.command | test("my-own|format") | not))] | length' "$merge_dir/cursor.json" 2>/dev/null)
-if [ "$own" = "./hooks/my-own.sh" ] && [ "$fmt" = "./hooks/format.sh" ] && [ "$g" = "7" ] && [ "$rel" = "0" ]; then
-    pass "cursor merge: user's own ./hooks/ commands and same-event hooks survive; Guardian's 7 are absolute, no duplicates"
+if [ "$own" = "./hooks/my-own.sh" ] && [ "$fmt" = "./hooks/format.sh" ] && [ "${cursor_handlers:-0}" -ge 7 ] && [ "$g" = "$cursor_handlers" ] && [ "$rel" = "0" ]; then
+    pass "cursor merge: user's own ./hooks/ commands and same-event hooks survive; Guardian's $cursor_handlers are absolute, no duplicates"
 else
-    fail "cursor merge: own=$own fmt=$fmt guardian=$g relative=$rel"
+    fail "cursor merge: own=$own fmt=$fmt guardian=$g (template has $cursor_handlers) relative=$rel"
 fi
 
 bash "$MERGE" --remove "$merge_dir/cursor.json" /home/u/.cursor/hooks/guardian "$merge_dir/cursor.un.bak" >/dev/null 2>&1
