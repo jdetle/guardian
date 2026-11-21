@@ -203,10 +203,36 @@ db_exec() {
     sqlite3 "$SESSIONS_DB" ".timeout 5000" "$sql" 2>/dev/null || true
 }
 
+# Which agent is calling: cursor (the default), claude or codex. Anything else is not
+# written to the database as it came.
+guardian_hook_client() {
+    case "${GUARDIAN_HOOK_FORMAT:-cursor}" in
+        claude) echo claude ;;
+        codex) echo codex ;;
+        *) echo cursor ;;
+    esac
+}
+
+# The schema below is version 2: sessions know which agent they belong to (client), where
+# they run (cwd), what they are doing (state: working | idle | ended) and when they last did
+# anything, so that sessions from Cursor, Claude Code and Codex can be followed side by side.
+SESSIONS_SCHEMA_VERSION=2
+
+# Create sessions.db, or bring an older one up to date. Hooks call this on every event, so
+# the usual case is two file tests and no process.
 ensure_db() {
-    if [ ! -f "$SESSIONS_DB" ]; then
-        mkdir -p "$GUARDIAN_DIR"
-        sqlite3 "$SESSIONS_DB" > /dev/null 2>&1 << 'SQL'
+    local marker="$GUARDIAN_DIR/.sessions_schema_v$SESSIONS_SCHEMA_VERSION"
+    if [ -f "$SESSIONS_DB" ] && [ -f "$marker" ]; then
+        return 0
+    fi
+    mkdir -p "$GUARDIAN_DIR"
+    # Read from stdin, sqlite3 carries on past a statement that fails, which is what makes
+    # this safe to run on any earlier database: an ALTER for a column that is already there
+    # fails and the rest still runs.
+    # (`|| true`: one of those failures makes sqlite3 exit non-zero, and the hooks that call
+    # this run under `set -e`.)
+    sqlite3 "$SESSIONS_DB" > /dev/null 2>&1 << 'SQL' || true
+.timeout 5000
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS sessions (
     conversation_id TEXT PRIMARY KEY,
@@ -222,7 +248,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     files_modified INTEGER DEFAULT 0,
     lines_changed INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0.0,
-    roi_score REAL
+    roi_score REAL,
+    client TEXT,
+    cwd TEXT,
+    state TEXT,
+    last_activity_at TEXT,
+    prompt_count INTEGER DEFAULT 0,
+    turn_count INTEGER DEFAULT 0,
+    subagent_count INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,8 +275,37 @@ CREATE TABLE IF NOT EXISTS pressure_samples (
     docker_cpu_percent REAL,
     sampled_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+ALTER TABLE sessions ADD COLUMN client TEXT;
+ALTER TABLE sessions ADD COLUMN cwd TEXT;
+ALTER TABLE sessions ADD COLUMN state TEXT;
+ALTER TABLE sessions ADD COLUMN last_activity_at TEXT;
+ALTER TABLE sessions ADD COLUMN prompt_count INTEGER DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN turn_count INTEGER DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN subagent_count INTEGER DEFAULT 0;
+CREATE INDEX IF NOT EXISTS tool_calls_by_session ON tool_calls(conversation_id);
+CREATE INDEX IF NOT EXISTS pressure_samples_by_session ON pressure_samples(conversation_id);
+-- Before version 2 only Cursor's hooks recorded a tool call or the end of a turn, so a
+-- session with either is Cursor's. The rest (started and never heard from again) came from
+-- Claude Code or Codex and are left unlabelled: there is no telling which.
+UPDATE sessions SET client = 'cursor' WHERE client IS NULL AND (ended_at IS NOT NULL OR tool_call_count > 0);
+UPDATE sessions SET state = 'ended' WHERE state IS NULL;
 SQL
+    # Marked only once the new columns are really there, so a failed upgrade is tried again.
+    if sqlite3 "$SESSIONS_DB" ".timeout 5000" \
+        "SELECT client, cwd, state, last_activity_at, prompt_count, turn_count, subagent_count FROM sessions LIMIT 0;" \
+        >/dev/null 2>&1; then
+        : > "$marker" 2>/dev/null || true
     fi
+}
+
+# Records a prompt in sessions.db (state: working). For the prompt hooks to call once they
+# know the prompt is going through: a prompt Guardian paused never reaches the agent, and
+# nothing would ever mark its turn as over.
+guardian_record_prompt() {
+    local lib_dir
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [ -f "$lib_dir/session-event.sh" ] || return 0
+    printf '%s' "$1" | bash "$lib_dir/session-event.sh" prompt >/dev/null 2>&1 || true
 }
 
 json_output() {

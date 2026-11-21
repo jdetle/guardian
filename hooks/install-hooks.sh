@@ -28,6 +28,7 @@ cp "$SCRIPT_DIR/pre-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/subagent-start.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/post-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/stop.sh" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/session-event.sh" "$SCRIPT_DIR/session-event.jq" "$SCRIPT_DIR/session-end.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/cursorignore_check.py" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/iso_to_epoch.py" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/cursorignore-checklist.json" "$HOOKS_DIR/"
@@ -37,6 +38,11 @@ chmod +x "$HOOKS_DIR"/*.sh
 chmod +x "$HOOKS_DIR/cursorignore_check.py" "$HOOKS_DIR/iso_to_epoch.py" 2>/dev/null || true
 mkdir -p "$GUARDIAN_DIR"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Which Guardian these hooks came from, for `guardian hooks status`.
+# (From the binary it is handed in; from a checkout it is read from Cargo.toml; with neither,
+# as in the test container, it is "unknown". `|| true`: a missing file must not stop the install.)
+GUARDIAN_HOOKS_VERSION="${GUARDIAN_HOOKS_VERSION:-$({ sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true; } | head -1)}"
+printf '%s\n' "${GUARDIAN_HOOKS_VERSION:-unknown}" > "$HOOKS_DIR/VERSION"
 if [ -f "$REPO_ROOT/scripts/guardian-queue.sh" ]; then
     cp "$REPO_ROOT/scripts/guardian-queue.sh" "$GUARDIAN_DIR/"
     chmod +x "$GUARDIAN_DIR/guardian-queue.sh"

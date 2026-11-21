@@ -25,6 +25,7 @@ cp "$HOOKS_SRC/lib.sh" "$DEST/"
 cp "$HOOKS_SRC/prompt-gate-common.sh" "$DEST/"
 cp "$HOOKS_SRC/tool-gate-common.sh" "$DEST/"
 cp "$HOOKS_SRC/session-start.sh" "$DEST/"
+cp "$HOOKS_SRC/session-event.sh" "$HOOKS_SRC/session-event.jq" "$HOOKS_SRC/stop.sh" "$DEST/"
 cp "$HOOKS_SRC/cursorignore_check.py" "$DEST/"
 cp "$HOOKS_SRC/iso_to_epoch.py" "$DEST/"
 cp "$HOOKS_SRC/cursorignore-checklist.json" "$DEST/"
@@ -35,6 +36,13 @@ cp "$HOOKS_SRC/codex/"*.sh "$DEST/codex/"
 cp "$HOOKS_SRC/claude/"*.sh "$DEST/claude/"
 chmod +x "$DEST"/*.sh "$DEST/codex"/*.sh "$DEST/claude"/*.sh
 chmod +x "$DEST/cursorignore_check.py" "$DEST/iso_to_epoch.py" 2>/dev/null || true
+
+
+# Which Guardian these hooks came from, for `guardian hooks status`.
+# (From the binary it is handed in; from a checkout it is read from Cargo.toml; with neither,
+# as in the test container, it is "unknown". `|| true`: a missing file must not stop the install.)
+GUARDIAN_HOOKS_VERSION="${GUARDIAN_HOOKS_VERSION:-$({ sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true; } | head -1)}"
+printf '%s\n' "${GUARDIAN_HOOKS_VERSION:-unknown}" > "$DEST/VERSION"
 
 mkdir -p "$GUARDIAN_DIR"
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ]; then
@@ -51,7 +59,8 @@ fi
 
 echo "[3/3] Done."
 echo ""
-echo "Installed: SessionStart, UserPromptSubmit (prompt gate), PreToolUse (Bash|Agent|Task advisory)."
+echo "Installed: SessionStart, UserPromptSubmit (prompt gate), PreToolUse (Bash|Agent|Task advisory),"
+echo "and session tracking for the menu bar app: PostToolUse, Stop, SessionEnd (record only, in the background)."
 echo "New Claude Code sessions pick the hooks up automatically; running sessions keep the hooks"
 echo "they started with — start a new session (or open /hooks) to load them."
 echo "Blocked prompt? Run: $GUARDIAN_DIR/guardian snooze 15   (or: $GUARDIAN_DIR/guardian once)"

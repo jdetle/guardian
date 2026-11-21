@@ -46,6 +46,12 @@
         "command": "./hooks/stop.sh",
         "timeout": 10
       }
+    ],
+    "sessionEnd": [
+      {
+        "command": "./hooks/session-end.sh",
+        "timeout": 5
+      }
     ]
   }
 }

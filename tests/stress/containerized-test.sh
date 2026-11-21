@@ -1052,6 +1052,18 @@ else
     pass "guardian dir check (running inside container: $TEST_MODE)"
 fi
 
+# ─── Session tracking for Cursor, Claude Code and Codex ─────────────────
+
+echo -e "\n${BOLD}${CYAN}=== Session tracking (sessions.db) for all three agents ===${NC}"
+
+# Its own script, with a scratch HOME of its own, so that it also runs on macOS in CI.
+if session_out=$(bash "$(dirname "$0")/session-hooks-test.sh" 2>&1); then
+    pass "session tracking hooks: $(echo "$session_out" | tail -1)"
+else
+    fail "session tracking hooks: $(echo "$session_out" | tail -1)"
+    echo "$session_out" | grep -v '^  PASS' || true
+fi
+
 # ─── Summary ────────────────────────────────────────────────────────────
 
 echo -e "\n${BOLD}${CYAN}════════════════════════════════════════${NC}"

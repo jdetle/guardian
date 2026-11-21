@@ -61,6 +61,13 @@ enum Commands {
         #[command(subcommand)]
         action: Option<DiskAction>,
     },
+    /// Guardian's hooks for Cursor, Claude Code and Codex: see whether each agent has
+    /// them and whether they are this version's, and install or update them. The hooks are
+    /// carried in this binary; no copy of the repository is needed.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
     /// Show how much time was spent at each pressure level, per day.
     Stats {
         /// How many of the most recent days to show.
@@ -158,6 +165,30 @@ enum DiskAction {
         /// Print JSON results.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Say, for each agent, whether Guardian's hooks are installed and up to date.
+    /// Exits non-zero if an agent that is set up on this machine lacks current hooks.
+    Status {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install or update the hooks. With no agent named: for every agent set up on this
+    /// machine. Other hooks and settings in the agents' files are left alone.
+    Install {
+        #[arg(long)]
+        cursor: bool,
+        #[arg(long)]
+        claude: bool,
+        #[arg(long)]
+        codex: bool,
+        /// Only agents that already have Guardian hooks: bring those up to date, add none.
+        #[arg(long, conflicts_with_all = ["cursor", "claude", "codex"])]
+        upgrade: bool,
     },
 }
 
@@ -744,6 +775,80 @@ fn disk_delete(paths: &[PathBuf], yes: bool, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn hooks_status(json: bool) -> Result<(), String> {
+    use guardian_daemon::agent_hooks;
+    let places = agent_hooks::Places::from_process().ok_or("could not find the home directory")?;
+    let all = agent_hooks::status(&places, env!("CARGO_PKG_VERSION"));
+    if json {
+        println!("{}", serde_json::to_string(&all).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    for st in &all {
+        println!("{:<12} {}", st.label, st.summary);
+    }
+    if all.iter().any(|st| st.client == "codex" && st.installed) {
+        println!("\nCodex runs new or changed hooks only once you have approved them: /hooks in the CLI, Settings > Hooks in the app.");
+    }
+    if all.iter().any(|st| st.present && !st.current) {
+        return Err("Some agents on this machine do not have this Guardian's hooks; see above.".to_string());
+    }
+    Ok(())
+}
+
+fn hooks_install(cursor: bool, claude: bool, codex: bool, upgrade: bool) -> Result<(), String> {
+    use guardian_daemon::agent_hooks::{self, Client};
+    let places = agent_hooks::Places::from_process().ok_or("could not find the home directory")?;
+    let version = env!("CARGO_PKG_VERSION");
+    let named: Vec<Client> = [(cursor, Client::Cursor), (claude, Client::Claude), (codex, Client::Codex)]
+        .into_iter()
+        .filter(|(wanted, _)| *wanted)
+        .map(|(_, client)| client)
+        .collect();
+    let chosen: Vec<Client> = if !named.is_empty() {
+        named
+    } else {
+        Client::ALL
+            .into_iter()
+            .filter(|c| {
+                let st = agent_hooks::client_status(*c, &places, version);
+                if upgrade { st.installed && !st.current } else { st.present }
+            })
+            .collect()
+    };
+    if chosen.is_empty() {
+        println!(
+            "{}",
+            if upgrade {
+                "Every agent with Guardian hooks already has this version's."
+            } else {
+                "No agent is set up on this machine. Name one to install for it anyway: --cursor, --claude or --codex."
+            }
+        );
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for client in &chosen {
+        match agent_hooks::install(*client, &places, version) {
+            Ok(_) => {
+                let st = agent_hooks::client_status(*client, &places, version);
+                println!("{:<12} {}", st.label, st.summary);
+            }
+            Err(why) => {
+                failed += 1;
+                println!("{:<12} not installed:\n{why}", client.label());
+            }
+        }
+    }
+    println!("\nSessions that are already running keep the hooks they started with; new ones pick these up.");
+    if chosen.contains(&Client::Codex) {
+        println!("Codex skips new or changed hooks until you approve them: /hooks in the CLI, Settings > Hooks in the app.");
+    }
+    if failed > 0 {
+        return Err(format!("{failed} agent(s) could not be set up; see above."));
+    }
+    Ok(())
+}
+
 fn check_config() -> Result<(), String> {
     let path = config_path();
     let report = load_config_report();
@@ -815,6 +920,10 @@ fn run(cli: Cli) -> Result<(), String> {
             Some(DiskAction::Save { paths, delete, plan, no_verify, plan_id, yes, json }) => {
                 disk_save(&paths, delete, plan, no_verify, plan_id, yes, json)
             }
+        },
+        Commands::Hooks { action } => match action {
+            HooksAction::Status { json } => hooks_status(json),
+            HooksAction::Install { cursor, claude, codex, upgrade } => hooks_install(cursor, claude, codex, upgrade),
         },
         Commands::Stats { days } => {
             print!("{}", PressureStats::load().render(days as usize));
@@ -940,6 +1049,13 @@ mod tests {
         assert!(parses(&["guardian", "disk", "--fresh"]));
         assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
         assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
+        assert!(parses(&["guardian", "hooks", "status"]));
+        assert!(parses(&["guardian", "hooks", "status", "--json"]));
+        assert!(parses(&["guardian", "hooks", "install"]));
+        assert!(parses(&["guardian", "hooks", "install", "--claude", "--codex"]));
+        assert!(parses(&["guardian", "hooks", "install", "--upgrade"]));
+        assert!(!parses(&["guardian", "hooks", "install", "--upgrade", "--cursor"]));
+        assert!(!parses(&["guardian", "hooks"]));
         assert!(parses(&["guardian", "disk", "save", "/tmp/wt"]));
         assert!(parses(&["guardian", "disk", "save", "/tmp/a", "/tmp/b", "--delete", "--yes", "--json"]));
         assert!(parses(&["guardian", "disk", "save", "--plan", "--json", "/tmp/wt"]));

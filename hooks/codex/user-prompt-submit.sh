@@ -43,6 +43,12 @@ case "$PG_OUTCOME" in
     block)
         json_output "$(codex_emit_block "$PG_MESSAGE")"
         ;;
+esac
+
+# The prompt is going to the agent: its session is working until Stop says the turn is over.
+guardian_record_prompt "$input"
+
+case "$PG_OUTCOME" in
     pass_msg)
         json_output "$(codex_emit_allow_advisory "$PG_MESSAGE")"
         ;;

@@ -42,10 +42,24 @@ ensure_db
 conversation_id=$(sanitize_sql "$(echo "$input" | jq -r '.conversation_id // .session_id // "" | tostring')")
 model=$(sanitize_sql "$(echo "$input" | jq -r '.model // "unknown" | tostring')")
 
+# Which agent this is and where it is working, so its sessions can be told apart and
+# followed (Cursor names its folders in workspace_roots; the others send cwd).
+client=$(guardian_hook_client)
+session_cwd=$(sanitize_sql "$(echo "$input" | jq -r '(.cwd // (.workspace_roots | if type == "array" then .[0] else null end) // "") | tostring')")
+
 pressure=$(read_state_pressure)
 
 if [ -n "$conversation_id" ]; then
-    db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, pressure_at_start) VALUES ('$conversation_id', '$model', '$pressure');"
+    cwd_update=""
+    if [ -n "$session_cwd" ]; then
+        cwd_update=", cwd = '$session_cwd'"
+    fi
+    # A session can start more than once (resume, clear, compact): the row is made the
+    # first time and brought back to life after that.
+    db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, pressure_at_start, client, state) VALUES ('$conversation_id', '$model', '$pressure', '$client', 'idle');
+UPDATE sessions SET client = COALESCE(client, '$client'), last_activity_at = datetime('now'), state = CASE WHEN state IS NULL OR state = 'ended' THEN 'idle' ELSE state END, model = CASE WHEN model IN ('', 'unknown') THEN '$model' ELSE model END$cwd_update WHERE conversation_id = '$conversation_id';
+DELETE FROM tool_calls WHERE recorded_at < datetime('now', '-60 days');
+DELETE FROM pressure_samples WHERE sampled_at < datetime('now', '-60 days');"
 fi
 
 if declare -F guardian_advise_prune >/dev/null; then

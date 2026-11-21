@@ -22,7 +22,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     files_modified INTEGER DEFAULT 0,
     lines_changed INTEGER DEFAULT 0,
     estimated_cost_usd REAL DEFAULT 0.0,
-    roi_score REAL
+    roi_score REAL,
+    -- Since schema version 2 (hooks/lib.sh brings an older database up to date):
+    client TEXT,               -- cursor | claude | codex
+    cwd TEXT,                  -- where the session is working
+    state TEXT,                -- working | idle | ended
+    last_activity_at TEXT,
+    prompt_count INTEGER DEFAULT 0,
+    turn_count INTEGER DEFAULT 0,
+    subagent_count INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (

@@ -251,10 +251,14 @@ if [ "$healthy" = "true" ]; then
     echo "To check status:  launchctl list com.guardian.guardiand"
     echo "To view state:    cat ~/.guardian/state.json"
     echo ""
-    echo "Hooks (run the ones you use):"
-    echo "  Cursor:       bash hooks/install-hooks.sh"
-    echo "  Claude Code:  bash scripts/install-claude-hooks.sh"
-    echo "  Codex:        bash scripts/install-codex-hooks.sh"
+    # Hooks installed by an earlier Guardian are brought up to date with this one; agents
+    # that have none are left alone until asked for.
+    echo "Agent hooks:"
+    "$GUARDIAN_DIR/guardian" hooks install --upgrade 2>&1 | sed 's/^/  /' || true
+    "$GUARDIAN_DIR/guardian" hooks status 2>&1 | sed 's/^/  /' || true
+    echo ""
+    echo "Install hooks for every agent on this machine:  $GUARDIAN_DIR/guardian hooks install"
+    echo "  (one agent: --cursor, --claude or --codex; see where each stands: guardian hooks status)"
 else
     echo ""
     echo "ERROR: guardiand is not sampling — no fresh $GUARDIAN_DIR/state.json from a stable process (launchd pid: ${daemon_pid:-none})."
