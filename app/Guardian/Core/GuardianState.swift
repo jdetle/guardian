@@ -438,8 +438,10 @@ struct DiskReport: Codable, Sendable {
 /// What `guardian disk save` would do to a worktree (`--plan --json`).
 struct SavePlan: Codable, Sendable {
     let branch: String
-    /// True when HEAD is detached and `branch` is created for it.
+    /// True when `branch` is created for the save: HEAD is detached, or it was on a shared
+    /// branch (`fromBranch`) that work in progress is not pushed to.
     let newBranch: Bool
+    let fromBranch: String?
     /// Files that will be committed.
     let files: [String]
     let remote: String
@@ -452,6 +454,7 @@ struct SavePlan: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case branch, files, remote, ignored
         case newBranch = "new_branch"
+        case fromBranch = "from_branch"
         case remoteBranch = "remote_branch"
         case hasUpstream = "has_upstream"
     }

@@ -2774,20 +2774,57 @@ mod tests {
     }
 
     #[test]
-    fn saving_pushes_to_the_branch_it_already_follows() {
+    fn saving_never_pushes_onto_the_branch_it_was_started_from() {
         let s = Scratch::new("save-upstream");
         let remote = s.repo_with_remote("code/app");
-        s.git("code/app", &["worktree", "add", "-q", "-b", "mine", "../app-wt"]);
+        let main_before = s.rev(&remote, "refs/heads/main");
+        // Started from origin/main, so git records origin/main as what it follows: the
+        // usual way an agent's worktree is made.
+        s.git("code/app", &["worktree", "add", "-q", "-b", "mine", "../app-wt", "origin/main"]);
         let wt = s.path("code/app-wt");
-        s.git("code/app-wt", &["push", "-q", "-u", "origin", "mine:shared"]);
+        assert_eq!(git(&wt, &["config", "--get", "branch.mine.merge"]).unwrap().trim(), "refs/heads/main");
         s.file("code/app-wt/notes.txt", 10);
 
         let plan = plan_save(&wt, &s.0).unwrap();
-        assert_eq!((plan.remote_branch.as_str(), plan.has_upstream), ("shared", true));
+        assert_eq!((plan.branch.as_str(), plan.remote_branch.as_str(), plan.new_branch), ("mine", "mine", false));
+        assert!(!plan.has_upstream, "there is no origin/mine yet");
         let saved = save_worktree(&wt, &s.0).unwrap();
-        assert_eq!(saved.pushed_to, "origin/shared");
-        assert_eq!(s.rev(&remote, "refs/heads/shared"), s.rev(&wt, "HEAD"));
-        assert_eq!(s.rev(&remote, "refs/heads/mine"), "", "not pushed under a second name");
+        assert_eq!(saved.pushed_to, "origin/mine");
+        assert_eq!(s.rev(&remote, "refs/heads/mine"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&remote, "refs/heads/main"), main_before, "main is untouched");
+        assert_eq!(
+            git(&wt, &["config", "--get", "branch.mine.merge"]).unwrap().trim(),
+            "refs/heads/main",
+            "what it follows is left as it was set"
+        );
+
+        // More work later goes to the same place.
+        s.file("code/app-wt/more.txt", 10);
+        assert!(plan_save(&wt, &s.0).unwrap().has_upstream);
+        assert_eq!(save_worktree(&wt, &s.0).unwrap().pushed_to, "origin/mine");
+        assert_eq!(s.rev(&remote, "refs/heads/main"), main_before);
+    }
+
+    #[test]
+    fn work_on_a_shared_branch_is_saved_on_a_branch_of_its_own() {
+        let s = Scratch::new("save-shared");
+        let remote = s.repo_with_remote("code/app");
+        s.git("code/app", &["branch", "develop"]);
+        s.git("code/app", &["push", "-q", "-u", "origin", "develop"]);
+        let develop_before = s.rev(&remote, "refs/heads/develop");
+        s.git("code/app", &["worktree", "add", "-q", "../app-wt", "develop"]);
+        let wt = s.path("code/app-wt");
+        s.file("code/app-wt/hotfix.txt", 10);
+
+        let plan = plan_save(&wt, &s.0).unwrap();
+        assert_eq!((plan.branch.as_str(), plan.new_branch), ("guardian-save/app-wt", true));
+        assert_eq!(plan.from_branch.as_deref(), Some("develop"));
+        let saved = save_worktree(&wt, &s.0).unwrap();
+        assert_eq!(saved.pushed_to, "origin/guardian-save/app-wt");
+        assert_eq!(s.rev(&remote, "refs/heads/guardian-save/app-wt"), s.rev(&wt, "HEAD"));
+        assert_eq!(s.rev(&remote, "refs/heads/develop"), develop_before, "develop is untouched");
+        assert_eq!(s.rev(&s.path("code/app"), "refs/heads/develop"), develop_before, "here too");
+        assert_eq!(why_not_deletable(&wt, &s.0), None);
     }
 
     #[test]

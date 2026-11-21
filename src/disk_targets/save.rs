@@ -34,15 +34,21 @@ pub struct SavePlan {
     pub path: PathBuf,
     /// The branch the work is committed to and pushed.
     pub branch: String,
-    /// True when HEAD is detached: `branch` is created for the commits made there.
+    /// True when `branch` is created for the save: HEAD is detached, or it is on a shared
+    /// branch that work in progress must not be pushed to.
     pub new_branch: bool,
+    /// The shared branch it was on, when that is why `branch` is new.
+    pub from_branch: Option<String>,
     /// Changed and new files that will be committed, relative to the worktree.
     pub files: Vec<String>,
-    /// Where the branch is pushed.
+    /// Where the branch is pushed: always under its own name, so `remote_branch` is `branch`.
     pub remote: String,
     pub remote_branch: String,
     /// False when the branch is not on the remote yet: the push puts it there.
     pub has_upstream: bool,
+    /// Make the pushed branch the one this branch follows (only when it follows none).
+    #[serde(skip)]
+    set_upstream: bool,
     /// Files git ignores that are kept nowhere else (a `.env`, a local database). A commit
     /// does not save them and removing the worktree deletes them.
     pub ignored: Vec<String>,
@@ -294,36 +300,20 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
         ));
     }
 
-    let (branch, new_branch) = match ask(path, &["symbolic-ref", "--short", "-q", "HEAD"]) {
-        Some(branch) => (branch, false),
-        None => {
-            // Detached HEAD: its commits get a branch, one not in use yet.
-            let base = branch_name_for(path);
-            let free = std::iter::once(base.clone())
-                .chain((2..10).map(|n| format!("{base}-{n}")))
-                .find(|name| {
-                    ask(path, &["rev-parse", "-q", "--verify", &format!("refs/heads/{name}")]).is_none()
-                })
-                .ok_or("its HEAD is detached and no branch name is free for it")?;
-            (free, true)
-        }
+    let current = ask(path, &["symbolic-ref", "--short", "-q", "HEAD"]);
+    let configured = |key: &str| {
+        current
+            .as_ref()
+            .and_then(|branch| ask(path, &["config", "--get", &format!("branch.{branch}.{key}")]))
     };
-
-    let configured = |key: &str| ask(path, &["config", "--get", &format!("branch.{branch}.{key}")]);
-    let upstream = match (configured("remote"), configured("merge")) {
-        (Some(remote), Some(merge)) if remote != "." && !new_branch => merge
-            .strip_prefix("refs/heads/")
-            .map(|b| (remote, b.to_string())),
-        _ => None,
-    };
-    let has_upstream = upstream.is_some();
-    let (remote, remote_branch) = match upstream {
-        Some(found) => found,
+    // The remote the branch already follows, else `origin`, else the only one there is.
+    let remote = match configured("remote").filter(|remote| remote != ".") {
+        Some(remote) => remote,
         None => {
             let remotes: Vec<String> = ask(path, &["remote"])
                 .map(|text| text.lines().map(str::to_string).collect())
                 .unwrap_or_default();
-            let remote = if remotes.iter().any(|r| r == "origin") {
+            if remotes.iter().any(|r| r == "origin") {
                 "origin".to_string()
             } else if remotes.len() == 1 {
                 remotes[0].clone()
@@ -331,19 +321,58 @@ pub fn plan_save(path: &Path, home: &Path) -> Result<SavePlan, String> {
                 return Err("its repository has no remote to push to".to_string());
             } else {
                 return Err("its repository has several remotes and none is called origin; push it yourself".to_string());
-            };
-            (remote, branch.clone())
+            }
         }
     };
 
+    // Work in progress is never pushed onto a branch other people build on: the remote's
+    // default branch, or one with a name that says as much.
+    let default_branch = ask(path, &["symbolic-ref", "-q", "--short", &format!("refs/remotes/{remote}/HEAD")])
+        .and_then(|head| head.strip_prefix(&format!("{remote}/")).map(str::to_string));
+    let shared = |branch: &str| {
+        const SHARED: &[&str] = &[
+            "main", "master", "develop", "development", "dev", "trunk", "staging", "production", "prod",
+        ];
+        Some(branch) == default_branch.as_deref()
+            || SHARED.contains(&branch)
+            || branch.starts_with("release/")
+            || branch.starts_with("release-")
+    };
+    let (branch, new_branch, from_branch) = match current.clone() {
+        Some(branch) if !shared(&branch) => (branch, false, None),
+        on => {
+            // A detached HEAD, or a shared branch: the work gets a branch of its own, one
+            // not in use yet.
+            let base = branch_name_for(path);
+            let free = std::iter::once(base.clone())
+                .chain((2..10).map(|n| format!("{base}-{n}")))
+                .find(|name| {
+                    ask(path, &["rev-parse", "-q", "--verify", &format!("refs/heads/{name}")]).is_none()
+                        && ask(path, &["rev-parse", "-q", "--verify", &format!("refs/remotes/{remote}/{name}")]).is_none()
+                })
+                .ok_or("no branch name is free to save its work under")?;
+            (free, true, on)
+        }
+    };
+
+    // Always pushed under its own name. A branch's configured upstream is often the branch
+    // it was started from (`origin/main`), and pushing there would publish work in progress
+    // to it.
+    let has_upstream = !new_branch
+        && ask(path, &["rev-parse", "-q", "--verify", &format!("refs/remotes/{remote}/{branch}")]).is_some();
+    // Only where nothing is configured: an upstream someone set is left as it is.
+    let set_upstream = new_branch || configured("merge").is_none();
+
     Ok(SavePlan {
         path: path.to_path_buf(),
+        remote_branch: branch.clone(),
         branch,
         new_branch,
+        from_branch,
         files,
         remote,
-        remote_branch,
         has_upstream,
+        set_upstream,
         ignored,
     })
 }
@@ -356,7 +385,7 @@ pub fn save_worktree(path: &Path, home: &Path) -> Result<Saved, String> {
     let branch = plan.branch.as_str();
     if plan.new_branch {
         run(path, &["checkout", "-q", "-b", branch], LOCAL_TIMEOUT)
-            .map_err(|e| format!("could not make branch {branch} for its detached HEAD: {e}"))?;
+            .map_err(|e| format!("could not make branch {branch} to save its work on: {e}"))?;
     }
     if !plan.files.is_empty() {
         run(path, &["add", "-A"], LOCAL_TIMEOUT).map_err(|e| format!("could not stage its files: {e}"))?;
@@ -372,7 +401,7 @@ pub fn save_worktree(path: &Path, home: &Path) -> Result<Saved, String> {
     };
     let refspec = format!("refs/heads/{branch}:refs/heads/{}", plan.remote_branch);
     let mut push = vec!["push", "-q"];
-    if !plan.has_upstream {
+    if plan.set_upstream {
         push.push("--set-upstream");
     }
     push.extend([plan.remote.as_str(), refspec.as_str()]);

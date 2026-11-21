@@ -566,9 +566,14 @@ struct MenuBarView: View {
         case 1: commit = "Commits 1 file"
         default: commit = "Commits \(plan.files.count) files"
         }
-        let branch = plan.newBranch
-            ? "; its detached HEAD goes on a new branch, \(plan.branch),"
-            : (plan.files.isEmpty ? " on branch \(plan.branch);" : " to branch \(plan.branch)")
+        let branch: String
+        if let shared = plan.fromBranch {
+            branch = "; \(shared) is a shared branch, so the work goes on a new one, \(plan.branch),"
+        } else if plan.newBranch {
+            branch = "; its detached HEAD goes on a new branch, \(plan.branch),"
+        } else {
+            branch = plan.files.isEmpty ? " on branch \(plan.branch);" : " to branch \(plan.branch)"
+        }
         lines.append("\(commit)\(branch) and pushes it to \(plan.remote)/\(plan.remoteBranch)"
             + (plan.hasUpstream ? "." : ", which is not on the remote yet.")
             + " Then removes the worktree, freeing about \(target.sizeText).")

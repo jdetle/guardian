@@ -497,7 +497,9 @@ fn describe_save(plan: &disk_targets::SavePlan, home: &std::path::Path, delete: 
         1 => "commit 1 file".to_string(),
         n => format!("commit {n} files"),
     };
-    lines.push(if plan.new_branch {
+    lines.push(if let Some(shared) = &plan.from_branch {
+        format!("      {files}; {shared} is a shared branch, so the work goes on a new one, {}", plan.branch)
+    } else if plan.new_branch {
         format!("      {files}; put its detached HEAD on a new branch, {}", plan.branch)
     } else if plan.files.is_empty() {
         format!("      {files} on branch {}", plan.branch)
