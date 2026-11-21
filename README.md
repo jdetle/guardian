@@ -114,7 +114,7 @@ A shield appears at the right of the menu bar; its shape follows the level (outl
 - memory, swap, CPU, disk, the kernel's memory-pressure and thermal verdicts, per-agent RAM
 - **Today**: share of time at each level and how often it changed
 - any **config problem** the daemon reported
-- **Find space to free**: the `guardian disk` scan of all your git repositories, with each item's age and worktree status. Items Guardian can safely remove have a bin button that asks before deleting (through the same checks as `guardian disk delete`); the rest have a button that copies their removal command. Every row can be shown in Finder.
+- **Find space to free**: the `guardian disk` scan of all your git repositories, with each item's age and worktree status, sized by what deleting it would free. The scan `guardiand` keeps fresh in the background is shown as soon as the panel opens; **Scan again** brings it up to date. Items Guardian can safely remove have a bin button that asks before deleting (through the same checks as `guardian disk delete`); the rest have a button that copies their removal command. Every row can be shown in Finder.
 - **Open dashboard** for the larger System / Sessions / Docker / Settings window
 
 It notifies you only when load becomes critical or the disk becomes critical. The app needs macOS 14 and the Swift toolchain to build; it reads `~/.guardian/` and calls `~/.guardian/guardian`, so install the daemon first.
@@ -175,12 +175,14 @@ If you still see messages about **“Parallel workspace load”** and **`~/.curs
 
 ### Disk (`[disk]`)
 
-**`[disk]`** samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
+**`[disk]`** (`enabled`, `warn_used_percent`, `critical_used_percent`, `background_scan_minutes`) samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
 
 ### Finding space to free (`guardian disk`)
 
 ```bash
 ~/.guardian/guardian disk                  # list the biggest targets (read-only)
+~/.guardian/guardian disk --cached         # the last saved scan, at once, without scanning
+~/.guardian/guardian disk --fresh          # measure everything again, reusing nothing
 ~/.guardian/guardian disk --older-than 14  # only projects and worktrees untouched for 2+ weeks
 ~/.guardian/guardian disk clean            # list, then choose what to delete
 ~/.guardian/guardian disk delete ~/code/app/target   # delete specific targets
@@ -193,6 +195,14 @@ The scan walks your home folder for **every git repository** (skipping `Library`
 - **Tool caches**: Cargo, npm, pnpm, Bun, pip, uv, Homebrew, Go, Gradle, Maven, Xcode and Simulator data, Playwright browsers, Docker's disk image, model caches and the Trash.
 
 Every target shows its size, how long the project has gone untouched, and whether it **comes back on its own** or needs a **look before deleting**. Projects are measured oldest first inside a time budget (`--seconds`, default 45), at background I/O priority, so the scan is safe to run on a machine that is already struggling; anything not reached is counted and reported.
+
+**Sizes are what deleting would free**, which can be much less than what a folder appears to occupy. A `node_modules` installed by bun or pnpm is made of clones of the files in that tool's cache: every copy looks like a gigabyte, and deleting one frees almost nothing, because the data stays for the other copies. Such a row says so ("1.0 GB in size, of which 1.0 GB is shared with other copies"), sorts below folders that really give space back, and the totals count only what would be freed. A file with several names (hard links, common in `target/`) is counted once, and as freed only if every name is inside the folder.
+
+**Scans remember what they measured.** Results are saved to `~/.guardian/disk_index.json`. The next scan measures only what is new, was touched since, was measured only in part, or has not been measured for 12 hours; everything else keeps its saved size. A scan that runs out of time is carried on by the next one, starting with what has never been measured, so running it again always makes progress. `--cached` prints the saved scan immediately and `--fresh` ignores it.
+
+What git said about a worktree is saved the same way, because asking takes a second or more per worktree: git is asked again when the worktree shows a sign of use (a commit, checkout or staged change, or a change at its top level) or after 12 hours. A listing can therefore still say "no uncommitted work" about a worktree whose files were edited since without any of that. **Deleting never goes by the listing**: the index only saves measuring, and whether something may be deleted is decided afresh from the disk and from git at that moment.
+
+**`guardiand` keeps the saved scan fresh in the background**, so the list is already there when the disk fills up. It starts `guardian disk refresh` as a separate low-priority process every **`[disk] background_scan_minutes`** (default **180**; **0** turns it off), and straight away when the disk reaches `warn` or `critical`. It does not start one at `critical` load, starts one under `strained` load only when the disk is tight, stops a running one if load becomes critical, and never runs two at once.
 
 **Deleting is a separate, confirmed step.** `disk clean` numbers what it can delete and asks which (`1 3 5`, `2-4`, or `old` for everything that comes back on its own and has gone untouched for 14+ days), then asks once more before removing anything. Each target is re-checked at that moment:
 

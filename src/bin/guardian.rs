@@ -47,12 +47,17 @@ enum Commands {
     },
     /// Find disk space to free: old build output, git worktrees and tool caches across
     /// all your git repositories. Listing is read-only; `clean` and `delete` remove things.
+    /// Scans remember what they measured (~/.guardian/disk_index.json), so each one only
+    /// measures what is new or has changed.
     Disk {
         #[command(flatten)]
         scan: ScanArgs,
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Show the last saved scan at once, without scanning.
+        #[arg(long, conflicts_with = "fresh")]
+        cached: bool,
         #[command(subcommand)]
         action: Option<DiskAction>,
     },
@@ -82,6 +87,9 @@ struct ScanArgs {
     /// Desktop, Documents and Downloads, which macOS guards with a permission prompt.
     #[arg(long, global = true)]
     root: Vec<PathBuf>,
+    /// Measure everything again instead of reusing sizes saved by earlier scans.
+    #[arg(long, global = true)]
+    fresh: bool,
 }
 
 impl ScanArgs {
@@ -92,12 +100,20 @@ impl ScanArgs {
             top: self.top as usize,
             budget: std::time::Duration::from_secs(self.seconds),
             older_than_days: self.older_than,
+            max_age: if self.fresh {
+                std::time::Duration::ZERO
+            } else {
+                disk_targets::DEFAULT_MAX_AGE
+            },
         }
     }
 }
 
 #[derive(Subcommand)]
 enum DiskAction {
+    /// Bring the saved scan up to date and print one line. guardiand runs this in the
+    /// background; it does nothing if another scan is already running.
+    Refresh,
     /// Scan, then choose what to delete. Asks before deleting anything. Takes the same
     /// scan options as `guardian disk`, before or after the word `clean`.
     Clean,
@@ -222,9 +238,24 @@ fn print_free_space(home: &std::path::Path) {
     }
 }
 
+/// Bring the saved scan up to date, for running unattended.
+fn disk_refresh(scan: &ScanArgs) -> Result<(), String> {
+    match disk_targets::refresh(&scan.options()).ok_or("could not find the home directory")? {
+        disk_targets::Refresh::Busy => println!("Another disk scan is running; left to it."),
+        disk_targets::Refresh::Done(report) => println!(
+            "Disk scan saved: {} that comes back on its own, {} to look at first; {} sizes reused, {} places still to measure.",
+            disk_targets::human_size(report.regenerates_freed_bytes),
+            disk_targets::human_size(report.review_freed_bytes),
+            report.reused,
+            report.unmeasured + report.outdated
+        ),
+    }
+    Ok(())
+}
+
 fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
     let home = home()?;
-    println!("Scanning your git repositories and tool caches (up to {} s)...", scan.seconds);
+    println!("Scanning your git repositories and tool caches (up to {} s; sizes that have not changed are reused)...", scan.seconds);
     // Look at more than will be listed: only things Guardian can delete are offered.
     let mut opts = scan.options();
     opts.top = 100;
@@ -250,6 +281,9 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
             details.push(age);
         }
         details.push(t.note.clone().unwrap_or_else(|| t.cost.clone()));
+        if let Some(shared) = t.shared_text() {
+            details.push(shared);
+        }
         let flag = if t.safety == disk_targets::Safety::Review { "  LOOK FIRST" } else { "" };
         println!(
             "{:>3}. {:>9}  {} ({}){flag}\n                {}",
@@ -261,7 +295,7 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
         );
     }
     let old: Vec<&disk_targets::Target> = offered.iter().filter(|t| t.is_old_and_safe()).collect();
-    let old_bytes: u64 = old.iter().map(|t| t.bytes).sum();
+    let old_bytes: u64 = old.iter().map(|t| t.freed_bytes).sum();
     println!();
     if !old.is_empty() {
         println!(
@@ -291,7 +325,7 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
     let total: u64 = chosen
         .iter()
         .filter(|t| paths.contains(&t.path))
-        .map(|t| t.bytes)
+        .map(|t| t.freed_bytes)
         .sum();
 
     println!();
@@ -423,10 +457,16 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Config {
             action: ConfigAction::Check,
         } => check_config(),
-        Commands::Disk { scan, json, action } => match action {
+        Commands::Disk { scan, json, cached, action } => match action {
             None => {
-                let report = disk_targets::survey(&scan.options())
-                    .ok_or_else(|| "could not find the home directory".to_string())?;
+                let report = if cached {
+                    disk_targets::cached(&scan.options()).ok_or_else(|| {
+                        "no scan has been saved yet; run `guardian disk` once".to_string()
+                    })?
+                } else {
+                    disk_targets::survey(&scan.options())
+                        .ok_or_else(|| "could not find the home directory".to_string())?
+                };
                 if json {
                     println!(
                         "{}",
@@ -437,6 +477,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 Ok(())
             }
+            Some(DiskAction::Refresh) => disk_refresh(&scan),
             Some(DiskAction::Clean) => disk_clean(&scan),
             Some(DiskAction::Delete { paths, yes, json }) => disk_delete(&paths, yes, json),
         },
@@ -560,6 +601,10 @@ mod tests {
         assert!(parses(&["guardian", "disk", "--older-than", "30"]));
         assert!(parses(&["guardian", "disk", "clean", "--top", "20", "--older-than", "14"]));
         assert!(parses(&["guardian", "disk", "delete", "/tmp/a", "/tmp/b", "--yes", "--json"]));
+        assert!(parses(&["guardian", "disk", "--cached", "--json", "--top", "12"]));
+        assert!(parses(&["guardian", "disk", "--fresh"]));
+        assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
+        assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
         assert!(!parses(&["guardian", "disk", "delete"]));
     }
 }

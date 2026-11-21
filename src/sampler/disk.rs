@@ -114,6 +114,7 @@ mod tests {
             enabled: true,
             warn_used_percent: 85.0,
             critical_used_percent: 93.0,
+            ..DiskConfig::default()
         };
         assert_eq!(disk_level(50.0, &cfg), DiskPressureLevel::Clear);
         assert_eq!(disk_level(85.0, &cfg), DiskPressureLevel::Warn);
@@ -127,6 +128,7 @@ mod tests {
             enabled: false,
             warn_used_percent: 0.0,
             critical_used_percent: 100.0,
+            ..DiskConfig::default()
         };
         assert_eq!(disk_level(99.0, &cfg), DiskPressureLevel::Clear);
     }
@@ -137,6 +139,7 @@ mod tests {
             enabled: true,
             warn_used_percent: 90.0,
             critical_used_percent: 85.0,
+            ..DiskConfig::default()
         };
         // critical coerced to 91; 89% is still clear
         assert_eq!(disk_level(89.0, &cfg), DiskPressureLevel::Clear);

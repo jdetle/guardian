@@ -162,6 +162,10 @@ pub struct DiskConfig {
     pub warn_used_percent: f64,
     #[serde(default = "default_disk_critical_used_percent")]
     pub critical_used_percent: f64,
+    /// How often guardiand refreshes the saved disk-space scan in the background
+    /// (`guardian disk refresh`), in minutes. 0 turns background scans off.
+    #[serde(default = "default_disk_background_scan_minutes")]
+    pub background_scan_minutes: u64,
 }
 
 impl Default for DiskConfig {
@@ -170,8 +174,13 @@ impl Default for DiskConfig {
             enabled: true,
             warn_used_percent: default_disk_warn_used_percent(),
             critical_used_percent: default_disk_critical_used_percent(),
+            background_scan_minutes: default_disk_background_scan_minutes(),
         }
     }
+}
+
+fn default_disk_background_scan_minutes() -> u64 {
+    180
 }
 
 fn default_disk_warn_used_percent() -> f64 {

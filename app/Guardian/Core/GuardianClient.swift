@@ -40,6 +40,7 @@ final class GuardianClient: ObservableObject {
     private let statsFileURL: URL
     private let promptControlQueue = DispatchQueue(label: "guardian.prompt-controls")
     private let scanQueue = DispatchQueue(label: "guardian.disk-scan", qos: .utility)
+    private let savedScanQueue = DispatchQueue(label: "guardian.disk-saved-scan", qos: .utility)
     private var timer: Timer?
 
     static let maxHistoryCount = 150
@@ -61,6 +62,7 @@ final class GuardianClient: ObservableObject {
         loadState()
         loadQueue()
         loadStats()
+        loadSavedDiskScan()
         // guardiand samples every 2 s; the menu bar icon does not need to be that fresh.
         var ticks = 0
         let t = Timer(timeInterval: 4.0, repeats: true) { [weak self] _ in
@@ -112,7 +114,40 @@ final class GuardianClient: ObservableObject {
         today = file.days[formatter.string(from: Date())]
     }
 
-    /// Run `guardian disk --json`: a read-only survey of what is cheap to delete.
+    /// Show the scan guardiand keeps up to date in the background, at once and without
+    /// scanning (`guardian disk --cached`). Does nothing when there is no saved scan, when a
+    /// newer report is already shown, or with a guardian too old to keep one.
+    func loadSavedDiskScan() {
+        guard diskReport == nil, !diskScanning else { return }
+        let executable = guardianDir.appendingPathComponent("guardian")
+        savedScanQueue.async {
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["disk", "--cached", "--json", "--top", "12"]
+            let out = Pipe()
+            process.standardOutput = out
+            process.standardError = FileHandle.nullDevice
+            var report: DiskReport?
+            do {
+                try process.run()
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                if process.terminationStatus == 0 {
+                    report = try? JSONDecoder().decode(DiskReport.self, from: data)
+                }
+            } catch {
+                report = nil
+            }
+            DispatchQueue.main.async {
+                if let report, self.diskReport == nil, !self.diskScanning {
+                    self.diskReport = report
+                }
+            }
+        }
+    }
+
+    /// Run `guardian disk --json`: a read-only survey of what is cheap to delete. It measures
+    /// only what has changed since the saved scan, so it is usually quick.
     func scanDisk() {
         guard !diskScanning else { return }
         diskScanning = true
@@ -207,7 +242,7 @@ final class GuardianClient: ObservableObject {
                     self.diskReport?.targets.removeAll {
                         $0.path == target.path || $0.path.hasPrefix(target.path + "/")
                     }
-                    self.deleteMessage = "Deleted \(target.displayPath), freeing about \(DiskTarget.sizeText(result.freedBytes ?? target.bytes))."
+                    self.deleteMessage = "Deleted \(target.displayPath), freeing about \(DiskTarget.sizeText(result.freedBytes ?? target.freedBytes))."
                     self.loadState()
                 } else {
                     self.deleteMessage = "Kept \(target.displayPath): \(result?.error ?? "the delete command did not run")."

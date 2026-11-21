@@ -1,0 +1,4 @@
+- [2026-11-20 disk-scan-efficiency](./2026-11-20-disk-scan-efficiency.md)
+  - decision: proceed; keep a resumable on-disk index refreshed in the background, and report the space a delete really frees
+  - risk: background scan I/O on a strained machine; gating not yet tried under load
+  - followup: [ ] author — implement index, background refresh and freed-space sizes as 0.12.0

@@ -305,8 +305,13 @@ struct MenuBarView: View {
 
     private func summary(_ report: DiskReport) -> String {
         var text = "\(report.reposScanned) git repositories scanned. "
-            + "\(DiskTarget.sizeText(report.regeneratesBytes)) comes back on its own, "
-            + "\(DiskTarget.sizeText(report.reviewBytes)) needs a look."
+            + "Deleting would free \(DiskTarget.sizeText(report.regeneratesBytes)) that comes back on its own, "
+            + "\(DiskTarget.sizeText(report.reviewBytes)) that needs a look."
+        if report.fromCache, let scannedAt = report.scannedAt {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .full
+            text = "Saved scan from \(formatter.localizedString(for: scannedAt, relativeTo: Date())). " + text
+        }
         if report.unmeasured > 0 {
             text += " \(report.unmeasured) recently used places were not measured."
         }

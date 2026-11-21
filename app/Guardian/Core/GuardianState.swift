@@ -210,7 +210,11 @@ struct DiskTarget: Codable, Sendable, Identifiable {
     var remove: String = ""
     /// regenerates | review
     var safety: String = "review"
+    /// What it occupies on disk.
     var bytes: UInt64 = 0
+    /// What deleting it would free: less than `bytes` when its files are clones of files
+    /// elsewhere (a bun or pnpm install). Equal to `bytes` from a guardian before 0.12.
+    var freedBytes: UInt64 = 0
     var complete: Bool = true
     /// Whole days since the project or worktree was last touched; nil for tool caches.
     var ageDays: Int?
@@ -225,6 +229,7 @@ struct DiskTarget: Codable, Sendable, Identifiable {
         case path
         case displayPath = "display_path"
         case kind, what, cost, remove, safety, bytes, complete
+        case freedBytes = "freed_bytes"
         case ageDays = "age_days"
         case repo, branch, note, deletable
     }
@@ -239,6 +244,7 @@ struct DiskTarget: Codable, Sendable, Identifiable {
         remove = (try? c.decodeIfPresent(String.self, forKey: .remove)) ?? ""
         safety = (try? c.decodeIfPresent(String.self, forKey: .safety)) ?? "review"
         bytes = (try? c.decodeIfPresent(UInt64.self, forKey: .bytes)) ?? 0
+        freedBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .freedBytes)) ?? bytes
         complete = (try? c.decodeIfPresent(Bool.self, forKey: .complete)) ?? true
         ageDays = try? c.decodeIfPresent(Int.self, forKey: .ageDays)
         repo = try? c.decodeIfPresent(String.self, forKey: .repo)
@@ -249,9 +255,17 @@ struct DiskTarget: Codable, Sendable, Identifiable {
 
     var regenerates: Bool { safety == "regenerates" }
 
+    /// What deleting it would free; `+` marks a lower bound.
     var sizeText: String {
-        let text = Self.sizeText(bytes)
+        let text = Self.sizeText(freedBytes)
         return complete ? text : text + "+"
+    }
+
+    /// Said when a good part of what it occupies would not come back (same rule as the CLI).
+    var sharedText: String? {
+        let shared = bytes > freedBytes ? bytes - freedBytes : 0
+        guard shared >= max(bytes / 10, 10 * 1_048_576) else { return nil }
+        return "\(Self.sizeText(bytes)) in size, of which \(Self.sizeText(shared)) is shared with other copies and freed only when they go too"
     }
 
     static func sizeText(_ bytes: UInt64) -> String {
@@ -274,6 +288,7 @@ struct DiskTarget: Codable, Sendable, Identifiable {
         if let ageText { parts.append(ageText) }
         if let note, !note.isEmpty { parts.append(note) }
         if parts.isEmpty { parts.append(cost) }
+        if let sharedText { parts.append(sharedText) }
         return parts.joined(separator: "; ")
     }
 }
@@ -283,14 +298,34 @@ struct DiskReport: Codable, Sendable {
     var targets: [DiskTarget]
     let unmeasured: Int
     let reposScanned: Int
+    /// What deleting every target of each kind would free.
     let regeneratesBytes: UInt64
     let reviewBytes: UInt64
+    /// When the scan behind this report finished; nil from a guardian before 0.12.
+    let scannedAt: Date?
+    /// True when this is the saved scan read back rather than a new one.
+    let fromCache: Bool
 
     enum CodingKeys: String, CodingKey {
         case targets, unmeasured
         case reposScanned = "repos_scanned"
         case regeneratesBytes = "regenerates_bytes"
         case reviewBytes = "review_bytes"
+        case regeneratesFreedBytes = "regenerates_freed_bytes"
+        case reviewFreedBytes = "review_freed_bytes"
+        case scannedAt = "scanned_at"
+        case fromCache = "from_cache"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(targets, forKey: .targets)
+        try c.encode(unmeasured, forKey: .unmeasured)
+        try c.encode(reposScanned, forKey: .reposScanned)
+        try c.encode(regeneratesBytes, forKey: .regeneratesFreedBytes)
+        try c.encode(reviewBytes, forKey: .reviewFreedBytes)
+        try c.encodeIfPresent(scannedAt.map { UInt64($0.timeIntervalSince1970) }, forKey: .scannedAt)
+        try c.encode(fromCache, forKey: .fromCache)
     }
 
     init(from decoder: Decoder) throws {
@@ -298,8 +333,14 @@ struct DiskReport: Codable, Sendable {
         targets = (try? c.decodeIfPresent([DiskTarget].self, forKey: .targets)) ?? []
         unmeasured = (try? c.decodeIfPresent(Int.self, forKey: .unmeasured)) ?? 0
         reposScanned = (try? c.decodeIfPresent(Int.self, forKey: .reposScanned)) ?? 0
-        regeneratesBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesBytes)) ?? 0
-        reviewBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .reviewBytes)) ?? 0
+        // The freed totals where the CLI gives them (0.12 on), else what is on disk.
+        regeneratesBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesFreedBytes))
+            ?? (try? c.decodeIfPresent(UInt64.self, forKey: .regeneratesBytes)) ?? 0
+        reviewBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .reviewFreedBytes))
+            ?? (try? c.decodeIfPresent(UInt64.self, forKey: .reviewBytes)) ?? 0
+        scannedAt = (try? c.decodeIfPresent(UInt64.self, forKey: .scannedAt))
+            .map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        fromCache = (try? c.decodeIfPresent(Bool.self, forKey: .fromCache)) ?? false
     }
 }
 
