@@ -83,12 +83,97 @@ pub struct Target {
     pub deletable: bool,
 }
 
+/// How long something has gone untouched, in the bands a listing is grouped by. Declared
+/// from the longest untouched to the most recent, which is also the order they are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Staleness {
+    /// 90 days or more.
+    Quarter,
+    /// 30 to 89 days.
+    Month,
+    /// 14 to 29 days.
+    Fortnight,
+    /// 7 to 13 days.
+    Week,
+    /// Touched in the last week, or with no way to tell.
+    InUse,
+}
+
+impl Staleness {
+    pub fn of(age_days: Option<u64>) -> Self {
+        match age_days {
+            Some(d) if d >= 90 => Self::Quarter,
+            Some(d) if d >= 30 => Self::Month,
+            Some(d) if d >= OLD_DAYS => Self::Fortnight,
+            Some(d) if d >= 7 => Self::Week,
+            _ => Self::InUse,
+        }
+    }
+
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Quarter => "Untouched 90 days or more",
+            Self::Month => "Untouched 30 to 89 days",
+            Self::Fortnight => "Untouched 14 to 29 days",
+            Self::Week => "Untouched 7 to 13 days",
+            Self::InUse => "Used in the last week",
+        }
+    }
+
+    /// Untouched for [`OLD_DAYS`] or more: what deleting in bulk goes by.
+    pub fn is_old(self) -> bool {
+        self <= Self::Fortnight
+    }
+}
+
+/// Stale things that belong together: everything in one project (a repository with its
+/// worktrees and build folders), or among the tool caches, that has gone untouched for
+/// about as long. Small on their own, they are listed and deleted as one.
+#[derive(Clone, Debug, Serialize)]
+pub struct Bundle {
+    /// The project, as `~/…`, or "Tool caches".
+    pub name: String,
+    /// False for the bundle of tool caches.
+    pub is_project: bool,
+    pub staleness: Staleness,
+    /// The band in words: "Untouched 30 to 89 days".
+    pub heading: String,
+    /// How stale it is and how much of it can go without a look, in a sentence.
+    pub detail: String,
+    /// What it is made of: "3 worktrees, 4 build folders".
+    pub contents: String,
+    /// What it occupies, and what deleting all of it would free. Each folder is counted
+    /// once: a build folder inside a worktree of the bundle is part of the worktree.
+    pub bytes: u64,
+    pub freed_bytes: u64,
+    /// The part of those that comes back on its own.
+    pub regenerates_bytes: u64,
+    pub regenerates_freed_bytes: u64,
+    /// The longest and the shortest any of it has gone untouched, in days.
+    pub oldest_days: u64,
+    pub newest_days: u64,
+    /// What `guardian disk delete` can remove now without a look: Guardian can delete it
+    /// and it comes back on its own. Nothing here is inside anything else here.
+    pub delete_paths: Vec<PathBuf>,
+    /// What deleting `delete_paths` would free.
+    pub deletable_freed_bytes: u64,
+    /// How many of its folders are left out of `delete_paths`: they need a look first, or
+    /// their own command.
+    pub held_back: usize,
+    /// Its folders, the ones that free the most first.
+    pub members: Vec<Target>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub volume: String,
     pub used_percent: f64,
     pub available_gb: f64,
-    /// Largest first; only targets at or above the size floor.
+    /// Stale things grouped by project and by how long they have gone untouched, the
+    /// longest untouched first. Only bundles at or above the size floor.
+    pub bundles: Vec<Bundle>,
+    /// Everything not in a bundle, largest first; only targets at or above the size floor.
     pub targets: Vec<Target>,
     /// Candidates found but not measured before the time budget ran out.
     pub unmeasured: usize,
@@ -842,6 +927,12 @@ fn candidates(home: &Path, opts: &Options, deadline: Instant) -> Discovery {
         if !path.exists() {
             continue;
         }
+        // When something was last added or removed at its top level. Only for caches that
+        // refill themselves: a toolchain or a model is not stale for having been installed
+        // long ago, and nothing records when it was last used.
+        let last_touch = (*safety == Safety::Regenerates)
+            .then(|| newest_shallow(&path))
+            .flatten();
         found.candidates.push(Candidate {
             path,
             kind: Kind::Cache,
@@ -853,7 +944,7 @@ fn candidates(home: &Path, opts: &Options, deadline: Instant) -> Discovery {
             remove: (!remove.is_empty()).then(|| remove.to_string()),
             safety: *safety,
             repo: None,
-            last_touch: None,
+            last_touch,
             branch: None,
             note: None,
             size: None,
@@ -1211,16 +1302,149 @@ fn plan_measuring(entries: &mut Vec<Candidate>, max_age: Duration, now: u64) -> 
     due
 }
 
-/// The listing for what `index` holds: filtered, sorted and totalled as `opts` asks.
+/// One measured place on its way into a report: the listing row, and what decides which
+/// bundle it belongs to.
+struct Row {
+    target: Target,
+    /// The main checkout it belongs to: a worktree's repository, a build folder's
+    /// repository (its worktree's, when it is inside one). `None` for tool caches.
+    project: Option<PathBuf>,
+    /// The worktree a build folder is inside, if that worktree was measured too.
+    inside: Option<PathBuf>,
+    staleness: Staleness,
+}
+
+/// "3 worktrees, 4 build folders": what a bundle is made of.
+fn contents_text(members: &[&Row]) -> String {
+    let count = |kind: Kind| members.iter().filter(|m| m.target.kind == kind).count();
+    let part = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    [
+        part(count(Kind::Worktree), "worktree", "worktrees"),
+        part(count(Kind::Build), "build folder", "build folders"),
+        part(count(Kind::Cache), "cache", "caches"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// Group the rows that have gone untouched for a week or more into bundles, one per
+/// project and age band, and return them with the rows left over. A bundle smaller than
+/// the size floor is not made; its rows are handed back to be listed on their own.
+fn bundle_stale(rows: Vec<Row>, home: &Path, min_bytes: u64) -> (Vec<Bundle>, Vec<Row>) {
+    let mut groups: HashMap<(Staleness, Option<PathBuf>), Vec<Row>> = HashMap::new();
+    let mut alone = Vec::new();
+    for row in rows {
+        if row.staleness == Staleness::InUse {
+            alone.push(row);
+        } else {
+            groups
+                .entry((row.staleness, row.project.clone()))
+                .or_default()
+                .push(row);
+        }
+    }
+
+    let mut bundles = Vec::new();
+    for ((staleness, project), mut rows) in groups {
+        rows.sort_by(|a, b| {
+            (b.target.freed_bytes, b.target.bytes, &a.target.path)
+                .cmp(&(a.target.freed_bytes, a.target.bytes, &b.target.path))
+        });
+        let worktrees: HashSet<&PathBuf> = rows
+            .iter()
+            .filter(|r| r.target.kind == Kind::Worktree)
+            .map(|r| &r.target.path)
+            .collect();
+        let goes_now = |r: &Row| r.target.deletable && r.target.safety == Safety::Regenerates;
+        // Worktrees that would be deleted take the build folders inside them along.
+        let going: HashSet<&PathBuf> = rows
+            .iter()
+            .filter(|r| r.target.kind == Kind::Worktree && goes_now(r))
+            .map(|r| &r.target.path)
+            .collect();
+        // A build folder inside a worktree of this bundle is part of that worktree's size.
+        let top_level: Vec<&Row> = rows
+            .iter()
+            .filter(|r| !r.inside.as_ref().is_some_and(|w| worktrees.contains(w)))
+            .collect();
+        let delete: Vec<&Row> = rows
+            .iter()
+            .filter(|r| goes_now(r) && !r.inside.as_ref().is_some_and(|w| going.contains(w)))
+            .collect();
+        let bytes: u64 = top_level.iter().map(|r| r.target.bytes).sum();
+        if bytes < min_bytes {
+            alone.extend(rows);
+            continue;
+        }
+        // A folder inside a worktree is dated by the worktree, as it is banded by it.
+        let ages: Vec<u64> = top_level.iter().filter_map(|r| r.target.age_days).collect();
+        let delete_paths: Vec<PathBuf> = delete.iter().map(|r| r.target.path.clone()).collect();
+        // Shown: everything counted, and anything inside a kept worktree that can still go.
+        let members: Vec<Target> = rows
+            .iter()
+            .filter(|r| {
+                !r.inside.as_ref().is_some_and(|w| worktrees.contains(w)) || delete_paths.contains(&r.target.path)
+            })
+            .map(|r| r.target.clone())
+            .collect();
+        let mut bundle = Bundle {
+            name: match &project {
+                Some(project) => display_path(project, home),
+                None => "Tool caches".to_string(),
+            },
+            is_project: project.is_some(),
+            staleness,
+            heading: staleness.heading().to_string(),
+            detail: String::new(),
+            contents: contents_text(&top_level),
+            bytes,
+            freed_bytes: top_level.iter().map(|r| r.target.freed_bytes).sum(),
+            regenerates_bytes: top_level
+                .iter()
+                .filter(|r| r.target.safety == Safety::Regenerates)
+                .map(|r| r.target.bytes)
+                .sum(),
+            regenerates_freed_bytes: top_level
+                .iter()
+                .filter(|r| r.target.safety == Safety::Regenerates)
+                .map(|r| r.target.freed_bytes)
+                .sum(),
+            oldest_days: ages.iter().copied().max().unwrap_or(0),
+            newest_days: ages.iter().copied().min().unwrap_or(0),
+            deletable_freed_bytes: delete.iter().map(|r| r.target.freed_bytes).sum(),
+            held_back: top_level
+                .iter()
+                .filter(|r| !delete_paths.contains(&r.target.path))
+                .count(),
+            delete_paths,
+            members,
+        };
+        bundle.detail = bundle.detail_text();
+        bundles.push(bundle);
+    }
+    // The longest untouched first; among those, what frees the most.
+    bundles.sort_by(|a, b| {
+        (a.staleness, b.freed_bytes, b.bytes, &a.name).cmp(&(b.staleness, a.freed_bytes, a.bytes, &b.name))
+    });
+    (bundles, alone)
+}
+
+/// The listing for what `index` holds: filtered, bundled, sorted and totalled as `opts` asks.
 fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> Report {
-    let worktree_paths: Vec<&PathBuf> = index
+    let worktrees: HashMap<&PathBuf, &Candidate> = index
         .entries
         .iter()
         .filter(|c| c.kind == Kind::Worktree)
-        .map(|c| &c.path)
+        .map(|c| (&c.path, c))
         .collect();
 
-    let mut targets = Vec::new();
+    let mut rows = Vec::new();
     let mut unmeasured = 0usize;
     for c in &index.entries {
         let Some(size) = c.size else {
@@ -1231,33 +1455,70 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
             .remove
             .clone()
             .unwrap_or_else(|| format!("rm -rf {}", shell_path(&c.path, home)));
-        targets.push(Target {
-            display_path: display_path(&c.path, home),
-            kind: c.kind,
-            what: c.what.clone(),
-            cost: c.cost.clone(),
-            remove,
-            safety: c.safety,
-            bytes: size.bytes,
-            freed_bytes: size.freed.min(size.bytes),
-            complete: size.complete,
-            measured_at: c.measured_at,
-            age_days: age_days(c.last_touch),
-            repo: c.repo.as_deref().map(|r| display_path(r, home)),
-            branch: c.branch.clone(),
-            note: c.note.clone(),
-            deletable: c.deletable,
-            path: c.path.clone(),
+        // The worktree a build folder is inside, if that worktree has been measured.
+        let inside = match (&c.kind, &c.repo) {
+            (Kind::Build, Some(repo)) => worktrees
+                .get(repo)
+                .filter(|w| w.size.is_some())
+                .map(|w| w.path.clone()),
+            _ => None,
+        };
+        let project = match c.kind {
+            Kind::Cache => None,
+            Kind::Worktree => c.repo.clone(),
+            Kind::Build => match c.repo.as_ref().and_then(|repo| worktrees.get(repo)) {
+                Some(worktree) => worktree.repo.clone(),
+                None => c
+                    .repo
+                    .clone()
+                    .or_else(|| c.path.parent().map(Path::to_path_buf)),
+            },
+        };
+        let age = age_days(c.last_touch);
+        // A build folder is as stale as the worktree around it, so the two stay together.
+        let staleness = match inside.as_ref().and_then(|w| worktrees.get(w)) {
+            Some(worktree) => Staleness::of(age_days(worktree.last_touch)),
+            None => Staleness::of(age),
+        };
+        rows.push(Row {
+            target: Target {
+                display_path: display_path(&c.path, home),
+                kind: c.kind,
+                what: c.what.clone(),
+                cost: c.cost.clone(),
+                remove,
+                safety: c.safety,
+                bytes: size.bytes,
+                freed_bytes: size.freed.min(size.bytes),
+                complete: size.complete,
+                measured_at: c.measured_at,
+                age_days: age,
+                repo: c.repo.as_deref().map(|r| display_path(r, home)),
+                branch: c.branch.clone(),
+                note: c.note.clone(),
+                deletable: c.deletable,
+                path: c.path.clone(),
+            },
+            project,
+            inside,
+            staleness,
         });
     }
 
-    targets.retain(|t| t.bytes >= opts.min_bytes);
     if opts.older_than_days > 0 {
-        targets.retain(|t| {
-            t.kind == Kind::Cache || t.age_days.is_some_and(|d| d >= opts.older_than_days)
+        rows.retain(|r| {
+            r.target.kind == Kind::Cache
+                || r.target.age_days.is_some_and(|d| d >= opts.older_than_days)
         });
     }
-    // By what deleting gives back; among equals, by what is on disk.
+
+    let (mut bundles, alone) = bundle_stale(rows, home, opts.min_bytes);
+
+    // Everything not bundled is listed on its own, by what deleting gives back; among
+    // equals, by what is on disk.
+    let worktree_paths: Vec<&PathBuf> = worktrees.keys().copied().collect();
+    let mut targets: Vec<Target> = alone.into_iter().map(|r| r.target).collect();
+    targets.retain(|t| t.bytes >= opts.min_bytes);
     targets.sort_by(|a, b| (b.freed_bytes, b.bytes).cmp(&(a.freed_bytes, a.bytes)));
 
     // A build folder inside a listed worktree is already part of that worktree's size.
@@ -1282,10 +1543,15 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
     };
     let on_disk: fn(&Target) -> u64 = |t| t.bytes;
     let freed: fn(&Target) -> u64 = |t| t.freed_bytes;
-    let (regenerates_bytes, review_bytes) = (sum(Safety::Regenerates, on_disk), sum(Safety::Review, on_disk));
-    let (regenerates_freed_bytes, review_freed_bytes) =
-        (sum(Safety::Regenerates, freed), sum(Safety::Review, freed));
+    let bundled = |of: fn(&Bundle) -> u64| -> u64 { bundles.iter().map(of).sum() };
+    let regenerates_bytes = sum(Safety::Regenerates, on_disk) + bundled(|b| b.regenerates_bytes);
+    let review_bytes = sum(Safety::Review, on_disk) + bundled(|b| b.bytes - b.regenerates_bytes);
+    let regenerates_freed_bytes =
+        sum(Safety::Regenerates, freed) + bundled(|b| b.regenerates_freed_bytes);
+    let review_freed_bytes =
+        sum(Safety::Review, freed) + bundled(|b| b.freed_bytes - b.regenerates_freed_bytes);
     targets.truncate(opts.top.max(1));
+    bundles.truncate(opts.top.max(1));
 
     let (volume, used_percent, available_gb) =
         crate::sampler::disk::sample_volume_containing(home)
@@ -1296,6 +1562,7 @@ fn report_from(home: &Path, opts: &Options, index: &Index, from_cache: bool) -> 
         volume,
         used_percent,
         available_gb,
+        bundles,
         targets,
         unmeasured,
         repos_scanned: index.repos_scanned,
@@ -1408,10 +1675,15 @@ impl Target {
     /// "untouched 34 days", or nothing for tool caches.
     pub fn age_text(&self) -> Option<String> {
         let days = self.age_days?;
-        Some(match days {
-            0 => "used today".to_string(),
-            1 => "untouched 1 day".to_string(),
-            n => format!("untouched {n} days"),
+        // A cache's date is when its top level last changed, which is not when it was
+        // last read.
+        Some(match (self.kind, days) {
+            (Kind::Cache, 0) => "added to today".to_string(),
+            (Kind::Cache, 1) => "nothing new for 1 day".to_string(),
+            (Kind::Cache, n) => format!("nothing new for {n} days"),
+            (_, 0) => "used today".to_string(),
+            (_, 1) => "untouched 1 day".to_string(),
+            (_, n) => format!("untouched {n} days"),
         })
     }
 
@@ -1433,7 +1705,7 @@ impl Target {
         if let Some(note) = &self.note {
             details.push(note.clone());
         }
-        if details.is_empty() {
+        if self.note.is_none() && (details.is_empty() || self.kind == Kind::Cache) {
             details.push(self.cost.clone());
         }
         line.push_str(&format!("\n             {}", details.join("; ")));
@@ -1441,6 +1713,36 @@ impl Target {
             line.push_str(&format!("\n             {shared}"));
         }
         line
+    }
+}
+
+impl Bundle {
+    /// "untouched 35 to 56 days"; for tool caches, "nothing new for 35 to 56 days".
+    pub fn ages_text(&self) -> String {
+        let lead = if self.is_project { "untouched" } else { "nothing new for" };
+        if self.oldest_days == self.newest_days {
+            format!("{lead} {} days", self.oldest_days)
+        } else {
+            format!("{lead} {} to {} days", self.newest_days, self.oldest_days)
+        }
+    }
+
+    /// How stale it is and how much of it can go without a look.
+    pub fn detail_text(&self) -> String {
+        let held = match self.held_back {
+            0 => String::new(),
+            1 => "; 1 needs a look or its own command".to_string(),
+            n => format!("; {n} need a look or their own command"),
+        };
+        match self.delete_paths.len() {
+            0 => format!("{}; nothing in it can be deleted without a look or its own command", self.ages_text()),
+            n => format!(
+                "{}; {} in {n} folder{} can be deleted now{held}",
+                self.ages_text(),
+                human_size(self.deletable_freed_bytes),
+                if n == 1 { "" } else { "s" }
+            ),
+        }
     }
 }
 
@@ -1466,10 +1768,44 @@ impl Report {
                 ago_text(unix_now().saturating_sub(self.scanned_at))
             ));
         }
-        if self.targets.is_empty() {
+        if self.targets.is_empty() && self.bundles.is_empty() {
             out.push_str("Nothing large enough to list was found.\n");
         } else {
-            out.push_str("Sizes are what deleting would free, largest first. This listing deletes nothing; `guardian disk clean` offers to.\n\n");
+            out.push_str("Stale things first, bundled by project; then the rest, largest first. Sizes are what deleting would free. This listing deletes nothing; `guardian disk clean` offers to.\n\n");
+        }
+        let mut heading = None;
+        for b in &self.bundles {
+            if heading != Some(b.staleness) {
+                if heading.is_some() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("{}\n", b.staleness.heading()));
+                heading = Some(b.staleness);
+            }
+            out.push_str(&format!(
+                "  {:>9}  {}: {}\n             {}\n",
+                human_size(b.freed_bytes),
+                b.name,
+                b.contents,
+                b.detail_text()
+            ));
+            for m in b.members.iter().take(3) {
+                out.push_str(&format!(
+                    "             {:>9}  {} ({})\n",
+                    m.size_text(),
+                    m.what,
+                    m.display_path
+                ));
+            }
+            if b.members.len() > 3 {
+                out.push_str(&format!("                        and {} more\n", b.members.len() - 3));
+            }
+            if !b.delete_paths.is_empty() {
+                out.push_str("             $ guardian disk clean    (offers this bundle as one choice)\n");
+            }
+        }
+        if heading.is_some() {
+            out.push('\n');
         }
         for (label, safety) in [
             ("Comes back on its own", Safety::Regenerates),
@@ -1505,7 +1841,8 @@ impl Report {
                 human_size(shared)
             ));
         }
-        if self.targets.iter().any(|t| !t.complete) {
+        let listed = self.targets.iter().chain(self.bundles.iter().flat_map(|b| &b.members));
+        if listed.into_iter().any(|t| !t.complete) {
             out.push_str("Sizes ending in + ran out of time and are lower bounds.\n");
         }
         if self.unmeasured > 0 {
@@ -1660,18 +1997,16 @@ pub fn delete_target(path: &Path, home: &Path) -> Result<Deleted, String> {
     })
 }
 
-/// Parse an answer to "delete which?": item numbers (`1 3 5`, `2,4`, `1-3`), or `old`.
+/// Parse an answer to "delete which?" about a numbered list of `count` choices: numbers
+/// (`1 3 5`, `2,4`, `1-3`), or `old` for the choices at the indices in `old`.
 /// `Ok(None)` means nothing was chosen.
-pub fn parse_selection(input: &str, targets: &[Target]) -> Result<Option<Vec<usize>>, String> {
+pub fn parse_selection(input: &str, count: usize, old: &[usize]) -> Result<Option<Vec<usize>>, String> {
     let input = input.trim().to_lowercase();
     if input.is_empty() || input == "n" || input == "no" || input == "q" {
         return Ok(None);
     }
     if input == "old" {
-        let picked: Vec<usize> = (0..targets.len())
-            .filter(|i| targets[*i].is_old_and_safe())
-            .collect();
-        return Ok((!picked.is_empty()).then_some(picked));
+        return Ok((!old.is_empty()).then(|| old.to_vec()));
     }
     let mut picked = Vec::new();
     for part in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()) {
@@ -1682,8 +2017,8 @@ pub fn parse_selection(input: &str, targets: &[Target]) -> Result<Option<Vec<usi
         let parse = |s: &str| {
             s.parse::<usize>()
                 .ok()
-                .filter(|n| (1..=targets.len()).contains(n))
-                .ok_or_else(|| format!("`{part}` is not a number from 1 to {}", targets.len()))
+                .filter(|n| (1..=count).contains(n))
+                .ok_or_else(|| format!("`{part}` is not a number from 1 to {count}"))
         };
         let (from, to) = (parse(from)?, parse(to)?);
         if from > to {
@@ -1742,6 +2077,32 @@ mod tests {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+
+        /// Make `rel` look last changed `days` ago: the folder and what is directly in it.
+        fn age(&self, rel: &str, days: u64) {
+            let when = SystemTime::now() - Duration::from_secs(days * 86_400 + 3_600);
+            let dir = self.path(rel);
+            let set = |path: &Path| {
+                if fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
+                    fs::File::open(path).unwrap().set_modified(when).unwrap();
+                }
+            };
+            if dir.is_dir() {
+                for entry in fs::read_dir(&dir).unwrap().flatten() {
+                    set(&entry.path());
+                }
+            }
+            set(&dir);
+        }
+
+        /// Make the checkout at `rel` look last worked in `days` ago. `git_dir` is its git
+        /// directory, relative to the scratch home: `<rel>/.git`, or for a linked worktree
+        /// `<main>/.git/worktrees/<name>`.
+        fn age_checkout(&self, rel: &str, git_dir: &str, days: u64) {
+            self.age(&format!("{git_dir}/logs"), days);
+            self.age(git_dir, days);
+            self.age(rel, days);
         }
 
         /// A repository at `rel` with one commit.
@@ -1886,10 +2247,11 @@ mod tests {
         assert_eq!(npm.remove, "npm cache clean --force");
         assert_eq!(npm.safety, Safety::Regenerates);
         assert!(!npm.deletable, "npm has its own cleaner; Guardian does not delete it");
-        assert_eq!(npm.age_days, None);
+        assert_eq!(npm.age_text().as_deref(), Some("added to today"));
         let ollama = find(&report, "~/.ollama/models");
         assert_eq!(ollama.safety, Safety::Review);
         assert!(!ollama.deletable);
+        assert_eq!(ollama.age_days, None, "a model is not stale for having been downloaded long ago");
         let playwright = find(&report, "~/Library/Caches/ms-playwright");
         assert!(playwright.deletable);
         assert!(report.regenerates_bytes >= 450_000);
@@ -2205,25 +2567,31 @@ mod tests {
 
     #[test]
     fn selection_parsing() {
-        let items = vec![
-            target(Some(40), Safety::Regenerates, Kind::Build, true),
-            target(Some(2), Safety::Regenerates, Kind::Build, true),
-            target(Some(90), Safety::Review, Kind::Worktree, true),
-            target(Some(30), Safety::Regenerates, Kind::Worktree, true),
-            target(None, Safety::Regenerates, Kind::Cache, true),
-        ];
-        assert_eq!(parse_selection("", &items), Ok(None));
-        assert_eq!(parse_selection("  n ", &items), Ok(None));
-        assert_eq!(parse_selection("1 3", &items), Ok(Some(vec![0, 2])));
-        assert_eq!(parse_selection("3,1,1", &items), Ok(Some(vec![0, 2])));
-        assert_eq!(parse_selection("2-4", &items), Ok(Some(vec![1, 2, 3])));
-        // `old`: comes back on its own, untouched two weeks, not a shared tool cache.
-        assert_eq!(parse_selection("OLD", &items), Ok(Some(vec![0, 3])));
-        assert!(parse_selection("0", &items).is_err());
-        assert!(parse_selection("6", &items).is_err());
-        assert!(parse_selection("4-2", &items).is_err());
-        assert!(parse_selection("all", &items).is_err());
-        assert!(parse_selection("y", &items).is_err(), "a stray yes selects nothing");
+        // Five choices; the first and fourth are what `old` stands for.
+        let pick = |input: &str| parse_selection(input, 5, &[0, 3]);
+        assert_eq!(pick(""), Ok(None));
+        assert_eq!(pick("  n "), Ok(None));
+        assert_eq!(pick("1 3"), Ok(Some(vec![0, 2])));
+        assert_eq!(pick("3,1,1"), Ok(Some(vec![0, 2])));
+        assert_eq!(pick("2-4"), Ok(Some(vec![1, 2, 3])));
+        assert_eq!(pick("OLD"), Ok(Some(vec![0, 3])));
+        assert_eq!(parse_selection("old", 5, &[]), Ok(None), "nothing old to pick");
+        assert!(pick("0").is_err());
+        assert!(pick("6").is_err());
+        assert!(pick("4-2").is_err());
+        assert!(pick("all").is_err());
+        assert!(pick("y").is_err(), "a stray yes selects nothing");
+    }
+
+    #[test]
+    fn old_and_safe_is_two_weeks_untouched_and_not_a_shared_cache() {
+        let old = |age, safety, kind, deletable| target(age, safety, kind, deletable).is_old_and_safe();
+        assert!(old(Some(40), Safety::Regenerates, Kind::Build, true));
+        assert!(old(Some(30), Safety::Regenerates, Kind::Worktree, true));
+        assert!(!old(Some(2), Safety::Regenerates, Kind::Build, true));
+        assert!(!old(Some(90), Safety::Review, Kind::Worktree, true));
+        assert!(!old(Some(90), Safety::Regenerates, Kind::Build, false));
+        assert!(!old(Some(90), Safety::Regenerates, Kind::Cache, true));
     }
 
     // --- text ---
@@ -2270,6 +2638,160 @@ mod tests {
         assert!(text.contains("$ npm cache clean --force"), "{text}");
         assert!(text.contains("to empty trash"), "{text}");
         assert!(text.contains("used today"), "{text}");
+    }
+
+    // --- stale things, bundled ---
+
+    fn bundle<'a>(report: &'a Report, name: &str, staleness: Staleness) -> &'a Bundle {
+        report
+            .bundles
+            .iter()
+            .find(|b| b.name == name && b.staleness == staleness)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {staleness:?} bundle {name} in {:?}",
+                    report.bundles.iter().map(|b| (&b.name, b.staleness)).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    #[test]
+    fn ages_fall_into_bands() {
+        assert_eq!(Staleness::of(None), Staleness::InUse);
+        assert_eq!(Staleness::of(Some(6)), Staleness::InUse);
+        assert_eq!(Staleness::of(Some(7)), Staleness::Week);
+        assert_eq!(Staleness::of(Some(13)), Staleness::Week);
+        assert_eq!(Staleness::of(Some(14)), Staleness::Fortnight);
+        assert_eq!(Staleness::of(Some(30)), Staleness::Month);
+        assert_eq!(Staleness::of(Some(89)), Staleness::Month);
+        assert_eq!(Staleness::of(Some(90)), Staleness::Quarter);
+        assert!(Staleness::Quarter < Staleness::Month && Staleness::Week < Staleness::InUse);
+        assert!(Staleness::Fortnight.is_old() && !Staleness::Week.is_old());
+    }
+
+    #[test]
+    fn stale_folders_are_bundled_by_project_the_longest_untouched_first() {
+        let s = Scratch::new("bundles");
+        // Untouched for two months: two folders, each too small to list on its own.
+        s.repo("code/old-app");
+        s.file("code/old-app/web/package.json", 10);
+        s.file("code/old-app/web/node_modules/x.js", 300_000);
+        s.file("code/old-app/api/node_modules/x.js", 350_000);
+        s.age("code/old-app/web/node_modules", 60);
+        s.age("code/old-app/api/node_modules", 75);
+        // A folder is as fresh as the latest sign of work in its repository.
+        s.age_checkout("code/old-app", "code/old-app/.git", 75);
+        // Untouched for three weeks.
+        s.repo("code/mid-app");
+        s.file("code/mid-app/Cargo.toml", 10);
+        s.file("code/mid-app/target/debug/app", 700_000);
+        s.age("code/mid-app/target", 20);
+        s.age_checkout("code/mid-app", "code/mid-app/.git", 20);
+        // In use.
+        s.repo("code/live-app");
+        s.file("code/live-app/node_modules/x.js", 900_000);
+        // Tool caches nothing has been added to for six weeks: one Guardian deletes, one
+        // with a cleaner of its own.
+        s.file("Library/Caches/ms-playwright/chromium/bin", 800_000);
+        s.age("Library/Caches/ms-playwright", 45);
+        s.file(".cache/uv/blob", 600_000);
+        s.age(".cache/uv", 45);
+
+        let opts = Options {
+            min_bytes: 500_000,
+            top: 50,
+            ..Options::default()
+        };
+        let report = survey_home(&s.0, &opts);
+        let order: Vec<(&str, Staleness)> = report.bundles.iter().map(|b| (b.name.as_str(), b.staleness)).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("Tool caches", Staleness::Month),
+                ("~/code/old-app", Staleness::Month),
+                ("~/code/mid-app", Staleness::Fortnight),
+            ],
+            "longest untouched first; within a band, what frees the most"
+        );
+        assert_eq!(listed(&report), vec!["~/code/live-app/node_modules"], "what is in use is listed on its own");
+
+        let old = bundle(&report, "~/code/old-app", Staleness::Month);
+        assert_eq!(old.contents, "2 build folders");
+        assert_eq!((old.newest_days, old.oldest_days), (60, 75));
+        assert_eq!(old.delete_paths.len(), 2);
+        assert_eq!(old.held_back, 0);
+        assert!(old.is_project);
+        assert!(old.freed_bytes >= 650_000 && old.freed_bytes == old.deletable_freed_bytes);
+        assert_eq!(old.members[0].display_path, "~/code/old-app/api/node_modules", "largest first");
+        assert_eq!(old.ages_text(), "untouched 60 to 75 days");
+
+        let caches = bundle(&report, "Tool caches", Staleness::Month);
+        assert!(!caches.is_project);
+        assert_eq!(caches.contents, "2 caches");
+        assert_eq!(caches.delete_paths, vec![s.path("Library/Caches/ms-playwright")]);
+        assert_eq!(caches.held_back, 1, "uv has its own cleaner");
+        assert_eq!(caches.ages_text(), "nothing new for 45 days");
+
+        // The totals cover bundles and single folders alike.
+        assert!(report.regenerates_bytes >= 300_000 + 350_000 + 700_000 + 900_000 + 800_000 + 600_000);
+
+        let text = report.render();
+        let month = text.find("Untouched 30 to 89 days").unwrap();
+        let fortnight = text.find("Untouched 14 to 29 days").unwrap();
+        let single = text.find("Comes back on its own").unwrap();
+        assert!(month < fortnight && fortnight < single, "{text}");
+        assert!(text.contains("~/code/old-app: 2 build folders"), "{text}");
+        assert!(text.contains("in 2 folders can be deleted now"), "{text}");
+        assert!(text.contains("1 needs a look or its own command"), "{text}");
+    }
+
+    #[test]
+    fn a_bundle_too_small_to_list_hands_its_folders_back() {
+        let s = Scratch::new("bundle-floor");
+        s.file("code/app/node_modules/x.js", 300_000);
+        s.age("code/app/node_modules", 40);
+        let big_floor = Options {
+            min_bytes: 5_000_000,
+            ..small_floor()
+        };
+        let report = survey_home(&s.0, &big_floor);
+        assert!(report.bundles.is_empty() && report.targets.is_empty());
+        // With a floor it clears, it is a bundle of one.
+        let report = survey_home(&s.0, &small_floor());
+        assert_eq!(report.bundles.len(), 1);
+        assert_eq!(report.bundles[0].contents, "1 build folder");
+        assert!(report.targets.is_empty());
+    }
+
+    #[test]
+    fn a_stale_worktree_is_bundled_with_what_is_inside_it() {
+        let s = Scratch::new("bundle-worktrees");
+        s.repo("code/app");
+        fs::write(s.path("code/app/.gitignore"), "node_modules\n").unwrap();
+        s.git("code/app", &["add", ".gitignore"]);
+        s.git("code/app", &["commit", "-q", "-m", "ignore"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "done", "../app-wt-done"]);
+        s.git("code/app", &["worktree", "add", "-q", "-b", "wip", "../app-wt-wip"]);
+        s.file("code/app-wt-done/node_modules/dep/x.js", 400_000);
+        s.file("code/app-wt-wip/node_modules/dep/x.js", 500_000);
+        s.file("code/app-wt-wip/notes.txt", 100);
+        s.age_checkout("code/app-wt-done", "code/app/.git/worktrees/app-wt-done", 20);
+        s.age_checkout("code/app-wt-wip", "code/app/.git/worktrees/app-wt-wip", 22);
+
+        let report = survey_home(&s.0, &small_floor());
+        let b = bundle(&report, "~/code/app", Staleness::Fortnight);
+        assert_eq!(b.contents, "2 worktrees", "the folders inside them are part of them");
+        // The clean worktree goes whole. The one with unsaved work stays, but the
+        // dependencies inside it can still go.
+        assert_eq!(
+            b.delete_paths,
+            vec![s.path("code/app-wt-wip/node_modules"), s.path("code/app-wt-done")]
+        );
+        assert_eq!(b.held_back, 1);
+        let shown: Vec<&str> = b.members.iter().map(|m| m.display_path.as_str()).collect();
+        assert_eq!(shown, vec!["~/code/app-wt-wip", "~/code/app-wt-wip/node_modules", "~/code/app-wt-done"]);
+        assert!(b.freed_bytes >= 900_000, "both worktrees, each counted once: {}", b.freed_bytes);
+        assert!(b.freed_bytes < 1_400_000, "{}", b.freed_bytes);
     }
 
     #[test]

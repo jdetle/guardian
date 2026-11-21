@@ -262,29 +262,26 @@ fn disk_refresh(scan: &ScanArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
-    let home = home()?;
-    println!("Scanning your git repositories and tool caches (up to {} s; sizes that have not changed are reused)...", scan.seconds);
-    // Look at more than will be listed: only things Guardian can delete are offered.
-    let mut opts = scan.options();
-    opts.top = 100;
-    let report = disk_targets::survey(&opts).ok_or("could not find the home directory")?;
-    let offered: Vec<disk_targets::Target> = report
-        .targets
-        .into_iter()
-        .filter(|t| t.deletable)
-        .take(scan.top as usize)
-        .collect();
-    if offered.is_empty() {
-        println!("Nothing Guardian can delete was found. `guardian disk` lists everything, including items that need a tool or a decision.");
-        return Ok(());
-    }
+/// One numbered choice in `guardian disk clean`: a bundle of stale things that can go
+/// together, or a single folder.
+struct Offer {
+    /// What deleting it would free.
+    freed: u64,
+    /// The line it is listed and confirmed by.
+    title: String,
+    /// What is said under it.
+    detail: String,
+    paths: Vec<PathBuf>,
+    /// Needs a look before deleting; said next to it and again when confirming.
+    look_first: bool,
+    /// Picked by `old`: comes back on its own and has gone untouched for two weeks or more.
+    old: bool,
+}
 
-    println!(
-        "\nDisk: {:.1}% used, {:.1} GB free. {} git repositories scanned.\n",
-        report.used_percent, report.available_gb, report.repos_scanned
-    );
-    for (i, t) in offered.iter().enumerate() {
+/// What `guardian disk clean` can offer from a report: stale bundles first, then single
+/// folders, each list in the report's own order.
+fn offers(report: &disk_targets::Report, top: usize) -> Vec<Offer> {
+    let single = |t: &disk_targets::Target| {
         let mut details: Vec<String> = Vec::new();
         if let Some(age) = t.age_text() {
             details.push(age);
@@ -293,61 +290,108 @@ fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
         if let Some(shared) = t.shared_text() {
             details.push(shared);
         }
-        let flag = if t.safety == disk_targets::Safety::Review { "  LOOK FIRST" } else { "" };
+        Offer {
+            freed: t.freed_bytes,
+            title: format!("{} ({})", t.what, t.display_path),
+            detail: details.join("; "),
+            paths: vec![t.path.clone()],
+            look_first: t.safety == disk_targets::Safety::Review,
+            old: false,
+        }
+    };
+    let mut all = Vec::new();
+    for b in &report.bundles {
+        if !b.delete_paths.is_empty() {
+            all.push(Offer {
+                freed: b.deletable_freed_bytes,
+                title: format!("{}: {} stale folder{}", b.name, b.delete_paths.len(), if b.delete_paths.len() == 1 { "" } else { "s" }),
+                detail: b.detail_text(),
+                paths: b.delete_paths.clone(),
+                look_first: false,
+                // Tool caches are shared by every project: chosen by number, never by `old`.
+                old: b.is_project && b.staleness.is_old(),
+            });
+        }
+    }
+    // Stale folders Guardian can delete but that need a look first are offered one by one.
+    for t in report.bundles.iter().flat_map(|b| &b.members) {
+        if t.deletable && t.safety == disk_targets::Safety::Review {
+            all.push(single(t));
+        }
+    }
+    for t in report.targets.iter().filter(|t| t.deletable) {
+        all.push(single(t));
+    }
+    all.truncate(top);
+    all
+}
+
+fn disk_clean(scan: &ScanArgs) -> Result<(), String> {
+    let home = home()?;
+    println!("Scanning your git repositories and tool caches (up to {} s; sizes that have not changed are reused)...", scan.seconds);
+    // Look at more than will be listed: only things Guardian can delete are offered.
+    let mut opts = scan.options();
+    opts.top = 100;
+    let report = disk_targets::survey(&opts).ok_or("could not find the home directory")?;
+    let offered = offers(&report, scan.top as usize);
+    if offered.is_empty() {
+        println!("Nothing Guardian can delete was found. `guardian disk` lists everything, including items that need a tool or a decision.");
+        return Ok(());
+    }
+
+    println!(
+        "\nDisk: {:.1}% used, {:.1} GB free. {} git repositories scanned. Stale things come first, bundled by project.\n",
+        report.used_percent, report.available_gb, report.repos_scanned
+    );
+    for (i, offer) in offered.iter().enumerate() {
+        let flag = if offer.look_first { "  LOOK FIRST" } else { "" };
         println!(
-            "{:>3}. {:>9}  {} ({}){flag}\n                {}",
+            "{:>3}. {:>9}  {}{flag}\n                {}",
             i + 1,
-            t.size_text(),
-            t.what,
-            t.display_path,
-            details.join("; ")
+            disk_targets::human_size(offer.freed),
+            offer.title,
+            offer.detail
         );
     }
-    let old: Vec<&disk_targets::Target> = offered.iter().filter(|t| t.is_old_and_safe()).collect();
-    let old_bytes: u64 = old.iter().map(|t| t.freed_bytes).sum();
+    let old: Vec<usize> = (0..offered.len()).filter(|i| offered[*i].old).collect();
     println!();
     if !old.is_empty() {
         println!(
-            "`old` selects the {} item(s) that come back on their own and have gone untouched for {}+ days ({}).",
+            "`old` selects the {} bundle(s) of things that come back on their own and have gone untouched for {}+ days ({}).",
             old.len(),
             disk_targets::OLD_DAYS,
-            disk_targets::human_size(old_bytes)
+            disk_targets::human_size(old.iter().map(|i| offered[*i].freed).sum())
         );
     }
 
     let answer = ask("Delete which? Numbers (1 3 5, 2-4), `old`, or Enter for none: ")?;
-    let Some(picked) = disk_targets::parse_selection(&answer, &offered)? else {
+    let Some(picked) = disk_targets::parse_selection(&answer, offered.len(), &old)? else {
         println!("Nothing deleted.");
         return Ok(());
     };
     // Deleting a worktree takes the build folders inside it along; do not ask for them twice.
-    let chosen: Vec<&disk_targets::Target> = picked.iter().map(|i| &offered[*i]).collect();
-    let paths: Vec<PathBuf> = chosen
+    let chosen: Vec<&Offer> = picked.iter().map(|i| &offered[*i]).collect();
+    let mut all_paths: Vec<PathBuf> = chosen.iter().flat_map(|o| o.paths.iter().cloned()).collect();
+    all_paths.sort();
+    all_paths.dedup();
+    let paths: Vec<PathBuf> = all_paths
         .iter()
-        .filter(|t| {
-            !chosen
-                .iter()
-                .any(|outer| outer.path != t.path && t.path.starts_with(&outer.path))
-        })
-        .map(|t| t.path.clone())
+        .filter(|p| !all_paths.iter().any(|outer| outer != *p && p.starts_with(outer)))
+        .cloned()
         .collect();
-    let total: u64 = chosen
-        .iter()
-        .filter(|t| paths.contains(&t.path))
-        .map(|t| t.freed_bytes)
-        .sum();
 
     println!();
-    for t in chosen.iter().filter(|t| paths.contains(&t.path)) {
-        let warn = if t.safety == disk_targets::Safety::Review {
-            format!("  <- {}", t.note.clone().unwrap_or_else(|| t.cost.clone()))
+    for offer in &chosen {
+        let warn = if offer.look_first {
+            format!("  <- {}", offer.detail)
         } else {
             String::new()
         };
-        println!("  {:>9}  {}{warn}", t.size_text(), t.display_path);
+        println!("  {:>9}  {}{warn}", disk_targets::human_size(offer.freed), offer.title);
     }
+    let total: u64 = chosen.iter().map(|o| o.freed).sum();
     let confirm = ask(&format!(
-        "Delete these {} item(s), about {}? This cannot be undone. [y/N] ",
+        "Delete these {} folder(s), about {}? This cannot be undone. [y/N] ",
         paths.len(),
         disk_targets::human_size(total)
     ))?;
@@ -615,5 +659,58 @@ mod tests {
         assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
         assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
         assert!(!parses(&["guardian", "disk", "delete"]));
+    }
+
+    #[test]
+    fn clean_offers_stale_bundles_first_and_old_picks_them() {
+        use std::time::{Duration, SystemTime};
+        let home = std::env::temp_dir().join(format!("guardian-cli-offers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let write = |rel: &str, bytes: usize| {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        };
+        let age = |rel: &str, days: u64| {
+            let when = SystemTime::now() - Duration::from_secs(days * 86_400 + 3_600);
+            for entry in std::fs::read_dir(home.join(rel)).unwrap().flatten() {
+                std::fs::File::open(entry.path()).unwrap().set_modified(when).unwrap();
+            }
+            std::fs::File::open(home.join(rel)).unwrap().set_modified(when).unwrap();
+        };
+        write("code/old/node_modules/a.js", 300_000);
+        write("code/old/.next/b.js", 200_000);
+        write("code/old/package.json", 2);
+        age("code/old/node_modules", 40);
+        age("code/old/.next", 40);
+        write("code/live/node_modules/c.js", 900_000);
+        write("Library/Caches/ms-playwright/chromium/bin", 400_000);
+        age("Library/Caches/ms-playwright", 50);
+        let home = std::fs::canonicalize(&home).unwrap();
+
+        let opts = disk_targets::Options {
+            min_bytes: 1,
+            top: 50,
+            ..disk_targets::Options::default()
+        };
+        let report = disk_targets::survey_home(&home, &opts);
+        let offered = offers(&report, 10);
+        let titles: Vec<&str> = offered.iter().map(|o| o.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "~/code/old: 2 stale folders",
+                "Tool caches: 1 stale folder",
+                "Node dependencies (~/code/live/node_modules)",
+            ]
+        );
+        assert_eq!(offered[0].paths.len(), 2);
+        assert!(offered[0].freed >= 500_000);
+        // `old` takes the project's stale bundle, not a cache every project shares, and
+        // nothing in use.
+        let old: Vec<bool> = offered.iter().map(|o| o.old).collect();
+        assert_eq!(old, vec![true, false, false]);
+        assert_eq!(offers(&report, 1).len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

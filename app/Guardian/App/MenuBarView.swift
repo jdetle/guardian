@@ -284,7 +284,7 @@ struct MenuBarView: View {
             }
 
             if let report = client.diskReport {
-                if report.targets.isEmpty {
+                if report.targets.isEmpty && report.bundles.isEmpty {
                     Text("Nothing large and easy to remove was found.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -293,7 +293,7 @@ struct MenuBarView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    targetList(report.targets)
+                    targetList(report)
                 }
             } else if !client.diskScanning {
                 Text("Lists build output, dependency folders, unused worktrees and caches, with what deleting each would free. Finding them deletes nothing.")
@@ -324,34 +324,50 @@ struct MenuBarView: View {
         DiskTarget.withoutNested(targets.filter { $0.deletable && selected.contains($0.path) })
     }
 
-    /// Everything found, in one scrolling list: first what Guardian deletes itself (tick,
-    /// then one button), then what needs its own tool or a decision (a command to copy).
+    /// Everything found, in one scrolling list: stale bundles first (the longest untouched
+    /// at the top), then single folders Guardian deletes itself, then what needs its own
+    /// tool or a decision (a command to copy).
     @ViewBuilder
-    private func targetList(_ targets: [DiskTarget]) -> some View {
-        let deletable = targets.filter(\.deletable)
-        let manual = targets.filter { !$0.deletable }
-        let chosen = picked(from: targets)
-        let suggested = deletable.filter(\.isOldAndSafe)
+    private func targetList(_ report: DiskReport) -> some View {
+        let bundles = report.bundles
+        let members = bundles.flatMap(\.members)
+        // Stale folders that can be deleted but need a look are offered one at a time.
+        let singles = members.filter { $0.deletable && !$0.regenerates } + report.targets.filter(\.deletable)
+        let manual = report.targets.filter { !$0.deletable }
+        let chosen = picked(from: members + report.targets)
+        let old = Set(bundles.filter { $0.isOld && $0.isProject }.flatMap(\.deletePaths))
+        let canDelete = !singles.isEmpty || bundles.contains { !$0.deletePaths.isEmpty }
 
-        if !deletable.isEmpty {
-            Text("Tick what to delete, then press Delete selected. Nothing is removed until you confirm.")
+        if canDelete {
+            Text((bundles.isEmpty ? "" : "Stale things come first, bundled by project. ")
+                + "Tick what to delete, then press Delete selected. Nothing is removed until you confirm.")
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        Text(counts(deletable: deletable.count, manual: manual.count))
+        Text(counts(bundles: bundles.count, singles: singles.count, manual: manual.count))
             .font(.caption2)
             .foregroundStyle(.secondary)
         ScrollView {
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(deletable) { target in
-                    deletableRow(target)
+                ForEach(Array(bundles.enumerated()), id: \.element.id) { index, bundle in
+                    if index == 0 || bundles[index - 1].heading != bundle.heading {
+                        listLabel(bundle.heading, first: index == 0)
+                    }
+                    bundleRow(bundle)
+                }
+                if !singles.isEmpty {
+                    if !bundles.isEmpty {
+                        listLabel("Single folders", first: false)
+                    }
+                    ForEach(singles) { target in
+                        deletableRow(target)
+                    }
                 }
                 if !manual.isEmpty {
-                    Text("Needs a command: Guardian does not delete these itself. Copy the command and run it in a terminal.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, deletable.isEmpty ? 0 : 6)
+                    listLabel(
+                        "Needs a command: Guardian does not delete these itself. Copy the command and run it in a terminal.",
+                        first: bundles.isEmpty && singles.isEmpty
+                    )
                     ForEach(manual) { target in
                         commandRow(target)
                     }
@@ -359,15 +375,15 @@ struct MenuBarView: View {
             }
         }
         .frame(height: Self.listHeight)
-        if !deletable.isEmpty {
+        if canDelete {
             HStack {
                 Button(selected.isEmpty ? "Tick old and safe" : "Untick all") {
-                    selected = selected.isEmpty ? Set(suggested.map(\.path)) : []
+                    selected = selected.isEmpty ? old : []
                 }
-                .disabled(selected.isEmpty && suggested.isEmpty)
-                .help(suggested.isEmpty
-                    ? "Nothing here both comes back on its own and has gone untouched for \(DiskTarget.oldDays) days. Tick rows yourself."
-                    : "Ticks the \(suggested.count) that come back on their own and have gone untouched for \(DiskTarget.oldDays) days or more")
+                .disabled(selected.isEmpty && old.isEmpty)
+                .help(old.isEmpty
+                    ? "No project has anything that both comes back on its own and has gone untouched for \(DiskTarget.oldDays) days. Tick rows yourself."
+                    : "Ticks every bundle untouched for \(DiskTarget.oldDays) days or more: only what comes back on its own")
                 Spacer()
                 Button(chosen.isEmpty
                     ? "Delete selected…"
@@ -380,11 +396,74 @@ struct MenuBarView: View {
         }
     }
 
-    private func counts(deletable: Int, manual: Int) -> String {
+    private func listLabel(_ text: String, first: Bool) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, first ? 0 : 6)
+    }
+
+    private func counts(bundles: Int, singles: Int, manual: Int) -> String {
+        let plural = { (n: Int, one: String, many: String) in n == 1 ? "1 \(one)" : "\(n) \(many)" }
         var parts: [String] = []
-        if deletable > 0 { parts.append("\(deletable) Guardian can delete") }
+        if bundles > 0 { parts.append(plural(bundles, "stale bundle", "stale bundles")) }
+        if singles > 0 { parts.append(plural(singles, "single folder", "single folders")) }
         if manual > 0 { parts.append("\(manual) that need a command") }
         return parts.joined(separator: ", ") + ". Scroll for more."
+    }
+
+    /// A bundle as one row: ticking it ticks everything in it that can go without a look.
+    private func bundleRow(_ bundle: DiskBundle) -> some View {
+        let paths = Set(bundle.deletePaths)
+        let isOn = Binding(
+            get: { !paths.isEmpty && paths.isSubset(of: selected) },
+            set: { on in
+                if on { selected.formUnion(paths) } else { selected.subtract(paths) }
+            }
+        )
+        let canTick = !paths.isEmpty && client.deletingPaths.isEmpty
+        return HStack(alignment: .top, spacing: 8) {
+            if !client.deletingPaths.isDisjoint(with: paths) {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16)
+            } else if paths.isEmpty {
+                // Nothing in it can go without a look: shown, not tickable.
+                Color.clear.frame(width: 16, height: 16)
+            } else {
+                Toggle("Delete the stale folders of \(bundle.name)", isOn: isOn)
+                    .toggleStyle(.checkbox)
+                    .labelsHidden()
+                    .disabled(!client.deletingPaths.isEmpty)
+            }
+            Text(DiskTarget.sizeText(paths.isEmpty ? bundle.freedBytes : bundle.deletableFreedBytes))
+                .font(.caption.monospacedDigit().weight(.medium))
+                .frame(width: 56, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(bundle.name)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(bundle.contents)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(bundle.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(bundle.members.prefix(12).map { "\($0.sizeText)  \($0.displayPath)" }.joined(separator: "\n"))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(isOn.wrappedValue ? 0.12 : 0.05)))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if canTick { isOn.wrappedValue.toggle() }
+        }
     }
 
     private func deletableRow(_ target: DiskTarget) -> some View {

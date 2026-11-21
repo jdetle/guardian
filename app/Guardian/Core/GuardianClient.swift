@@ -243,10 +243,17 @@ final class GuardianClient: ObservableObject {
                 self.deletingPaths = []
                 let deleted = results.filter(\.ok)
                 let kept = results.filter { !$0.ok }
-                for done in deleted {
-                    self.diskReport?.targets.removeAll {
-                        $0.path == done.path || $0.path.hasPrefix(done.path + "/")
+                if var report = self.diskReport {
+                    for done in deleted {
+                        let gone = { (path: String) in path == done.path || path.hasPrefix(done.path + "/") }
+                        report.targets.removeAll { gone($0.path) }
+                        for i in report.bundles.indices {
+                            report.bundles[i].members.removeAll { gone($0.path) }
+                            report.bundles[i].deletePaths.removeAll(where: gone)
+                        }
                     }
+                    report.bundles.removeAll { $0.members.isEmpty }
+                    self.diskReport = report
                 }
                 self.deleteMessage = Self.deleteSummary(chosen: chosen, deleted: deleted, kept: kept)
                 self.loadState()

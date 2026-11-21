@@ -292,6 +292,14 @@ struct DiskTarget: Codable, Sendable, Identifiable {
 
     var ageText: String? {
         guard let ageDays else { return nil }
+        // A cache's date is when its top level last changed, not when it was last read.
+        if kind == "cache" {
+            switch ageDays {
+            case 0: return "added to today"
+            case 1: return "nothing new for 1 day"
+            default: return "nothing new for \(ageDays) days"
+            }
+        }
         switch ageDays {
         case 0: return "used today"
         case 1: return "untouched 1 day"
@@ -303,15 +311,75 @@ struct DiskTarget: Codable, Sendable, Identifiable {
     var detailText: String {
         var parts: [String] = []
         if let ageText { parts.append(ageText) }
-        if let note, !note.isEmpty { parts.append(note) }
-        if parts.isEmpty { parts.append(cost) }
+        if let note, !note.isEmpty {
+            parts.append(note)
+        } else if parts.isEmpty || kind == "cache" {
+            parts.append(cost)
+        }
         if let sharedText { parts.append(sharedText) }
         return parts.joined(separator: "; ")
     }
 }
 
+/// One bundle of `guardian disk --json`: the stale folders of one project (or the stale tool
+/// caches), listed and deleted as one.
+struct DiskBundle: Codable, Sendable, Identifiable {
+    var id: String { staleness + "|" + name }
+    /// The project as `~/…`, or "Tool caches".
+    var name: String = ""
+    var isProject: Bool = true
+    /// quarter | month | fortnight | week
+    var staleness: String = "week"
+    /// The age band in words: "Untouched 30 to 89 days".
+    var heading: String = ""
+    /// How stale it is and how much of it can go without a look.
+    var detail: String = ""
+    /// "3 worktrees, 4 build folders"
+    var contents: String = ""
+    /// What deleting all of it would free.
+    var freedBytes: UInt64 = 0
+    /// What deleting `deletePaths` would free.
+    var deletableFreedBytes: UInt64 = 0
+    /// What can be deleted now without a look. Nothing here is inside anything else here.
+    var deletePaths: [String] = []
+    var heldBack: Int = 0
+    var members: [DiskTarget] = []
+
+    enum CodingKeys: String, CodingKey {
+        case name, staleness, heading, detail, contents, members
+        case isProject = "is_project"
+        case freedBytes = "freed_bytes"
+        case deletableFreedBytes = "deletable_freed_bytes"
+        case deletePaths = "delete_paths"
+        case heldBack = "held_back"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        isProject = (try? c.decodeIfPresent(Bool.self, forKey: .isProject)) ?? true
+        staleness = (try? c.decodeIfPresent(String.self, forKey: .staleness)) ?? "week"
+        heading = (try? c.decodeIfPresent(String.self, forKey: .heading)) ?? ""
+        detail = (try? c.decodeIfPresent(String.self, forKey: .detail)) ?? ""
+        contents = (try? c.decodeIfPresent(String.self, forKey: .contents)) ?? ""
+        freedBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .freedBytes)) ?? 0
+        deletableFreedBytes = (try? c.decodeIfPresent(UInt64.self, forKey: .deletableFreedBytes)) ?? 0
+        deletePaths = (try? c.decodeIfPresent([String].self, forKey: .deletePaths)) ?? []
+        heldBack = (try? c.decodeIfPresent(Int.self, forKey: .heldBack)) ?? 0
+        members = (try? c.decodeIfPresent([DiskTarget].self, forKey: .members)) ?? []
+    }
+
+    /// Untouched for two weeks or more (OLD_DAYS in src/disk_targets.rs): what
+    /// `guardian disk clean` selects with `old`, for projects.
+    var isOld: Bool { ["quarter", "month", "fortnight"].contains(staleness) }
+}
+
 /// Output of `guardian disk --json`.
 struct DiskReport: Codable, Sendable {
+    /// Stale things grouped by project and age, the longest untouched first. Empty from a
+    /// guardian that does not bundle.
+    var bundles: [DiskBundle]
+    /// Everything not in a bundle.
     var targets: [DiskTarget]
     let unmeasured: Int
     let reposScanned: Int
@@ -324,7 +392,7 @@ struct DiskReport: Codable, Sendable {
     let fromCache: Bool
 
     enum CodingKeys: String, CodingKey {
-        case targets, unmeasured
+        case bundles, targets, unmeasured
         case reposScanned = "repos_scanned"
         case regeneratesBytes = "regenerates_bytes"
         case reviewBytes = "review_bytes"
@@ -336,6 +404,7 @@ struct DiskReport: Codable, Sendable {
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(bundles, forKey: .bundles)
         try c.encode(targets, forKey: .targets)
         try c.encode(unmeasured, forKey: .unmeasured)
         try c.encode(reposScanned, forKey: .reposScanned)
@@ -347,6 +416,7 @@ struct DiskReport: Codable, Sendable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        bundles = (try? c.decodeIfPresent([DiskBundle].self, forKey: .bundles)) ?? []
         targets = (try? c.decodeIfPresent([DiskTarget].self, forKey: .targets)) ?? []
         unmeasured = (try? c.decodeIfPresent(Int.self, forKey: .unmeasured)) ?? 0
         reposScanned = (try? c.decodeIfPresent(Int.self, forKey: .reposScanned)) ?? 0
