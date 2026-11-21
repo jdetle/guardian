@@ -437,7 +437,7 @@ struct MenuBarView: View {
                     .labelsHidden()
                     .disabled(!client.deletingPaths.isEmpty)
             }
-            Text(DiskTarget.sizeText(paths.isEmpty ? bundle.freedBytes : bundle.deletableFreedBytes))
+            Text(DiskTarget.sizeText(bundle.deletableFreedBytes))
                 .font(.caption.monospacedDigit().weight(.medium))
                 .frame(width: 56, alignment: .trailing)
             VStack(alignment: .leading, spacing: 1) {

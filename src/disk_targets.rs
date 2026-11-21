@@ -1734,22 +1734,20 @@ impl Bundle {
         }
     }
 
-    /// How stale it is and how much of it can go without a look.
+    /// How stale it is, how much of it can go without a look, and what is held back.
     pub fn detail_text(&self) -> String {
+        let held_freed = human_size(self.freed_bytes.saturating_sub(self.deletable_freed_bytes));
+        let now = match self.delete_paths.len() {
+            0 => "nothing in it can be deleted now".to_string(),
+            1 => "1 folder can be deleted now".to_string(),
+            n => format!("{n} folders can be deleted now"),
+        };
         let held = match self.held_back {
             0 => String::new(),
-            1 => "; 1 needs a look or its own command".to_string(),
-            n => format!("; {n} need a look or their own command"),
+            1 => format!("; 1 more ({held_freed}) needs a look or its own command"),
+            n => format!("; {n} more ({held_freed}) need a look or their own command"),
         };
-        match self.delete_paths.len() {
-            0 => format!("{}; nothing in it can be deleted without a look or its own command", self.ages_text()),
-            n => format!(
-                "{}; {} in {n} folder{} can be deleted now{held}",
-                self.ages_text(),
-                human_size(self.deletable_freed_bytes),
-                if n == 1 { "" } else { "s" }
-            ),
-        }
+        format!("{}; {now}{held}", self.ages_text())
     }
 }
 
@@ -1778,7 +1776,7 @@ impl Report {
         if self.targets.is_empty() && self.bundles.is_empty() {
             out.push_str("Nothing large enough to list was found.\n");
         } else {
-            out.push_str("Stale things first, bundled by project; then the rest, largest first. Sizes are what deleting would free. This listing deletes nothing; `guardian disk clean` offers to.\n\n");
+            out.push_str("Stale things first, bundled by project; then the rest, largest first. Sizes are what deleting would free; a bundle's is what can be deleted now. This listing deletes nothing; `guardian disk clean` offers to.\n\n");
         }
         let mut heading = None;
         for b in &self.bundles {
@@ -1791,7 +1789,7 @@ impl Report {
             }
             out.push_str(&format!(
                 "  {:>9}  {}: {}\n             {}\n",
-                human_size(b.freed_bytes),
+                human_size(b.deletable_freed_bytes),
                 b.name,
                 b.contents,
                 b.detail_text()
@@ -2748,8 +2746,9 @@ mod tests {
         let single = text.find("Comes back on its own").unwrap();
         assert!(month < fortnight && fortnight < single, "{text}");
         assert!(text.contains("~/code/old-app: 2 build folders"), "{text}");
-        assert!(text.contains("in 2 folders can be deleted now"), "{text}");
-        assert!(text.contains("1 needs a look or its own command"), "{text}");
+        assert!(text.contains("untouched 60 to 75 days; 2 folders can be deleted now\n"), "{text}");
+        assert!(text.contains("1 folder can be deleted now; 1 more ("), "{text}");
+        assert!(text.contains(") needs a look or its own command"), "{text}");
     }
 
     #[test]
