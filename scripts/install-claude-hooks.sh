@@ -38,11 +38,6 @@ chmod +x "$DEST"/*.sh "$DEST/codex"/*.sh "$DEST/claude"/*.sh
 chmod +x "$DEST/cursorignore_check.py" "$DEST/iso_to_epoch.py" 2>/dev/null || true
 
 
-# Which Guardian these hooks came from, for `guardian hooks status`.
-# (From the binary it is handed in; from a checkout it is read from Cargo.toml; with neither,
-# as in the test container, it is "unknown". `|| true`: a missing file must not stop the install.)
-GUARDIAN_HOOKS_VERSION="${GUARDIAN_HOOKS_VERSION:-$({ sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true; } | head -1)}"
-printf '%s\n' "${GUARDIAN_HOOKS_VERSION:-unknown}" > "$DEST/VERSION"
 
 mkdir -p "$GUARDIAN_DIR"
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ]; then
@@ -56,6 +51,14 @@ if ! bash "$HOOKS_SRC/merge-agent-hooks.sh" "$SETTINGS_JSON" "$HOOKS_SRC/claude-
     echo "Fix the problem above and re-run this installer." >&2
     exit 1
 fi
+
+# Stamped only now that the hooks are registered: a failed merge must not leave the old
+# registrations looking like this version's.
+# Which Guardian these hooks came from, for `guardian hooks status`.
+# (From the binary it is handed in; from a checkout it is read from Cargo.toml; with neither,
+# as in the test container, it is "unknown". `|| true`: a missing file must not stop the install.)
+GUARDIAN_HOOKS_VERSION="${GUARDIAN_HOOKS_VERSION:-$({ sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true; } | head -1)}"
+printf '%s\n' "${GUARDIAN_HOOKS_VERSION:-unknown}" > "$DEST/VERSION"
 
 echo "[3/3] Done."
 echo ""

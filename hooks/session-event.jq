@@ -40,7 +40,9 @@ def spawns_agent: . == "Agent" or . == "Task" or . == "spawn_agent";
           ($in.tool_name | text | if . == "" then "unknown" else . end) as $tool
           | [
               "INSERT INTO tool_calls (conversation_id, tool_name, duration_ms, model) VALUES (\($id), \($tool | q), \($in.duration_ms // $in.duration | int), \((if $model == "" then "unknown" else $model end) | q));",
-              "UPDATE sessions SET state = 'working', tool_call_count = COALESCE(tool_call_count, 0) + 1"
+              # A session that has ended stays ended: this hook runs in the background in
+              # Claude Code and Codex, and can finish after the one that ended the session.
+              "UPDATE sessions SET state = CASE WHEN state = 'ended' THEN 'ended' ELSE 'working' END, tool_call_count = COALESCE(tool_call_count, 0) + 1"
                 + (if ($tool | spawns_agent) then ", subagent_count = COALESCE(subagent_count, 0) + 1" else "" end)
                 + " WHERE conversation_id = \($id);"
             ]
@@ -51,7 +53,7 @@ def spawns_agent: . == "Agent" or . == "Task" or . == "spawn_agent";
               | ($state.pressure | text) as $pressure
               | if ($minute == (now | strftime("%Y-%m-%dT%H:%M")) or $minute == (now - 60 | strftime("%Y-%m-%dT%H:%M")))
                    and ($pressure == "clear" or $pressure == "strained" or $pressure == "critical")
-                then ["INSERT INTO pressure_samples (conversation_id, pressure, cpu_percent, memory_available_gb, docker_cpu_percent) VALUES (\($id), \($pressure | q), \($state.cpu_percent | num), \($state.memory_available_gb | num), \($state.docker.total_cpu_percent? | num));"]
+                then ["INSERT INTO pressure_samples (conversation_id, pressure, cpu_percent, memory_available_gb, docker_cpu_percent) VALUES (\($id), \($pressure | q), \($state.cpu_percent | num), \($state.memory_available_gb | num), \($state.docker | if type == "object" then .total_cpu_percent else null end | num));"]
                 else [] end
             )
         elif $event == "end" then

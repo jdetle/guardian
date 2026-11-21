@@ -225,7 +225,8 @@ ensure_db() {
     if [ -f "$SESSIONS_DB" ] && [ -f "$marker" ]; then
         return 0
     fi
-    mkdir -p "$GUARDIAN_DIR"
+    # Nowhere to keep it: nothing is recorded, and the hook that called goes on.
+    mkdir -p "$GUARDIAN_DIR" 2>/dev/null || return 0
     # Read from stdin, sqlite3 carries on past a statement that fails, which is what makes
     # this safe to run on any earlier database: an ALTER for a column that is already there
     # fails and the rest still runs.

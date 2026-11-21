@@ -36,7 +36,7 @@ Sessions snapshot their hooks at startup — **start a new session** (or open `/
 | `PreToolUse` (`Bash\|Agent\|Task`) | `claude/pre-tool-use.sh` | Silent when load is clear. At `strained` / `critical` adds an advisory as `additionalContext`, at most once per 2 minutes per session. Optionally **denies subagent spawns** (see below). |
 
 | `PostToolUse` (every tool, `async`) | `claude/post-tool-use.sh` | Records the tool call and the load it ran under in `~/.guardian/sessions.db`. Prints nothing. |
-| `Stop` (`async`) | `claude/stop.sh` | The turn is over: the session goes from *working* to *idle* and is scored. Prints nothing, so it can never keep Claude going. |
+| `Stop` (`async`) | `claude/stop.sh` | The turn is over: the session goes from *working* to *idle* and is scored. Prints nothing, so it can never keep Claude going. Claude Code does not run it for a turn you interrupt; that session reads as working until it has been quiet for half an hour. |
 | `SessionEnd` | `claude/session-end.sh` | Marks the session *ended*. Prints nothing; quick, because Claude Code gives session-end hooks about a second and a half. |
 
 The last three exist so the menu bar app can **follow Claude Code sessions** next to Cursor's and

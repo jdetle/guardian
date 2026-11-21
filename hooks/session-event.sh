@@ -42,5 +42,13 @@ sql=$(printf '%s' "$input" | jq -r \
     -f "$SCRIPT_DIR/session-event.jq" 2>/dev/null) || exit 0
 [ -n "$sql" ] || exit 0
 
-sqlite3 "$SESSIONS_DB" ".timeout 5000" "$sql" >/dev/null 2>&1 || true
+# How long to wait for a database another hook is writing. A tool call is recorded in the
+# background, so it can wait; a prompt and a session's end are recorded while the agent
+# waits (Claude Code gives a session-end hook about a second and a half in all), so they
+# give up quickly. Missing one of those costs a state that the next event puts right.
+case "$event" in
+    tool) busy_ms=3000 ;;
+    *) busy_ms=400 ;;
+esac
+sqlite3 "$SESSIONS_DB" ".timeout $busy_ms" "$sql" >/dev/null 2>&1 || true
 exit 0

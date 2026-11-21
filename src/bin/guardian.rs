@@ -188,7 +188,7 @@ enum BlockingAction {
 #[derive(Subcommand)]
 enum HooksAction {
     /// Say, for each agent, whether Guardian's hooks are installed and up to date.
-    /// Exits non-zero if an agent that is set up on this machine lacks current hooks.
+    /// Exits non-zero if an agent has Guardian hooks that are not this version's.
     Status {
         /// Print JSON instead of text.
         #[arg(long)]
@@ -868,8 +868,10 @@ fn hooks_status(json: bool) -> Result<(), String> {
     if all.iter().any(|st| st.client == "codex" && st.installed) {
         println!("\nCodex runs new or changed hooks only once you have approved them: /hooks in the CLI, Settings > Hooks in the app.");
     }
-    if all.iter().any(|st| st.present && !st.current) {
-        return Err("Some agents on this machine do not have this Guardian's hooks; see above.".to_string());
+    // An agent with no Guardian hooks at all is reported, not failed on: it may have been
+    // left without on purpose. Hooks that are there and behind are what needs doing.
+    if all.iter().any(|st| st.outdated) {
+        return Err("Some agents have an older Guardian's hooks; bring them up to date with: guardian hooks install --upgrade".to_string());
     }
     Ok(())
 }

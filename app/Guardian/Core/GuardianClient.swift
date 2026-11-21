@@ -462,21 +462,27 @@ final class GuardianClient: ObservableObject {
         }
     }
 
-    /// Install or update Guardian's hooks for every agent set up on this machine
-    /// (`guardian hooks install`). Other hooks in the agents' files are left alone.
-    func installHooks() {
+    /// Bring Guardian's hooks up to date where an agent already has them (`clients` empty:
+    /// `guardian hooks install --upgrade`), or install them for the agents named, which is
+    /// something the person asks for agent by agent. Other hooks in the agents' files are
+    /// left alone.
+    func installHooks(for clients: [String] = []) {
         guard !installingHooks else { return }
         installingHooks = true
         hookMessage = nil
         let executable = guardianDir.appendingPathComponent("guardian")
+        let arguments = ["hooks", "install"] + (clients.isEmpty ? ["--upgrade"] : clients.map { "--" + $0 })
         sessionsQueue.async {
-            let ran = Self.run(executable, ["hooks", "install"]) != nil
+            let ran = Self.run(executable, arguments) != nil
             let data = Self.run(executable, ["hooks", "status", "--json"])
             let status = data.flatMap { try? JSONDecoder().decode([HookClientStatus].self, from: $0) } ?? []
             DispatchQueue.main.async {
                 self.installingHooks = false
                 self.hookStatus = status
-                let behind = status.filter { $0.present && !$0.current }.map(\.label)
+                let asked = Set(clients)
+                let behind = status
+                    .filter { ($0.installed && !$0.current) || (asked.contains($0.client) && !$0.current) }
+                    .map(\.label)
                 if !ran {
                     self.hookMessage = "The hooks could not be installed: the guardian command did not run."
                 } else if behind.isEmpty {

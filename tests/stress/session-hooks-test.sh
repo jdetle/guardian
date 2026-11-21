@@ -99,6 +99,10 @@ hook claude/session-end.sh '{"session_id":"c1","reason":"prompt_input_exit"}'; o
 check "end: records and says nothing" "0|" "$HOOK_RC|$out"
 check "end: the session is over, and how its last turn went is kept" "ended|completed|2|1" "$(q "select state, status, turn_count, ended_at is not null from sessions where conversation_id='c1'")"
 
+# The tool hook runs in the background in Claude Code and Codex and can land last.
+hook claude/post-tool-use.sh '{"session_id":"c1","tool_name":"Bash"}'
+check "a tool call recorded after the session ended does not bring it back" "ended|4" "$(q "select state, tool_call_count from sessions where conversation_id='c1'")"
+
 hook claude/session-start.sh '{"session_id":"c1","source":"resume"}' >/dev/null
 check "resumed: an ended session is idle again, still one row" "idle|1" "$(q "select state, (select count(*) from sessions) from sessions where conversation_id='c1'")"
 
@@ -128,6 +132,13 @@ check "stop: how the turn went and how many loops it took" "0||idle|aborted|3|1"
 hook session-end.sh '{"conversation_id":"u1","reason":"window_close","final_status":"completed","duration_ms":5000}'; out=$HOOK_OUT
 check "end: over, without overwriting how the last turn went" "0||ended|aborted" "$HOOK_RC|$out|$(q "select state, status from sessions where conversation_id='u1'")"
 
+fresh_home
+write_state critical
+jq '.prompt_gate.mode = "strict"' "$HOOKS_DIR/hook_policy.default.json" > "$G/hook_policy.json"
+: > "$G/blocking_on"
+hook before-submit-prompt.sh '{"conversation_id":"ub","prompt":"run the full test suite"}'
+check "Cursor: a prompt Guardian paused does not mark its session working" "false|" "$(printf '%s' "$HOOK_OUT" | jq -r '.continue' 2>/dev/null)|$(q "select state from sessions where conversation_id='ub'")"
+
 # ─── What must not be recorded ──────────────────────────────────────────
 echo "=== What is not recorded ==="
 fresh_home
@@ -152,13 +163,27 @@ check "no state file at all: still recorded, still no sample" "2|0" "$(q "select
 
 hook claude/post-tool-use.sh '{"tool_name":"Bash"}'; out=$HOOK_OUT
 check "an event that names no session records nothing and does not fail" "0||1" "$HOOK_RC|$out|$(q "select count(*) from sessions")"
+garbage_ok=yes
 for bad in 'not json' '' '[]' '{"session_id":{"a":1}}' 'null'; do
-    hook codex/session-end.sh "$bad"; out=$HOOK_OUT
-    if [ "$HOOK_RC" != "0" ] || [ -n "$out" ]; then
-        fail "garbage input [$bad] must exit 0 in silence (rc=$HOOK_RC out=$out)"
-    fi
+    for script in codex/session-end.sh claude/post-tool-use.sh claude/stop.sh session-end.sh; do
+        hook "$script" "$bad"; out=$HOOK_OUT
+        if [ "$HOOK_RC" != "0" ] || [ -n "$out" ]; then
+            garbage_ok=no
+            fail "garbage input [$bad] to $script must exit 0 in silence (rc=$HOOK_RC out=$out)"
+        fi
+    done
 done
-pass "garbage on stdin: exit 0, nothing printed"
+check "garbage on stdin, every recording hook: exit 0, nothing printed" "yes" "$garbage_ok"
+
+# A home where ~/.guardian cannot be made: nothing to record to, and still no failure.
+real_home="$HOME"
+export HOME="$SCRATCH/no-such-place/file"
+: > "$SCRATCH/no-such-place" 2>/dev/null || true
+for script in claude/post-tool-use.sh claude/stop.sh claude/session-end.sh; do
+    hook "$script" '{"session_id":"n1","tool_name":"Bash"}'
+    check "$script with nowhere to write: exit 0, nothing printed" "0|" "$HOOK_RC|$HOOK_OUT"
+done
+export HOME="$real_home"
 
 # ─── Hostile values stay values ─────────────────────────────────────────
 echo "=== Hostile input ==="
@@ -191,8 +216,13 @@ check "earlier sessions that ended or used tools were Cursor's; they keep everyt
 check "an earlier session that only ever started is left unlabelled" "|ended" "$(q "select coalesce(client, ''), state from sessions where conversation_id='old-unknown'")"
 hook claude/session-start.sh '{"session_id":"new","source":"resume"}' >/dev/null
 check "tool calls older than sixty days are cleared out at a session start" "0|2" "$(q "select (select count(*) from tool_calls where recorded_at < datetime('now', '-60 days')), (select count(*) from tool_calls)")"
-hook claude/post-tool-use.sh '{"session_id":"new","tool_name":"Read"}' >/dev/null
-check "upgrading twice changes nothing" "2|3" "$(q "select tool_call_count, (select count(*) from sessions) from sessions where conversation_id='new'")"
+# Run the upgrade again for real (it is skipped while its marker file is there), twice at once,
+# as two hooks finishing together would.
+rm -f "$G"/.sessions_schema_v*
+printf '%s' '{"session_id":"new","tool_name":"Read"}' | bash "$HOOKS_DIR/claude/post-tool-use.sh" >/dev/null 2>&1 &
+printf '%s' '{"session_id":"new","tool_name":"Grep"}' | bash "$HOOKS_DIR/claude/post-tool-use.sh" >/dev/null 2>&1 &
+wait
+check "upgrading again, from two hooks at once, loses nothing and relabels nothing" "3|3|cursor|" "$(q "select tool_call_count, (select count(*) from sessions), (select client from sessions where conversation_id='old-cursor'), (select coalesce(client, '') from sessions where conversation_id='old-unknown') from sessions where conversation_id='new'")"
 
 echo ""
 echo "session-hooks-test: $PASSED passed, $FAILED failed"

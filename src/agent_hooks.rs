@@ -148,7 +148,13 @@ impl Places {
     /// the agents and the installers honour them.
     pub fn from_process() -> Option<Self> {
         let mut places = Self::under(&dirs::home_dir()?);
-        let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        // Taken apart and put together again, so that a trailing slash or a doubled one does
+        // not make the path differ from the one the installer writes into the config.
+        let set = |name: &str| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(|v| PathBuf::from(v).components().collect::<PathBuf>())
+        };
         if let Some(dir) = set("CLAUDE_CONFIG_DIR") {
             places.claude = dir;
         }
@@ -195,6 +201,9 @@ pub struct ClientStatus {
     pub missing_events: Vec<String>,
     /// Installed, complete, and from this version of Guardian.
     pub current: bool,
+    /// Has Guardian's hooks, but not this version's set: the case an update is for. An agent
+    /// with none is not behind; someone may have left it without on purpose.
+    pub outdated: bool,
     pub config: PathBuf,
     /// One sentence saying where it stands and what to do, if anything.
     pub summary: String,
@@ -210,12 +219,15 @@ fn template_events(template: &str) -> Vec<String> {
 
 /// Does this list of an event's entries hold a handler whose command runs a script under
 /// `root`? Entries are handlers themselves (Cursor) or hold them under `hooks` (the others).
+/// The installer writes a path that needs it shell-quoted, so `root` is looked for both
+/// plain and as it reads inside single quotes (as hooks/merge-agent-hooks.jq does).
 fn has_guardian_handler(entries: &serde_json::Value, root: &str) -> bool {
+    let quoted = root.replace('\'', "'\\''");
     let runs_ours = |handler: &serde_json::Value| {
         handler
             .get("command")
             .and_then(|c| c.as_str())
-            .is_some_and(|c| c.contains(root))
+            .is_some_and(|c| c.contains(root) || c.contains(&quoted))
     };
     entries.as_array().is_some_and(|entries| {
         entries.iter().any(|entry| {
@@ -258,7 +270,7 @@ pub fn client_status(client: Client, places: &Places, version: &str) -> ClientSt
     } else if !installed && !present {
         "not set up on this machine".to_string()
     } else if !installed {
-        format!("no Guardian hooks: guardian hooks install --{}", client.key())
+        format!("no Guardian hooks (to add them: guardian hooks install --{})", client.key())
     } else if !missing_events.is_empty() {
         format!(
             "hooks {} installed, without {}: guardian hooks install",
@@ -279,6 +291,7 @@ pub fn client_status(client: Client, places: &Places, version: &str) -> ClientSt
         version: installed_version,
         missing_events,
         current,
+        outdated: installed && !current,
         config,
         summary,
     }
@@ -310,9 +323,17 @@ fn unpack(dir: &Path) -> std::io::Result<()> {
 /// Install (or bring up to date) Guardian's hooks for `client`, by running its installer
 /// from this binary's own copy of the hooks. Returns what the installer printed.
 pub fn install(client: Client, places: &Places, version: &str) -> Result<String, String> {
-    // Unpacked afresh each time, somewhere of Guardian's own: the installers copy from it.
-    let share = places.guardian.join("share");
+    // Unpacked for this run alone, somewhere of Guardian's own, and removed afterwards: the
+    // installers copy from it. A folder per process, so that two installs at once (the menu
+    // bar's and a terminal's) do not pull it out from under each other.
+    let share = places.guardian.join(format!("hooks-unpacked.{}", std::process::id()));
     unpack(&share).map_err(|e| format!("could not unpack the hooks to {}: {e}", share.display()))?;
+    let ran = run_installer(client, places, version, &share);
+    let _ = fs::remove_dir_all(&share);
+    ran
+}
+
+fn run_installer(client: Client, places: &Places, version: &str, share: &Path) -> Result<String, String> {
     let output = Command::new("bash")
         .arg(share.join(client.installer()))
         .env("HOME", &places.home)
@@ -408,6 +429,7 @@ mod tests {
         fs::write(places.config_file(Client::Claude), r#"{"model":"x","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/someone/elses/hook.sh"}]}]}}"#).unwrap();
         let st = claude(&places);
         assert!(st.present && !st.installed, "another tool's hook is not Guardian's");
+        assert!(!st.outdated, "an agent without Guardian hooks is not behind; it may be so on purpose");
         assert!(st.summary.contains("guardian hooks install --claude"), "{}", st.summary);
 
         // The three hooks an older Guardian installed, with no version stamp.
@@ -420,9 +442,26 @@ mod tests {
         }});
         fs::write(places.config_file(Client::Claude), old.to_string()).unwrap();
         let st = claude(&places);
-        assert!(st.installed && !st.current);
+        assert!(st.installed && !st.current && st.outdated);
         assert_eq!(st.missing_events, vec!["PostToolUse", "SessionEnd", "Stop"]);
         assert!(st.summary.contains("without PostToolUse, SessionEnd, Stop"), "{}", st.summary);
+    }
+
+    #[test]
+    fn hooks_under_a_path_that_needs_quoting_are_still_recognised() {
+        if Command::new("jq").arg("--version").output().is_err() {
+            eprintln!("skipped: jq is not installed");
+            return;
+        }
+        // A home folder with a space and an apostrophe: the installer shell-quotes the path
+        // it writes into the config.
+        let s = Scratch::new("quoted");
+        let home = s.0.join("o'brien home");
+        fs::create_dir_all(&home).unwrap();
+        let places = Places::under(&home);
+        install(Client::Claude, &places, "9.9.9").unwrap();
+        let st = client_status(Client::Claude, &places, "9.9.9");
+        assert!(st.current, "{}", st.summary);
     }
 
     #[test]
@@ -467,6 +506,15 @@ mod tests {
         let newer = client_status(Client::Claude, &places, "10.0.0");
         assert!(newer.installed && !newer.current);
         assert!(newer.summary.contains("hooks 9.9.9 installed, this Guardian has 10.0.0"), "{}", newer.summary);
+
+        // Nothing of the unpacked copy is left behind.
+        let left: Vec<String> = fs::read_dir(&places.guardian)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("hooks-unpacked") || n == "share")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
 
         // And the installed hooks record a session, in the scratch home.
         let record = |script: &str, input: &str| {

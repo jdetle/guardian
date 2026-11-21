@@ -292,7 +292,10 @@ struct MenuBarView: View {
     /// right when an agent's are missing or from an older Guardian.
     private var sessionsSection: some View {
         let live = AgentSessions.live(client.sessions)
-        let behind = client.hookStatus.filter { $0.present && !$0.current }
+        // Hooks from an older Guardian are something to update. An agent with none may have
+        // been left without on purpose: that is said quietly, and adding them is asked for.
+        let behind = client.hookStatus.filter { $0.installed && !$0.current }
+        let without = client.hookStatus.filter { $0.present && !$0.installed }
         return VStack(alignment: .leading, spacing: 4) {
             Text("Agent sessions")
                 .font(.caption.weight(.semibold))
@@ -315,7 +318,7 @@ struct MenuBarView: View {
             }
             if !behind.isEmpty {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("Hooks missing or out of date for \(behind.map(\.label).joined(separator: ", ")), so their sessions are not followed fully.")
+                    Text("Hooks from an older Guardian in \(behind.map(\.label).joined(separator: ", ")), so their sessions are not followed fully.")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
@@ -328,7 +331,22 @@ struct MenuBarView: View {
                             client.installHooks()
                         }
                         .controlSize(.small)
-                        .help("Installs this Guardian's hooks for every agent set up on this machine. Other hooks in their settings are left alone.")
+                        .help("Brings Guardian's hooks up to date in the agents that already have them. Other hooks in their settings are left alone.")
+                    }
+                }
+            }
+            if !without.isEmpty {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Not followed: \(without.map(\.label).joined(separator: ", ")) (no Guardian hooks).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if !client.installingHooks {
+                        Button("Add hooks…") {
+                            confirmAddHooks(without)
+                        }
+                        .controlSize(.small)
                     }
                 }
             }
@@ -338,6 +356,21 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    /// Adding Guardian to an agent that has none is asked for by name. Cancel is the default.
+    private func confirmAddHooks(_ agents: [HookClientStatus]) {
+        let names = agents.map(\.label).joined(separator: ", ")
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Add Guardian's hooks to \(names)?"
+        alert.informativeText = "This adds entries to the hook settings of \(names): a line of load context when a session starts, warnings about load on prompts and before heavy tool calls, and records of what each session does, so that it can be followed here. Hooks already in those settings are left alone, and the file as it was is kept beside it.\n\nGuardian only warns unless you have allowed pausing. Codex runs new hooks only once you approve them: /hooks, or Settings > Hooks."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Add hooks")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            client.installHooks(for: agents.map(\.client))
         }
     }
 
