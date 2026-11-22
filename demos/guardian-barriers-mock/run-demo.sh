@@ -9,6 +9,9 @@ export GUARDIAN_DIR="$HOME/.guardian"
 mkdir -p "$GUARDIAN_DIR"
 
 cp "$HOOKS/hook_policy.default.json" "$GUARDIAN_DIR/hook_policy.json"
+# Guardian only warns until told it may stop things (`guardian blocking on`); this demo
+# shows what that looks like.
+: > "$GUARDIAN_DIR/blocking_on"
 
 write_state() {
     local pressure="$1"

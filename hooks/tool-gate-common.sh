@@ -6,6 +6,8 @@
 # Optional enforcement: hook_policy.json `tool_gate.deny_subagents_on` ("never" | "strained" |
 # "critical") denies NEW subagent spawns at that pressure — subagent fan-out is the main way a
 # single agent turn multiplies memory use. A snooze (`guardian snooze 15`) lifts the deny.
+# It also takes the opt-in every block takes (`guardian blocking on`): without that, a spawn
+# that would have been denied is allowed with a warning asking the agent to work serially.
 #
 # Fail-open: missing / stale / corrupt state reads as "clear" (see read_state_pressure).
 # Sets:
@@ -30,7 +32,7 @@ guardian_tool_gate_eval() {
         return 0
     fi
 
-    local cpu mem swap tool why
+    local cpu mem swap tool why would_deny=""
     cpu=$(read_state_field "cpu_percent" "?")
     mem=$(read_state_field "memory_available_gb" "?")
     swap=$(read_state_field "swap_used_percent" "?")
@@ -45,9 +47,12 @@ guardian_tool_gate_eval() {
         fi
         case "${deny_on}:${TG_PRESSURE}" in
             critical:critical|strained:critical|strained:strained)
-                TG_OUTCOME="deny"
-                TG_MESSAGE="Guardian: Subagent blocked — ${TG_PRESSURE} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%).${why} Do this work yourself, serially, in the current session; do not retry the spawn. The user can lift this with: ${GUARDIAN_DIR}/guardian snooze 15"
-                return 0
+                if guardian_blocking_enabled; then
+                    TG_OUTCOME="deny"
+                    TG_MESSAGE="Guardian: Subagent blocked — ${TG_PRESSURE} load (CPU ${cpu}%, ${mem} GB RAM free, swap ${swap}%).${why} Do this work yourself, serially, in the current session; do not retry the spawn. The user can lift this with: ${GUARDIAN_DIR}/guardian snooze 15"
+                    return 0
+                fi
+                would_deny=1
                 ;;
         esac
     fi
@@ -61,6 +66,9 @@ guardian_tool_gate_eval() {
             TG_MESSAGE="Guardian: High load — CPU ${cpu}%, ${mem} GB RAM, swap ${swap}%. Serial work; skip heavy containers.${why}"
             ;;
     esac
+    if [ -n "$would_deny" ]; then
+        TG_MESSAGE="$TG_MESSAGE Starting a subagent now adds to it: do this work yourself, serially, in the current session if you can. (Guardian is only warning; it has not been set to stop subagents.)"
+    fi
     return 0
 }
 

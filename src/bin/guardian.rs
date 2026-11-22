@@ -61,6 +61,20 @@ enum Commands {
         #[command(subcommand)]
         action: Option<DiskAction>,
     },
+    /// Whether Guardian may stop things, or only warn. It only warns until you opt in:
+    /// `blocking on` lets the hooks pause prompts and deny subagents when your config says
+    /// to; `blocking off` goes back to warnings; `blocking status` says which it is.
+    Blocking {
+        #[command(subcommand)]
+        action: BlockingAction,
+    },
+    /// Guardian's hooks for Cursor, Claude Code and Codex: see whether each agent has
+    /// them and whether they are this version's, and install or update them. The hooks are
+    /// carried in this binary; no copy of the repository is needed.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
     /// Show how much time was spent at each pressure level, per day.
     Stats {
         /// How many of the most recent days to show.
@@ -158,6 +172,45 @@ enum DiskAction {
         /// Print JSON results.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlockingAction {
+    /// Let Guardian pause prompts and deny subagents, as config.toml says when.
+    /// Asks first; without a terminal to ask in, it needs --yes.
+    On {
+        /// Do not ask.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Warnings only (the default): nothing is paused or denied.
+    Off,
+    /// Say whether blocking is on, and what would be stopped if it is.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Say, for each agent, whether Guardian's hooks are installed and up to date.
+    /// Exits non-zero if an agent has Guardian hooks that are not this version's.
+    Status {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install or update the hooks. With no agent named: for every agent set up on this
+    /// machine. Other hooks and settings in the agents' files are left alone.
+    Install {
+        #[arg(long)]
+        cursor: bool,
+        #[arg(long)]
+        claude: bool,
+        #[arg(long)]
+        codex: bool,
+        /// Only agents that already have Guardian hooks: bring those up to date, add none.
+        #[arg(long, conflicts_with_all = ["cursor", "claude", "codex"])]
+        upgrade: bool,
     },
 }
 
@@ -744,6 +797,169 @@ fn disk_delete(paths: &[PathBuf], yes: bool, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The file whose presence is the opt-in. The hooks test for it directly
+/// (guardian_blocking_enabled in hooks/lib.sh), so it takes effect on the next hook call.
+fn blocking_marker() -> PathBuf {
+    guardian_dir().join("blocking_on")
+}
+
+/// When the gates would stop something, in words, from the settings in force.
+fn blocking_rules() -> String {
+    let cfg = load_config();
+    let gate = &cfg.prompt_gate;
+    let rule = |mode: &str| match mode {
+        "strict" if gate.block_on_session_budget => format!(
+            "prompts are paused at {} load, and when Cursor's memory is over its cap while load is strained or worse",
+            gate.block_on
+        ),
+        "strict" => format!("prompts are paused at {} load", gate.block_on),
+        "advisory" => "prompts are never paused (the mode is advisory)".to_string(),
+        _ => "a prompt is paused when it asks for heavy local work (a full build, a full test run, container builds, several subagents) at critical load and macOS agrees memory or heat is critical".to_string(),
+    };
+    let prompts = if !gate.enabled || gate.block_on == "never" {
+        "prompts are never paused (the prompt gate is off in config.toml)".to_string()
+    } else {
+        let mut text = rule(&gate.mode);
+        // [prompt_gate.clients] can give one agent a mode of its own.
+        for (client, mode) in &gate.clients {
+            if mode != &gate.mode {
+                text.push_str(&format!("; in {client}, {}", rule(mode)));
+            }
+        }
+        text
+    };
+    let subagents = match cfg.tool_gate.deny_subagents_on.as_str() {
+        "strained" | "critical" => format!("new subagents are denied at {} load", cfg.tool_gate.deny_subagents_on),
+        _ => "subagents are never denied (tool_gate.deny_subagents_on is never)".to_string(),
+    };
+    format!("{prompts}; {subagents}")
+}
+
+fn blocking(action: BlockingAction) -> Result<(), String> {
+    let marker = blocking_marker();
+    // A symlink is not an opt-in (the hooks ignore one too) and is not written through.
+    let on = || std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file());
+    match action {
+        BlockingAction::On { yes } => {
+            // Turning this on is a person's choice. An agent that reads a Guardian warning
+            // and runs this without a terminal is refused; a person is shown what it means.
+            if !yes && !on() {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    return Err("turning blocking on is for a person to decide: run this in a terminal, or pass --yes".to_string());
+                }
+                println!("With your settings: {}.", blocking_rules());
+                if !said_yes(&ask("Let Guardian pause prompts and deny subagents? [y/N] ")?) {
+                    println!("Left off. Guardian only warns.");
+                    return Ok(());
+                }
+            }
+            std::fs::create_dir_all(guardian_dir()).map_err(|e| e.to_string())?;
+            if std::fs::symlink_metadata(&marker).is_ok_and(|m| !m.is_file()) {
+                std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+            }
+            let stamp = format!("{}\n", Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+            std::fs::write(&marker, stamp).map_err(|e| e.to_string())?;
+            println!("Blocking is on. With your settings: {}.", blocking_rules());
+            println!("Back to warnings only: guardian blocking off");
+        }
+        BlockingAction::Off => {
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            println!("Blocking is off. Guardian only warns: no prompt is paused and no subagent is denied.");
+        }
+        BlockingAction::Status => {
+            if on() {
+                println!("Blocking is on. With your settings: {}.", blocking_rules());
+                println!("Back to warnings only: guardian blocking off");
+            } else {
+                println!("Blocking is off. Guardian only warns: no prompt is paused and no subagent is denied.");
+                println!("If you turn it on (guardian blocking on): {}.", blocking_rules());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hooks_status(json: bool) -> Result<(), String> {
+    use guardian_daemon::agent_hooks;
+    let places = agent_hooks::Places::from_process().ok_or("could not find the home directory")?;
+    let all = agent_hooks::status(&places, env!("CARGO_PKG_VERSION"));
+    if json {
+        println!("{}", serde_json::to_string(&all).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    for st in &all {
+        println!("{:<12} {}", st.label, st.summary);
+    }
+    if all.iter().any(|st| st.client == "codex" && st.installed) {
+        println!("\nCodex runs new or changed hooks only once you have approved them: /hooks in the CLI, Settings > Hooks in the app.");
+    }
+    // An agent with no Guardian hooks at all is reported, not failed on: it may have been
+    // left without on purpose. Hooks that are there and behind are what needs doing.
+    if all.iter().any(|st| st.outdated) {
+        return Err("Some agents have an older Guardian's hooks; bring them up to date with: guardian hooks install --upgrade".to_string());
+    }
+    Ok(())
+}
+
+fn hooks_install(cursor: bool, claude: bool, codex: bool, upgrade: bool) -> Result<(), String> {
+    use guardian_daemon::agent_hooks::{self, Client};
+    let places = agent_hooks::Places::from_process().ok_or("could not find the home directory")?;
+    let version = env!("CARGO_PKG_VERSION");
+    let named: Vec<Client> = [(cursor, Client::Cursor), (claude, Client::Claude), (codex, Client::Codex)]
+        .into_iter()
+        .filter(|(wanted, _)| *wanted)
+        .map(|(_, client)| client)
+        .collect();
+    let chosen: Vec<Client> = if !named.is_empty() {
+        named
+    } else {
+        Client::ALL
+            .into_iter()
+            .filter(|c| {
+                let st = agent_hooks::client_status(*c, &places, version);
+                if upgrade { st.installed && !st.current } else { st.present }
+            })
+            .collect()
+    };
+    if chosen.is_empty() {
+        println!(
+            "{}",
+            if upgrade {
+                "Every agent with Guardian hooks already has this version's."
+            } else {
+                "No agent is set up on this machine. Name one to install for it anyway: --cursor, --claude or --codex."
+            }
+        );
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for client in &chosen {
+        match agent_hooks::install(*client, &places, version) {
+            Ok(_) => {
+                let st = agent_hooks::client_status(*client, &places, version);
+                println!("{:<12} {}", st.label, st.summary);
+            }
+            Err(why) => {
+                failed += 1;
+                println!("{:<12} not installed:\n{why}", client.label());
+            }
+        }
+    }
+    println!("\nSessions that are already running keep the hooks they started with; new ones pick these up.");
+    if chosen.contains(&Client::Codex) {
+        println!("Codex skips new or changed hooks until you approve them: /hooks in the CLI, Settings > Hooks in the app.");
+    }
+    if failed > 0 {
+        return Err(format!("{failed} agent(s) could not be set up; see above."));
+    }
+    Ok(())
+}
+
 fn check_config() -> Result<(), String> {
     let path = config_path();
     let report = load_config_report();
@@ -815,6 +1031,11 @@ fn run(cli: Cli) -> Result<(), String> {
             Some(DiskAction::Save { paths, delete, plan, no_verify, plan_id, yes, json }) => {
                 disk_save(&paths, delete, plan, no_verify, plan_id, yes, json)
             }
+        },
+        Commands::Blocking { action } => blocking(action),
+        Commands::Hooks { action } => match action {
+            HooksAction::Status { json } => hooks_status(json),
+            HooksAction::Install { cursor, claude, codex, upgrade } => hooks_install(cursor, claude, codex, upgrade),
         },
         Commands::Stats { days } => {
             print!("{}", PressureStats::load().render(days as usize));
@@ -940,6 +1161,19 @@ mod tests {
         assert!(parses(&["guardian", "disk", "--fresh"]));
         assert!(!parses(&["guardian", "disk", "--cached", "--fresh"]));
         assert!(parses(&["guardian", "disk", "refresh", "--seconds", "120"]));
+        assert!(parses(&["guardian", "blocking", "on"]));
+        assert!(parses(&["guardian", "blocking", "on", "--yes"]));
+        assert!(!parses(&["guardian", "blocking", "off", "--yes"]));
+        assert!(parses(&["guardian", "blocking", "off"]));
+        assert!(parses(&["guardian", "blocking", "status"]));
+        assert!(!parses(&["guardian", "blocking"]));
+        assert!(parses(&["guardian", "hooks", "status"]));
+        assert!(parses(&["guardian", "hooks", "status", "--json"]));
+        assert!(parses(&["guardian", "hooks", "install"]));
+        assert!(parses(&["guardian", "hooks", "install", "--claude", "--codex"]));
+        assert!(parses(&["guardian", "hooks", "install", "--upgrade"]));
+        assert!(!parses(&["guardian", "hooks", "install", "--upgrade", "--cursor"]));
+        assert!(!parses(&["guardian", "hooks"]));
         assert!(parses(&["guardian", "disk", "save", "/tmp/wt"]));
         assert!(parses(&["guardian", "disk", "save", "/tmp/a", "/tmp/b", "--delete", "--yes", "--json"]));
         assert!(parses(&["guardian", "disk", "save", "--plan", "--json", "/tmp/wt"]));

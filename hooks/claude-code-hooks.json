@@ -34,6 +34,41 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/claude/post-tool-use.sh",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/claude/stop.sh",
+            "timeout": 15,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__GUARDIAN_CLAUDE_HOOK_ROOT__/claude/session-end.sh",
+            "timeout": 3
+          }
+        ]
+      }
     ]
   }
 }

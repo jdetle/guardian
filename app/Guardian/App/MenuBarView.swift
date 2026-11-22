@@ -42,6 +42,9 @@ struct MenuBarView: View {
             }
 
             Divider()
+            sessionsSection
+
+            Divider()
             diskSection
 
             if !client.queueEntries.isEmpty {
@@ -124,7 +127,23 @@ struct MenuBarView: View {
 
     private var promptControls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let expiry = client.snoozeUntil {
+            if !client.blockingOn {
+                // Guardian starts out only warning. Snooze and allow-once lift pauses, so
+                // there is nothing for them to do until pausing has been allowed.
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Warnings only")
+                            .font(.caption)
+                        Text("Guardian tells agents about load. It does not pause prompts or stop subagents.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Allow pausing…") { confirmBlocking() }
+                        .help("Lets Guardian pause prompts and deny subagents when your settings say to. You can turn it off again here.")
+                }
+            } else if let expiry = client.snoozeUntil {
                 HStack {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Snoozed until \(expiry.formatted(date: .omitted, time: .shortened))")
@@ -144,9 +163,11 @@ struct MenuBarView: View {
                         Button("30 minutes") { client.runPromptControl(["snooze", "30"]) }
                         Button("60 minutes") { client.runPromptControl(["snooze", "60"]) }
                         Button("2 hours (the most allowed)") { client.runPromptControl(["snooze", "120"]) }
+                        Divider()
+                        Button("Go back to warnings only") { client.runPromptControl(["blocking", "off"]) }
                     } label: {
                         Image(systemName: "ellipsis.circle")
-                            .accessibilityLabel("More snooze durations")
+                            .accessibilityLabel("More snooze durations, and turning pausing off")
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
@@ -248,6 +269,125 @@ struct MenuBarView: View {
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
         }
+    }
+
+    /// Pausing is an opt-in: say what it means before turning it on. Cancel is the default.
+    private func confirmBlocking() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Let Guardian pause prompts?"
+        alert.informativeText = "Until now Guardian has only warned. With this on, its hooks in Cursor, Claude Code and Codex may pause a prompt, or deny a new subagent, when your settings in ~/.guardian/config.toml say to. With the defaults that is a prompt asking for heavy local work (a full build, a full test run) while the machine is under critical pressure; subagents are never denied unless you set that too.\n\nA paused prompt can be let through with Allow once or Snooze. You can go back to warnings only from the menu next to Snooze, or with: guardian blocking off"
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Allow pausing")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            client.runPromptControl(["blocking", "on", "--yes"])
+        }
+    }
+
+    // MARK: - Agent sessions
+
+    /// Which agents have sessions open and what they are doing, from the sessions.db that
+    /// the hooks for Cursor, Claude Code and Codex write to; and a way to put those hooks
+    /// right when an agent's are missing or from an older Guardian.
+    private var sessionsSection: some View {
+        let live = AgentSessions.live(client.sessions)
+        // Hooks from an older Guardian are something to update. An agent with none may have
+        // been left without on purpose: that is said quietly, and adding them is asked for.
+        let behind = client.hookStatus.filter { $0.installed && !$0.current }
+        let without = client.hookStatus.filter { $0.present && !$0.installed }
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Agent sessions")
+                .font(.caption.weight(.semibold))
+            if live.isEmpty {
+                Text("None open in the last 12 hours.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(live) { agent in
+                HStack(alignment: .firstTextBaseline) {
+                    Text(agent.label)
+                        .font(.caption)
+                        .frame(width: 84, alignment: .leading)
+                    Text(sessionsText(agent))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            if !behind.isEmpty {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Hooks from an older Guardian in \(behind.map(\.label).joined(separator: ", ")), so their sessions are not followed fully.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if client.installingHooks {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button("Update hooks") {
+                            client.installHooks()
+                        }
+                        .controlSize(.small)
+                        .help("Brings Guardian's hooks up to date in the agents that already have them. Other hooks in their settings are left alone.")
+                    }
+                }
+            }
+            if !without.isEmpty {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Not followed: \(without.map(\.label).joined(separator: ", ")) (no Guardian hooks).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    if !client.installingHooks {
+                        Button("Add hooks…") {
+                            confirmAddHooks(without)
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+            if let message = client.hookMessage {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Adding Guardian to an agent that has none is asked for by name. Cancel is the default.
+    private func confirmAddHooks(_ agents: [HookClientStatus]) {
+        let names = agents.map(\.label).joined(separator: ", ")
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Add Guardian's hooks to \(names)?"
+        alert.informativeText = "This adds entries to the hook settings of \(names): a line of load context when a session starts, warnings about load on prompts and before heavy tool calls, and records of what each session does, so that it can be followed here. Hooks already in those settings are left alone, and the file as it was is kept beside it. For Cursor it also adds the /guardian slash commands to ~/.cursor/commands, and the Guardian .command files and a default hook_policy.json (if there is none) to ~/.guardian.\n\nGuardian only warns unless you have allowed pausing. Codex runs new hooks only once you approve them: /hooks, or Settings > Hooks."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Add hooks")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            client.installHooks(for: agents.map(\.client))
+        }
+    }
+
+    /// "1 working in guardian · 2 idle"
+    private func sessionsText(_ agent: AgentSessions) -> String {
+        var parts: [String] = []
+        if agent.working > 0 {
+            var text = "\(agent.working) working"
+            if !agent.workingOn.isEmpty {
+                text += " in \(agent.workingOn.prefix(2).joined(separator: ", "))"
+            }
+            parts.append(text)
+        }
+        if agent.idle > 0 {
+            parts.append("\(agent.idle) idle")
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: - Disk

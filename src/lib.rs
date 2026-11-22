@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod agent_hooks;
 mod background_scan;
 mod classifier;
 pub mod config;

@@ -17,7 +17,10 @@ extensions alike.
 bash scripts/install-claude-hooks.sh
 ```
 
-This copies scripts to **`~/.claude/hooks/guardian/`** and merges three entries into
+(or, without a checkout: `~/.guardian/guardian hooks install --claude`; the hooks are carried in
+the binary, and `guardian hooks status` says whether the installed ones are this version's.)
+
+This copies scripts to **`~/.claude/hooks/guardian/`** and merges six entries into
 **`~/.claude/settings.json`** (backup: `settings.json.guardian.bak`). Re-running is safe: existing
 Guardian entries are replaced, never duplicated, and other hooks and settings are left alone.
 `CLAUDE_CONFIG_DIR` is honored.
@@ -31,9 +34,27 @@ Sessions snapshot their hooks at startup — **start a new session** (or open `/
 | `SessionStart` | `claude/session-start.sh` | Adds one line of context: pressure, free RAM, per-agent RAM (Claude / Codex / Cursor), disk. Says so loudly when the daemon is not running. |
 | `UserPromptSubmit` | `claude/user-prompt-submit.sh` | Applies the shared [prompt policy](../README.md#prompt-gates-and-resume). Adaptive mode pauses explicit heavy local work during severe system pressure. |
 | `PreToolUse` (`Bash\|Agent\|Task`) | `claude/pre-tool-use.sh` | Silent when load is clear. At `strained` / `critical` adds an advisory as `additionalContext`, at most once per 2 minutes per session. Optionally **denies subagent spawns** (see below). |
+| `PostToolUse` (every tool, `async`) | `claude/post-tool-use.sh` | Records the tool call and the load it ran under in `~/.guardian/sessions.db`. Prints nothing. |
+| `Stop` (`async`) | `claude/stop.sh` | The turn is over: the session goes from *working* to *idle* and is scored. Prints nothing, so it can never keep Claude going. Claude Code does not run it for a turn you interrupt; that session reads as working until it has been quiet for half an hour. |
+| `SessionEnd` | `claude/session-end.sh` | Marks the session *ended*. Prints nothing; quick, because Claude Code gives session-end hooks about a second and a half. |
+
+The last three exist so the menu bar app can **follow Claude Code sessions** next to Cursor's and
+Codex's (see [Following agent sessions](../README.md#following-agent-sessions)). They only record:
+no output and exit 0, which Claude Code reads as "nothing to report". `async` hooks do not hold
+the agent up; on a Claude Code too old to know the key they simply run in the foreground.
+(Codex gets the same recorders without `async`; see [codex.md](codex.md).)
+`UserPromptSubmit` also marks the session *working*, once the prompt is known to be going through.
 
 The `PreToolUse` hook **never returns `permissionDecision: "allow"`** — that would skip Claude Code's
 own permission prompt. It either says nothing, adds context, or (opt-in) denies a subagent.
+
+## Warnings only until you opt in
+
+Out of the box none of these hooks stops anything. A prompt that the gate would have paused is
+sent with a warning added as context; a subagent that would have been denied is allowed with one.
+To let Guardian pause prompts and deny subagents, run `~/.guardian/guardian blocking on` (or
+**Allow pausing…** in the menu bar); `guardian blocking off` goes back. See
+[Prompt gates and resume](../README.md#prompt-gates-and-resume).
 
 ## Stopping subagent fan-out under pressure (opt-in)
 
@@ -46,13 +67,14 @@ a separate process — after pressure has already gone critical. To stop that, s
 deny_subagents_on = "critical"   # "never" (default) | "strained" | "critical"
 ```
 
-The `Agent` / `Task` tool call is then denied with a reason telling the agent to do the work
-serially in the current session. `Bash` is never denied. A snooze lifts the deny. The same setting
+With `guardian blocking on` as well, the `Agent` / `Task` tool call is then denied with a reason
+telling the agent to do the work serially in the current session; without it, the call is allowed
+and the agent is asked to work serially. `Bash` is never denied. A snooze lifts the deny. The same setting
 applies to Cursor (`Task`) and Codex (`spawn_agent`).
 
 ## When a prompt is blocked
 
-Claude Code shows the block reason and your original prompt. From any terminal:
+(Only with `guardian blocking on`.) Claude Code shows the block reason and your original prompt. From any terminal:
 
 ```bash
 ~/.guardian/guardian snooze 15   # gates off for 15 minutes
@@ -71,7 +93,9 @@ Then send again. macOS double-click helpers (`~/.guardian/Guardian-*.command`) w
 | Block shape | `continue: false`, `user_message` | `decision: "block"`, `reason` |
 | Tool advisory | `agent_message` on every call | `additionalContext`, rate limited per session: when load first appears, when it gets worse, otherwise at most every 10 minutes (`GUARDIAN_ADVISE_INTERVAL_SECS`, default 600) |
 | Session id | `conversation_id` | `session_id` (stored in the same `sessions.db` column) |
-| Not ported | — | `beforeReadFile` (`.cursorignore` advisory), `postToolUse` / `stop` ROI tracking |
+| Session tracking | `postToolUse`, `stop`, `sessionEnd` | `PostToolUse`, `Stop`, `SessionEnd` (same `sessions.db`, `client = claude`) |
+| Model name | on every event | only sometimes, at `SessionStart`; otherwise shown as `unknown` |
+| Not ported | — | `beforeReadFile` (`.cursorignore` advisory) |
 
 ## Verify
 
@@ -85,7 +109,7 @@ Hook behavior under simulated pressure is covered by the containerized suite
 
 ## Uninstall
 
-Remove the three entries whose command contains `/hooks/guardian/` from `~/.claude/settings.json`
+Remove the entries whose command contains `/hooks/guardian/` from `~/.claude/settings.json`
 (or restore `settings.json.guardian.bak`), then `rm -rf ~/.claude/hooks/guardian/`.
 
 ## Caveats

@@ -18,6 +18,10 @@ if [ "$PG_OUTCOME" = "block" ]; then
     json_output "$(jq -n --arg msg "$PG_MESSAGE" '{continue: false, user_message: $msg}')"
 fi
 
+# The prompt is going to the agent: its session is working until the stop hook says the
+# turn is over.
+guardian_record_prompt "$input"
+
 if [ "$PG_OUTCOME" = "pass_msg" ]; then
     json_output "$(jq -n --arg msg "$PG_MESSAGE" '{continue: true, user_message: $msg}')"
 fi
