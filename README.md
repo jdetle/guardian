@@ -4,7 +4,7 @@
 
 **Keep agents useful—and keep your Mac from melting down.**
 
-Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and per-agent memory (Cursor, Claude, Codex), writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** (optional) can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
+Guardian is a macOS stack that closes the loop between *what your machine is doing* and *what your agent tools are allowed to assume*. It samples CPU, memory, swap, disk, and per-agent memory (Cursor, Claude, Codex), writes shared state under `~/.guardian/`, and wires that into each editor through hooks. Agents get live pressure context in every session; the daemon enforces limits when things get hot. **Prompt-level gates** warn by default and, once you opt in (`guardian blocking on`), can pause sends when CPU/memory pressure or Cursor’s own memory use is too high, with **human-in-the-loop** resume paths.
 
 ---
 
@@ -25,7 +25,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | **Docker and dev services eating the box** | Optional **Docker CPU throttling** for non-essential containers under strain. |
 | **Runaway process trees** (builds, test runners) | **Fork guard** with optional kill for pathological spawns. |
 | **Indexing and huge contexts on a full disk** | **Disk** sampling on the home volume + **cursorignore**-style warnings for paths that blow up context and disk. |
-| **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** can block (with **resume** / snooze) so you don’t add load at the worst moment. |
+| **Sending prompts into a machine that’s already swapping hard** | **`beforeSubmitPrompt`** warns, and once you opt in (`guardian blocking on`) can block (with **resume** / snooze), so you don’t add load at the worst moment. |
 
 **Core idea:** *Observable pressure + honest agent guidance + daemon-side enforcement + optional gates with resume—so Cursor, Codex, and Claude Code stay usable on hardware that isn’t a dev workstation.*
 
@@ -36,10 +36,10 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 | Piece | Location | Role |
 |---|---|---|
 | `guardiand` | `src/` | Rust daemon — samples CPU, memory, swap, thermal, Docker, per-agent RSS for Cursor / Claude / Codex (~`ps`), home-volume disk (`statvfs`), writes `state.json` + `hook_policy.json` |
-| `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage) |
-| Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, … (`~/.cursor/hooks.json`) |
-| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI + app — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (`~/.codex/hooks.json`; hooks must be **trusted** in Codex once). See [docs/codex.md](docs/codex.md). |
-| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
+| `guardian` | `src/bin/guardian.rs` | User CLI (installed to `~/.guardian/guardian`) — **snooze** / **once** / **zeno** (relax effective limits toward full usage), **`disk`**, and **`hooks`** (install the agent hooks it carries, and say where each agent stands) |
+| Cursor | `hooks/`, `hooks/install-hooks.sh` | Shell + stdlib Python — `sessionStart`, `beforeSubmitPrompt`, `beforeReadFile`, `preToolUse`, `subagentStart`, `postToolUse`, `stop`, `sessionEnd` (`~/.cursor/hooks.json`) |
+| Codex | `hooks/codex/`, `scripts/install-codex-hooks.sh` | OpenAI Codex CLI + app — `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and session tracking: `PostToolUse`, `Stop`, `SessionEnd` (`~/.codex/hooks.json`; hooks must be **trusted** in Codex once). See [docs/codex.md](docs/codex.md). |
+| Claude Code | `hooks/claude/`, `scripts/install-claude-hooks.sh` | CLI, desktop app, IDE extensions — `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and session tracking: `PostToolUse`, `Stop`, `SessionEnd` (merged into `~/.claude/settings.json` → `hooks`). See [docs/claude-code.md](docs/claude-code.md). |
 | Policy | `~/.guardian/config.toml` | Thresholds, `[prompt_gate]`, `[tool_gate]`, `[session_budget]`, `[disk]`, `[queue]`, `[cursorignore_policy]` |
 | Agent work queue | `scripts/guardian-queue.sh`, `~/.guardian/agent_queue.jsonl` | CLI to add/list/pop deferred prompts; optional enqueue-on-block + clear-pressure notifier |
 | Guardian.app | `app/`, `scripts/install-app.sh` | SwiftUI **menu bar app** (optional, no Dock icon) — level and why, snooze / allow once, memory, swap, disk, per-agent RAM, today's time at each level, config problems, and **Find space to free**. See [Menu bar app](#menu-bar-app). |
@@ -52,7 +52,7 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 
 1. **`guardiand`** classifies pressure as `clear`, `strained`, or `critical` (optional **memory headroom ratios** in config).
 2. State is written atomically to `~/.guardian/state.json` (including **`disk`** usage on the home volume); **`hook_policy.json`** mirrors gate settings for shell hooks.
-3. **`beforeSubmitPrompt`** may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure and/or **Cursor RSS** above cap). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
+3. **`beforeSubmitPrompt`** warns by default; after `guardian blocking on` it may return `continue: false` when **`~/.guardian/hook_policy.json`** and live state say so (pressure and/or **Cursor RSS** above cap). Users can **`touch ~/.guardian/proceed_once`** or **snooze** (see below)—never a dead end.
 4. **`beforeReadFile`** always **`allow`**s; it may add **advisory** text when a path matches the shipped **cursorignore checklist** and isn’t covered by `.cursorignore` or **`.guardian/cursorignore-allow`**.
 5. **`preToolUse` / `subagentStart`** remain **allow** + advisory (by default). Opt in to **`[tool_gate] deny_subagents_on = "critical"`** to deny *new subagent spawns* under pressure — the one thing a prompt gate cannot stop mid-turn.
 6. Under load, the **daemon** enforces Docker throttling, fork guard, etc.
@@ -72,12 +72,19 @@ Guardian targets that gap: **it makes “how hard are we pushing this laptop?”
 
 ```bash
 bash scripts/install.sh              # daemon + CLI (required)
-bash hooks/install-hooks.sh          # Cursor
-bash scripts/install-claude-hooks.sh # Claude Code
-bash scripts/install-codex-hooks.sh  # OpenAI Codex
+~/.guardian/guardian hooks install   # hooks for every agent set up on this machine
+~/.guardian/guardian hooks status    # where each agent stands
 ```
 
-Run the hook installers for the agents you use; all three read the same **`~/.guardian/`** state and policy. Each one merges into the agent's existing config: re-running is safe, hooks you added yourself are kept (including on the same events), and a config it cannot parse is left untouched.
+**The hooks ship inside the `guardian` binary**, so installing or updating them needs no copy of this repository. `guardian hooks install` sets up Cursor, Claude Code and Codex, whichever are on the machine (`--cursor`, `--claude`, `--codex` to name them; `--upgrade` to only bring existing installs up to date, which `install.sh` does for you). `guardian hooks status` says, per agent, whether Guardian's hooks are installed, whether any event is missing, and whether they are this version's; it exits non-zero when an agent has an older Guardian's hooks (an agent with none is listed, not failed on: you may have left it out on purpose). The menu bar app shows the same, with **Update hooks** for the first case and **Add hooks…**, which asks first, for the second. (The app is not started from your shell, so it looks in `~/.claude` and `~/.codex`; if you set `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, use the command.) Cursor's installer also puts the `/guardian-*` slash commands in `~/.cursor/commands`, and the `Guardian-*.command` clickables, the queue script and a default `hook_policy.json` (if there is none) in `~/.guardian`.
+
+All three read the same **`~/.guardian/`** state and policy. Installing merges into the agent's existing config: re-running is safe, hooks you added yourself are kept (including on the same events), and a config it cannot parse is left untouched. The per-agent scripts (`hooks/install-hooks.sh`, `scripts/install-claude-hooks.sh`, `scripts/install-codex-hooks.sh`) do the same from a checkout.
+
+### Following agent sessions
+
+Every agent's hooks record its sessions in **`~/.guardian/sessions.db`**: which agent, which folder, whether it is **working** (a prompt is being worked on), **idle** (waiting for the next one) or **ended**, when it last did anything, and its prompts, turns, tool calls and subagents. The menu bar panel has one line per agent with open sessions ("Claude Code: 1 working in guardian · 2 idle"); the dashboard's **Sessions** tab lists them with a filter per agent. A turn that has been quiet for half an hour is shown as idle whatever was recorded, since an agent that is closed mid-turn never reports that it stopped.
+
+The recording hooks (`PostToolUse`, `Stop`, `SessionEnd`; Cursor's `postToolUse`, `stop`, `sessionEnd`) only record: they print nothing and never block, and in Claude Code the first two run in the background. Recording a prompt, a tool call or a session's end costs one `jq` and one `sqlite3`; the end of a turn also scores the session and costs about a tenth of a second. What is shown is what the hooks last heard: a turn you interrupt never reports that it stopped, so its session reads as working until it has been quiet for half an hour. Tool calls and pressure samples older than sixty days are cleared when a session starts.
 
 `install.sh` copies **`guardiand`** to **`~/.guardian/guardiand`** and points the LaunchAgent there, so `cargo clean` or a disk-space sweep of `target/` no longer kills the daemon. It exits non-zero unless the new daemon is actually writing fresh `state.json`.
 
@@ -89,7 +96,7 @@ Install copies default **`~/.guardian/hook_policy.json`** if missing (tune gates
 bash scripts/install-claude-hooks.sh
 ```
 
-Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), and **`PreToolUse`** (`Bash|Agent|Task` advisory) into **`~/.claude/settings.json`**. Idempotent; other hooks and settings are preserved, and entries from earlier Guardian versions are replaced. Start a new session afterwards. Details: [docs/claude-code.md](docs/claude-code.md).
+Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), **`PreToolUse`** (`Bash|Agent|Task` advisory) and the session-tracking **`PostToolUse`**, **`Stop`** and **`SessionEnd`** into **`~/.claude/settings.json`**. Idempotent; other hooks and settings are preserved, and entries from earlier Guardian versions are replaced. Start a new session afterwards. Details: [docs/claude-code.md](docs/claude-code.md).
 
 ### OpenAI Codex
 
@@ -97,7 +104,7 @@ Merges **`SessionStart`**, **`UserPromptSubmit`** (prompt gate), and **`PreToolU
 bash scripts/install-codex-hooks.sh
 ```
 
-Merges the same three events into **`~/.codex/hooks.json`**. Hooks are on by default in current Codex, but **Codex skips new or changed hooks until you trust them** — run **`/hooks`** in the CLI or open **Settings > Hooks** in the app. Details: [docs/codex.md](docs/codex.md).
+Merges the same six events into **`~/.codex/hooks.json`**. Hooks are on by default in current Codex, but **Codex skips new or changed hooks until you trust them** — run **`/hooks`** in the CLI or open **Settings > Hooks** in the app. Details: [docs/codex.md](docs/codex.md).
 
 ### Menu bar app
 
@@ -114,7 +121,8 @@ A shield appears at the right of the menu bar; its shape follows the level (outl
 - memory, swap, CPU, disk, the kernel's memory-pressure and thermal verdicts, per-agent RAM
 - **Today**: share of time at each level and how often it changed
 - any **config problem** the daemon reported
-- **Find space to free**: the `guardian disk` scan of all your git repositories, with each item's age and worktree status. Items Guardian can safely remove have a bin button that asks before deleting (through the same checks as `guardian disk delete`); the rest have a button that copies their removal command. Every row can be shown in Finder.
+- **Find space to free**: the `guardian disk` scan of all your git repositories, with each item's age and worktree status, sized by what deleting it would free. The scan `guardiand` keeps fresh in the background is shown as soon as the panel opens; **Scan again** brings it up to date. Stale bundles come first, the longest untouched at the top; ticking one ticks everything in it that can go without a look. Tick the items to remove and press **Delete selected**: it lists them with what they free and asks before deleting (through the same checks as `guardian disk delete`). **Tick old and safe** ticks every project bundle untouched for two weeks or more. Items that need their own tool or a decision are listed after those, each with a button that copies its removal command. Every row can be shown in Finder.
+- **Agent sessions**: one line per agent (Claude Code, Codex, Cursor) with sessions open, how many are working and where, and how many are idle; an **Update hooks** button when an agent's Guardian hooks are from an older version, and **Add hooks…** for an agent that has none
 - **Open dashboard** for the larger System / Sessions / Docker / Settings window
 
 It notifies you only when load becomes critical or the disk becomes critical. The app needs macOS 14 and the Swift toolchain to build; it reads `~/.guardian/` and calls `~/.guardian/guardian`, so install the daemon first.
@@ -131,6 +139,16 @@ deny_subagents_on = "critical"   # "never" (default) | "strained" | "critical"
 Applies to Cursor (`Task`), Claude Code (`Agent` / `Task`), and Codex (`spawn_agent`). Shell commands are never denied; a snooze lifts the deny.
 
 ### Prompt gates and resume
+
+**Guardian only warns until you opt in.** Out of the box no hook pauses a prompt or denies a tool call: when a gate would have, the prompt or tool call goes through and the agent (and, in Cursor, you) gets a warning saying why. To let Guardian actually stop things:
+
+```bash
+~/.guardian/guardian blocking on       # asks first; then the gates below may pause prompts and deny subagents
+~/.guardian/guardian blocking status   # which it is, and what would be stopped with your settings
+~/.guardian/guardian blocking off      # back to warnings only
+```
+
+The menu bar panel shows **Warnings only** with an **Allow pausing…** button until you do, and a way back afterwards. The opt-in is one file, `~/.guardian/blocking_on`; it takes effect on the next hook call and applies to Cursor, Claude Code and Codex alike. Everything below (`mode`, `block_on`, `deny_subagents_on`) says *when* Guardian would stop something; this switch says *whether* it may. An upgrade from a Guardian that blocked by default goes back to warning until you run the command.
 
 The default `adaptive` mode pauses a prompt only when a fresh sample shows critical pressure with critical macOS memory pressure or serious thermal pressure, and the prompt explicitly requests heavy local work. Examples include “Run the full test suite” and “Rebuild all Docker containers.” Questions, ordinary edits, ambiguous requests, and low available RAM alone pass through. The estimate uses local text rules and can miss heavy work implied by prior context.
 
@@ -152,7 +170,7 @@ codex = "adaptive"
 - **Strict** pauses prompts at the configured `block_on` pressure (`critical` or `strained`) and supports the optional Cursor RSS cap.
 - Set `enabled = false` under `[prompt_gate]` to switch off prompt gating across clients. `block_on = "never"` disables pressure-based gating.
 
-Existing configurations without a mode pick up the adaptive default when the hooks are updated. Set `mode = "strict"` to keep pressure-only blocking.
+Existing configurations without a mode pick up the adaptive default when the hooks are updated. Set `mode = "strict"` for pressure-only blocking. Either way nothing is paused without `guardian blocking on`.
 
 Use the **Guardian menu bar** to snooze for 5, 15, 30, or 60 minutes, see when snooze ends, or resume early. **Allow once** stays armed for 10 minutes or until a prompt would otherwise be paused, whichever comes first. A new session is told when a snooze or allow-once is in force. Snooze and Allow once are shared across Cursor, Claude Code, and Codex.
 
@@ -175,15 +193,18 @@ If you still see messages about **“Parallel workspace load”** and **`~/.curs
 
 ### Disk (`[disk]`)
 
-**`[disk]`** samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
+**`[disk]`** (`enabled`, `warn_used_percent`, `critical_used_percent`, `background_scan_minutes`) samples the volume containing your home directory and sets `state.json` → **`disk.level`** to `clear`, `warn`, or `critical` from **`warn_used_percent`** / **`critical_used_percent`** (defaults **85** / **93**). **`sessionStart`** and **`subagentStart`** add short advisories when space is tight; see **`hooks/resources.md`** for cleanup ideas (worktrees, Docker images, caches).
 
 ### Finding space to free (`guardian disk`)
 
 ```bash
 ~/.guardian/guardian disk                  # list the biggest targets (read-only)
+~/.guardian/guardian disk --cached         # the last saved scan, at once, without scanning
+~/.guardian/guardian disk --fresh          # measure everything again, reusing nothing
 ~/.guardian/guardian disk --older-than 14  # only projects and worktrees untouched for 2+ weeks
 ~/.guardian/guardian disk clean            # list, then choose what to delete
 ~/.guardian/guardian disk delete ~/code/app/target   # delete specific targets
+~/.guardian/guardian disk save --delete ~/code/app-wt   # commit and push a worktree's unsaved work, then remove it
 ```
 
 The scan walks your home folder for **every git repository** (skipping `Library`, media folders, and `Desktop` / `Documents` / `Downloads`, which macOS guards with a permission prompt; add one with `--root`) and reports:
@@ -192,13 +213,29 @@ The scan walks your home folder for **every git repository** (skipping `Library`
 - **Linked git worktrees**, each checked for unsaved work: uncommitted or untracked files, commits on a detached HEAD that exist nowhere else, a lock, and ignored files git keeps no copy of (`.env` files, local databases, notes) anywhere in the worktree.
 - **Tool caches**: Cargo, npm, pnpm, Bun, pip, uv, Homebrew, Go, Gradle, Maven, Xcode and Simulator data, Playwright browsers, Docker's disk image, model caches and the Trash.
 
+**Stale things come first, bundled.** Anything untouched for a week or more is grouped by project (a repository with all its worktrees and build folders) and by how long it has sat: 90 days or more, 30 to 89, 14 to 29, 7 to 13. The longest untouched bundles are listed first, and within a band the ones that free the most. A bundle is listed when it adds up to the size floor even if none of its folders would on its own, which is how fifty small forgotten worktrees become one line. Each bundle says how much of it can be deleted now and how many of its folders need a look or their own command first. `guardian disk clean` offers a bundle as one numbered choice, and `old` picks every project bundle untouched for two weeks or more. Download caches that refill themselves are dated by when something was last added at their top level and bundled as "Tool caches"; they are never picked by `old`, and toolchains, models and Docker's disk are not dated at all, because nothing records when those were last used. What is in use is listed after the bundles, largest first.
+
 Every target shows its size, how long the project has gone untouched, and whether it **comes back on its own** or needs a **look before deleting**. Projects are measured oldest first inside a time budget (`--seconds`, default 45), at background I/O priority, so the scan is safe to run on a machine that is already struggling; anything not reached is counted and reported.
+
+**Sizes are what deleting would free**, which can be much less than what a folder appears to occupy. A `node_modules` installed by bun or pnpm is made of clones of the files in that tool's cache: every copy looks like a gigabyte, and deleting one frees almost nothing, because the data stays for the other copies. Such a row says so ("1.0 GB in size, of which 1.0 GB is shared with other copies"), sorts below folders that really give space back, and the totals count only what would be freed. A file with several names (hard links, common in `target/`) is counted once, and as freed only if every name is inside the folder.
+
+**Scans remember what they measured.** Results are saved to `~/.guardian/disk_index.json`. The next scan measures only what is new, was touched since, was measured only in part, or has not been measured for 12 hours; everything else keeps its saved size. A scan that runs out of time measuring is carried on by the next one, starting with what has never been measured, so running it again makes progress. The search for repositories is not carried on in the same way: it starts from the top each time, keeps what an earlier search found beyond where it got to, and is given more of the time after a search that was cut short. In a very large home folder, give it longer with `--seconds`. Folders found only through `--root` are kept until the next scan that does not pass that root. `--cached` prints the saved scan immediately and `--fresh` ignores it.
+
+What git said about a worktree is saved the same way, because asking takes a second or more per worktree: git is asked again when the worktree shows a sign of use (a commit, checkout or staged change, or a change at its top level) or after 12 hours. A listing can therefore still say "no uncommitted work" about a worktree whose files were edited since without any of that. **Deleting never goes by the listing**: the index only saves measuring, and whether something may be deleted is decided afresh from the disk and from git at that moment.
+
+**`guardiand` keeps the saved scan fresh in the background**, so the list is already there when the disk fills up. It starts `guardian disk refresh` as a separate low-priority process every **`[disk] background_scan_minutes`** (default **180**; **0** turns it off), and ahead of that when the disk reaches `warn` or `critical`, if the saved scan is more than an hour old. `[disk] enabled = false` turns it off along with the rest. It does not start one at `critical` load, starts one under `strained` load only when the disk is tight, stops a running one if load becomes critical, and never runs two at once. A background scan has two minutes; when that is not enough to measure everything (the first scan, or after a lot has changed), the next one follows after ten minutes instead of a whole interval and carries on, up to six times in a row.
 
 **Deleting is a separate, confirmed step.** `disk clean` numbers what it can delete and asks which (`1 3 5`, `2-4`, or `old` for everything that comes back on its own and has gone untouched for 14+ days), then asks once more before removing anything. Each target is re-checked at that moment:
 
 - a build or dependency folder is deleted only if git tracks nothing inside it;
 - a worktree is removed with `git worktree remove`, never `--force`, and only if it has no uncommitted work — its branch stays in the repository;
+- a worktree with uncommitted work is never deleted as it is, but there is a fast way through: **`guardian disk save --delete <worktree>`** (in the menu bar, **Save & delete…**; in `disk clean`, the choices marked SAVED FIRST). It commits what is uncommitted to the worktree's branch, pushes it, asks the remote whether it has the commit, and only then removes the worktree. `--plan` shows what it would commit and push without changing anything.
+
+  Where it pushes: to the remote your own `git push` would use (`pushRemote`, `remote.pushDefault`, then the one the branch follows, then `origin`). A branch that is **not on the remote yet** goes up under its own name. A branch that **is already there** is left exactly as it is, because it is usually a pull request, where a new commit runs CI and may be merged: the save goes beside it as `guardian-save/<branch>`. Work sitting on a shared branch (the remote's default branch, `main`, `develop`, `release/…`, `gh-pages`) or on a detached HEAD gets a new branch, `guardian-save/<folder>`. A branch's recorded upstream is never pushed to, since that is usually the branch it was started from.
+
+  What it refuses: it never forces a push; never commits a file new to git (staged or not) that looks like credentials by name (`.env`, keys, `credentials.json`), any file whose contents hold a private key or a well-known token format, a dependency folder that is not ignored, a new file over 50 MB, or more than 2,000 new files; never commits into a merge or rebase under way; and stops if a commit would miss something (files hidden from git status, a nested repository, a submodule with changes). Your commit and push hooks run as usual, since that is where secret scanners live; `--no-verify` skips the commit hooks only. A save started from a plan you were shown refuses if a file to be committed has been added, removed or edited since. Files git ignores, such as a `.env`, are not saved by a commit and are named before you confirm. If a hook refuses or the push fails, the worktree is kept, and a commit already made stays on its branch;
 - caches that have their own cleaner (`npm cache clean`, `brew cleanup`, `docker system prune`, …) are listed with that command and left for you to run;
+- a worktree or virtual environment is kept if a folder git ignores inside it holds another git checkout (a worktree made from inside a worktree, a dependency cloned for editing), since removing it would delete that checkout and any unsaved work in it. Ignored folders are searched six levels down and kept if there is more below that; dependency folders such as `node_modules`, in a worktree or on their own, are searched at their top two levels, where a package cloned to be patched sits;
 - nothing outside your home folder, nothing at its top level, and no symlink is ever deleted.
 
 ### Deferred work queue (`[queue]`)
@@ -368,7 +405,7 @@ cat ~/.guardian/state.json | jq '{
 
 - **`clear`** — Headroom for parallel agents, Docker, and heavier terminal work.
 - **`strained`** — Workable, but prefer **sequential** work, fewer parallel chats/subagents, and lighter Docker/indexing until numbers improve.
-- **`critical`** — Strong signal to **avoid adding load**; optional prompt gates may block until you use **`proceed_once`**, **snooze**, or the machine recovers.
+- **`critical`** — Strong signal to **avoid adding load**; prompt gates warn, and after `guardian blocking on` may block until you use **`proceed_once`**, **snooze**, or the machine recovers.
 
 **Illustrative snapshot** (shape only; your machine will differ):
 

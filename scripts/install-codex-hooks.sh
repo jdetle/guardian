@@ -25,6 +25,7 @@ cp "$HOOKS_SRC/lib.sh" "$DEST/"
 cp "$HOOKS_SRC/prompt-gate-common.sh" "$DEST/"
 cp "$HOOKS_SRC/tool-gate-common.sh" "$DEST/"
 cp "$HOOKS_SRC/session-start.sh" "$DEST/"
+cp "$HOOKS_SRC/session-event.sh" "$HOOKS_SRC/session-event.jq" "$HOOKS_SRC/stop.sh" "$DEST/"
 cp "$HOOKS_SRC/cursorignore_check.py" "$DEST/"
 cp "$HOOKS_SRC/iso_to_epoch.py" "$DEST/"
 cp "$HOOKS_SRC/cursorignore-checklist.json" "$DEST/"
@@ -33,6 +34,8 @@ cp "$HOOKS_SRC/resources.md" "$DEST/"
 cp "$HOOKS_SRC/codex/"*.sh "$DEST/codex/"
 chmod +x "$DEST"/*.sh "$DEST/codex"/*.sh
 chmod +x "$DEST/cursorignore_check.py" "$DEST/iso_to_epoch.py" 2>/dev/null || true
+
+
 
 mkdir -p "$GUARDIAN_DIR"
 if [ ! -f "$GUARDIAN_DIR/hook_policy.json" ]; then
@@ -47,9 +50,18 @@ if ! bash "$HOOKS_SRC/merge-agent-hooks.sh" "$CODEX_HOOKS_JSON" "$HOOKS_SRC/code
     exit 1
 fi
 
+# Stamped only now that the hooks are registered: a failed merge must not leave the old
+# registrations looking like this version's.
+# Which Guardian these hooks came from, for `guardian hooks status`.
+# (From the binary it is handed in; from a checkout it is read from Cargo.toml; with neither,
+# as in the test container, it is "unknown". `|| true`: a missing file must not stop the install.)
+GUARDIAN_HOOKS_VERSION="${GUARDIAN_HOOKS_VERSION:-$({ sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true; } | head -1)}"
+printf '%s\n' "${GUARDIAN_HOOKS_VERSION:-unknown}" > "$DEST/VERSION"
+
 echo "[3/3] Done."
 echo ""
-echo "Installed: SessionStart, UserPromptSubmit (prompt gate), PreToolUse (Bash|Agent|spawn_agent advisory)."
+echo "Installed: SessionStart, UserPromptSubmit (prompt gate), PreToolUse (Bash|Agent|spawn_agent advisory),"
+echo "and session tracking for the menu bar app: PostToolUse, Stop, SessionEnd (record only)."
 echo ""
 echo "ONE MANUAL STEP — Codex skips new or changed hooks until you trust them:"
 echo "  CLI:          run /hooks and approve the Guardian entries"

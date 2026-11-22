@@ -42,10 +42,25 @@ ensure_db
 conversation_id=$(sanitize_sql "$(echo "$input" | jq -r '.conversation_id // .session_id // "" | tostring')")
 model=$(sanitize_sql "$(echo "$input" | jq -r '.model // "unknown" | tostring')")
 
+# Which agent this is and where it is working, so its sessions can be told apart and
+# followed (Cursor names its folders in workspace_roots; the others send cwd).
+client=$(guardian_hook_client)
+session_cwd=$(sanitize_sql "$(echo "$input" | jq -r '(.cwd // (.workspace_roots | if type == "array" then .[0] else null end) // "") | tostring')")
+
 pressure=$(read_state_pressure)
 
 if [ -n "$conversation_id" ]; then
-    db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, pressure_at_start) VALUES ('$conversation_id', '$model', '$pressure');"
+    cwd_update=""
+    if [ -n "$session_cwd" ]; then
+        cwd_update=", cwd = '$session_cwd'"
+    fi
+    # A session can start more than once (resume, clear, compact): the row is made the
+    # first time and brought back to life after that. Starting, it is idle whatever it was:
+    # a session killed in the middle of a turn and resumed is not still working.
+    db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, pressure_at_start, client, state) VALUES ('$conversation_id', '$model', '$pressure', '$client', 'idle');
+UPDATE sessions SET client = COALESCE(client, '$client'), last_activity_at = datetime('now'), state = 'idle', model = CASE WHEN model IN ('', 'unknown') THEN '$model' ELSE model END$cwd_update WHERE conversation_id = '$conversation_id';
+DELETE FROM tool_calls WHERE recorded_at < datetime('now', '-60 days');
+DELETE FROM pressure_samples WHERE sampled_at < datetime('now', '-60 days');"
 fi
 
 if declare -F guardian_advise_prune >/dev/null; then
@@ -86,11 +101,15 @@ why=$(read_state_reasons_suffix)
 context=""
 case "$pressure" in
     critical)
-        context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up; sends may block. Work serially — no subagents, no heavy containers. Snooze: ${snooze_hint}."
+        if guardian_blocking_enabled; then
+            context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up; sends may block. Work serially — no subagents, no heavy containers. Snooze: ${snooze_hint}."
+        else
+            context="${banner} Load critical: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Ease up. Work serially — no subagents, no heavy containers. Guardian only warns; it will not pause anything."
+        fi
         ;;
     strained)
         context="${banner} Load strained: CPU ${cpu}%, ${mem} GB free, swap ${swap}%.${why} Prefer serial work; at most one subagent at a time."
-        if [ "$block_on_hint" = "critical" ]; then
+        if [ "$block_on_hint" = "critical" ] && guardian_blocking_enabled; then
             context="${context} Gates block at critical — snooze early: ${snooze_hint}."
         fi
         ;;
@@ -101,7 +120,11 @@ esac
 
 case "$deny_subagents_on" in
     strained|critical)
-        context="${context} Subagent spawns are denied at ${deny_subagents_on} load."
+        if guardian_blocking_enabled; then
+            context="${context} Subagent spawns are denied at ${deny_subagents_on} load."
+        else
+            context="${context} Avoid subagents at ${deny_subagents_on} load (Guardian will warn, not stop them)."
+        fi
         ;;
 esac
 
@@ -146,7 +169,7 @@ snooze_left=$(guardian_snooze_remaining_secs)
 if [ "${snooze_left:-0}" -gt 0 ] 2>/dev/null; then
     context="${context} Snoozed for about $(( (snooze_left + 59) / 60 )) more min: pressure gates and subagent limits are off until then (end it: ${G_home}/guardian clear-snooze)."
 fi
-if guardian_proceed_once_armed; then
+if guardian_proceed_once_armed && guardian_blocking_enabled; then
     context="${context} Allow-once is armed: the next prompt Guardian would pause goes through."
 fi
 

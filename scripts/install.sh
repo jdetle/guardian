@@ -115,7 +115,9 @@ kill_ratio = 0.8
 # Set to true to allow guardian to kill runaway processes
 kill_enabled = false
 
-# Prompt / session gates (also written to ~/.guardian/hook_policy.json by guardiand)
+# Prompt / session gates (also written to ~/.guardian/hook_policy.json by guardiand).
+# These say WHEN Guardian would pause a prompt. Whether it may pause anything at all is a
+# separate opt-in: until you run `~/.guardian/guardian blocking on`, it only warns.
 [prompt_gate]
 enabled = true
 # adaptive | advisory | strict
@@ -132,6 +134,7 @@ block_on_session_budget = false
 # Tool-call gate (Cursor preToolUse, Claude Code / Codex PreToolUse). Advisory by default.
 [tool_gate]
 # Deny NEW subagent spawns at this pressure: "never" | "strained" | "critical".
+# Also needs `guardian blocking on`; without it Guardian warns instead of denying.
 # Subagent fan-out is the main way one agent turn multiplies memory use.
 deny_subagents_on = "never"
 
@@ -144,6 +147,8 @@ warn_cursor_rss_megabytes = 4096
 enabled = true
 warn_used_percent = 85.0
 critical_used_percent = 93.0
+# Minutes between background refreshes of the saved `guardian disk` scan; 0 turns them off
+background_scan_minutes = 180
 
 [queue]
 # When true, blocked beforeSubmitPrompt may save prompt text to ~/.guardian/agent_queue.jsonl (if Cursor sends it)
@@ -249,10 +254,18 @@ if [ "$healthy" = "true" ]; then
     echo "To check status:  launchctl list com.guardian.guardiand"
     echo "To view state:    cat ~/.guardian/state.json"
     echo ""
-    echo "Hooks (run the ones you use):"
-    echo "  Cursor:       bash hooks/install-hooks.sh"
-    echo "  Claude Code:  bash scripts/install-claude-hooks.sh"
-    echo "  Codex:        bash scripts/install-codex-hooks.sh"
+    # Hooks installed by an earlier Guardian are brought up to date with this one; agents
+    # that have none are left alone until asked for.
+    echo "Agent hooks:"
+    if ! "$GUARDIAN_DIR/guardian" hooks install --upgrade > /dev/null 2>&1; then
+        echo "  Some hooks could not be brought up to date; see: $GUARDIAN_DIR/guardian hooks install --upgrade"
+    fi
+    "$GUARDIAN_DIR/guardian" hooks status 2>&1 | sed 's/^/  /' || true
+    echo "  Sessions that are already running keep the hooks they started with; new ones pick these up."
+    echo ""
+    echo "Guardian only warns. To let it pause prompts and deny subagents: $GUARDIAN_DIR/guardian blocking on"
+    echo "Install hooks for every agent on this machine:  $GUARDIAN_DIR/guardian hooks install"
+    echo "  (one agent: --cursor, --claude or --codex; see where each stands: guardian hooks status)"
 else
     echo ""
     echo "ERROR: guardiand is not sampling — no fresh $GUARDIAN_DIR/state.json from a stable process (launchd pid: ${daemon_pid:-none})."

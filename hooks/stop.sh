@@ -1,6 +1,10 @@
 #!/bin/bash
-# Guardian stop hook.
-# Records session end data and computes ROI score.
+# Guardian stop hook: the agent has finished a turn (Cursor `stop`, Claude Code and Codex
+# `Stop`). Records it and scores the session so far. The session itself goes on until its
+# end hook says otherwise (session-event.sh end).
+#
+# Prints nothing and exits 0: in all three agents that means "nothing to say", and a stop
+# hook that says something can keep the agent going.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,17 +13,36 @@ source "$SCRIPT_DIR/lib.sh"
 input=$(read_hook_input)
 ensure_db
 
-conversation_id=$(sanitize_sql "$(echo "$input" | jq -r '.conversation_id // ""')")
-status=$(sanitize_sql "$(echo "$input" | jq -r '.status // "unknown"')")
-loop_count=$(echo "$input" | jq -r '.loop_count // 0')
+if ! printf '%s' "$input" | jq empty 2>/dev/null; then
+    exit 0
+fi
+client=$(guardian_hook_client)
+# Cursor sends conversation_id and how the turn went; Claude Code and Codex send session_id
+# and no status, and their Stop means the turn completed.
+conversation_id=$(sanitize_sql "$(echo "$input" | jq -r '.conversation_id // .session_id // "" | tostring')")
+default_status="unknown"
+if [ "$client" != "cursor" ]; then
+    default_status="completed"
+fi
+status=$(sanitize_sql "$(echo "$input" | jq -r --arg d "$default_status" '.status // $d | tostring')")
+loop_count=$(echo "$input" | jq -r '(.loop_count // 0) | if type == "number" then floor else 0 end' 2>/dev/null || echo 0)
+case "$loop_count" in
+    ''|*[!0-9]*) loop_count=0 ;;
+esac
 
 if [ -z "$conversation_id" ]; then
     exit 0
 fi
 
-# Update session end data
-db_exec "UPDATE sessions SET
+# The turn is over: the session is idle until the next prompt. ended_at is when it last
+# stopped; whether the session is over is in `state`.
+db_exec "INSERT OR IGNORE INTO sessions (conversation_id, model, client, state) VALUES ('$conversation_id', 'unknown', '$client', 'idle');
+UPDATE sessions SET
     ended_at = datetime('now'),
+    last_activity_at = datetime('now'),
+    client = COALESCE(client, '$client'),
+    state = CASE WHEN state = 'ended' AND ended_at > datetime('now', '-2 minutes') THEN 'ended' ELSE 'idle' END,
+    turn_count = COALESCE(turn_count, 0) + 1,
     status = '$status',
     loop_count = $loop_count,
     duration_ms = CAST((julianday('now') - julianday(started_at)) * 86400000 AS INTEGER)

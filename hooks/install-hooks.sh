@@ -28,6 +28,7 @@ cp "$SCRIPT_DIR/pre-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/subagent-start.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/post-tool-use.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/stop.sh" "$HOOKS_DIR/"
+cp "$SCRIPT_DIR/session-event.sh" "$SCRIPT_DIR/session-event.jq" "$SCRIPT_DIR/session-end.sh" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/cursorignore_check.py" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/iso_to_epoch.py" "$HOOKS_DIR/"
 cp "$SCRIPT_DIR/cursorignore-checklist.json" "$HOOKS_DIR/"
@@ -85,6 +86,14 @@ if ! bash "$SCRIPT_DIR/merge-agent-hooks.sh" "$HOOKS_JSON" "$SCRIPT_DIR/hooks.js
     echo "Fix the problem above and re-run this installer." >&2
     exit 1
 fi
+
+# Stamped only now that the hooks are registered: a failed merge must not leave the old
+# registrations looking like this version's.
+# Which Guardian these hooks came from, for `guardian hooks status`.
+# (From the binary it is handed in; from a checkout it is read from Cargo.toml; with neither,
+# as in the test container, it is "unknown". `|| true`: a missing file must not stop the install.)
+GUARDIAN_HOOKS_VERSION="${GUARDIAN_HOOKS_VERSION:-$({ sed -n 's/^version = "\(.*\)"/\1/p' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true; } | head -1)}"
+printf '%s\n' "${GUARDIAN_HOOKS_VERSION:-unknown}" > "$HOOKS_DIR/VERSION"
 
 echo ""
 echo "Guardian hooks installed."

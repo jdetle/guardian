@@ -11,9 +11,11 @@ Short checklist (also surfaced by hooks when load is high):
 - **Disk space** — Guardian reports home-volume usage in `state.json` and session advisories when usage crosses `[disk]` thresholds in config. Common space hogs: stale **git worktrees** (`git worktree list`, remove unused checkouts), **Docker** images/containers (`docker system df`, `docker image prune`, `docker builder prune`), **build outputs** (`target/`, `dist/`, `build/`, `node_modules`), **Xcode DerivedData**, and **`~/.cache`**.
 - **Deferred prompts** — `~/.guardian/agent_queue.jsonl` + `~/.guardian/guardian-queue.sh` (installed by `hooks/install-hooks.sh`). Use when a send is blocked or you want to run work later; Cursor does not auto-run queued text—paste manually or use optional `scripts/install-queue-watch.sh` for a clear-pressure notification.
 
-**When a subagent is denied** (only if `[tool_gate] deny_subagents_on` is set): the agent is told to continue serially. Snooze (`~/.guardian/guardian snooze 15`) lifts it; set `deny_subagents_on = "never"` and restart `guardiand` to turn it off.
+**When a subagent is denied** (only if `[tool_gate] deny_subagents_on` is set and you have run `guardian blocking on`; otherwise the agent is warned and the subagent starts): the agent is told to continue serially. Snooze (`~/.guardian/guardian snooze 15`) lifts it; set `deny_subagents_on = "never"` and restart `guardiand` to turn it off.
 
-**When a send is blocked:**
+**Guardian only warns unless you opt in** (`~/.guardian/guardian blocking on`, which says what it will mean and asks; `blocking off` to go back). The choice is yours to make: the warnings an agent reads in Claude Code and Codex do not include the command, and without a terminal to ask in it does nothing unless given `--yes`. Until then no send is blocked and no subagent denied; you and the agent are told about the load instead.
+
+**When a send is blocked** (with blocking on):
 
 - **Never blocked by the gate:** `/guardian-snooze`, `/guardian-once`, and prompts that reference **guardian-install** / **guardian-upgrade** (e.g. `.cursor/skills/guardian-install`, `skills/guardian-upgrade`, `…/SKILL.md`) — install and snooze always get through.
 

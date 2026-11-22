@@ -8,6 +8,25 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UPS="$ROOT/hooks/claude/user-prompt-submit.sh"
 PTU="$ROOT/hooks/claude/pre-tool-use.sh"
 
+# The hooks record what they see (sessions.db) and keep small state files, so they are run
+# against a scratch home that holds a copy of the live readings: nothing is written to the
+# real ~/.guardian.
+REAL_GUARDIAN="$HOME/.guardian"
+SCRATCH="$(mktemp -d)"
+if [ -z "$SCRATCH" ] || [ ! -d "$SCRATCH" ]; then
+    echo "hook-smoke: could not make a scratch directory" >&2
+    exit 2
+fi
+trap 'rm -rf "$SCRATCH"' EXIT
+mkdir -p "$SCRATCH/.guardian"
+for f in state.json hook_policy.json; do
+    if [ -f "$REAL_GUARDIAN/$f" ]; then
+        cp "$REAL_GUARDIAN/$f" "$SCRATCH/.guardian/$f"
+    fi
+done
+export HOME="$SCRATCH"
+unset GUARDIAN_HOOK_FORMAT CLAUDE_CONFIG_DIR CODEX_HOME
+
 out=$(printf '%s' '{"prompt":"smoke","cwd":"/tmp","session_id":"test"}' | bash "$UPS")
 echo "$out" | jq empty >/dev/null
 

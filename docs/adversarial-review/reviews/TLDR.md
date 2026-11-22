@@ -1,0 +1,12 @@
+- [2026-11-21 hooks-all-clients-pre-push](./2026-11-21-hooks-all-clients-pre-push.md)
+  - decision: proceed; two models found 27 issues, none a veto; the warn-only default held under a 540-run attempt to break it
+  - risk: not yet run against live Cursor and Codex sessions; container suite left to CI
+  - followup: [ ] author — one real session per agent, confirm it shows working → idle → ended in the app
+- [2026-11-20 disk-index-pre-push](./2026-11-20-disk-index-pre-push.md)
+  - decision: proceed; two models found 34 issues, one a data-loss veto (nested checkout deleted with a worktree); all acted on
+  - risk: `disk save` is untested against a hosted remote with real credentials and protections
+  - followup: [ ] author — one real save on a throwaway branch; make the scan budget hold inside git calls
+- [2026-11-20 disk-scan-efficiency](./2026-11-20-disk-scan-efficiency.md)
+  - decision: proceed; keep a resumable on-disk index refreshed in the background, and report the space a delete really frees
+  - risk: background scan I/O on a strained machine; gating not yet tried under load
+  - followup: [ ] author — implement index, background refresh and freed-space sizes as 0.12.0

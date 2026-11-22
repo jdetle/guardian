@@ -15,6 +15,7 @@ enum PanelSnapshot {
 
     static func render(to path: String, client: GuardianClient) -> Bool {
         client.refreshNow()
+        client.loadHookStatus()
         if CommandLine.arguments.contains("--with-disk") {
             client.scanDisk()
             while client.diskScanning {
@@ -30,8 +31,9 @@ enum PanelSnapshot {
         let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = view
         view.layoutSubtreeIfNeeded()
-        // Give SwiftUI a moment to finish its first layout pass.
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        // Give SwiftUI a moment to finish its first layout pass, and the session and hook
+        // readings (two short subprocesses) a moment to come back.
+        RunLoop.main.run(until: Date().addingTimeInterval(1.5))
         view.frame = NSRect(origin: .zero, size: view.fittingSize)
         view.layoutSubtreeIfNeeded()
 
